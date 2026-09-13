@@ -8,6 +8,7 @@ const scriptPath = path.resolve(__dirname, "..", "微软积分商城签到（全
 
 function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     const storage = new Map(Object.entries(initialStorage));
+    const intervals = { set: [], cleared: [] };
     let source = fs.readFileSync(scriptPath, "utf8");
     const entryPattern = /\s*\/\/ ====== 后台模式入口 ======\s*\r?\n\s*init\(\);\s*\r?\n\s*\}\)\(\);/;
     assert.match(source, entryPattern, "test harness could not locate the userscript entry point");
@@ -48,11 +49,14 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
         location: { hostname: "test.invalid", pathname: "/", search: "" },
         prompt() { return null; },
         setTimeout,
+        // runAll 的运行锁心跳通过计时器实现；记录启停供断言使用
+        setInterval: (fn, ms) => { intervals.set.push(ms); return intervals.set.length; },
+        clearInterval: (id) => { intervals.cleared.push(id); },
     };
     context.globalThis = context;
     vm.createContext(context);
     vm.runInContext(source, context, { filename: scriptPath });
-    return { ...context.__userscriptTest, storage };
+    return { ...context.__userscriptTest, storage, intervals };
 }
 
 test("claimCard preserves a false reportActivity result", async () => {
@@ -1125,4 +1129,78 @@ test("reportActivity attaches the explicit cookie header for the legacy API", as
 
     await API.reportActivity("o1", "h1");
     assert.equal(req.headers.cookie, "_U=u");
+});
+
+// ====== v3.6.6：审查修复（策略1 Cookie 头 / 前台日期基准 / 运行锁心跳）======
+
+test("claimCard strategy 1 attaches the explicit cookie header", async () => {
+    const { API, Utils } = createHarness({}, {
+        gmCookie(...args) {
+            const callback = args.find(a => typeof a === "function");
+            callback([{ name: "_U", value: "u" }]);
+        }
+    });
+    API._resolveReportActivityActionId = async () => null;
+    API.getRewardsToken = async () => "tok";
+    const posts = [];
+    Utils.xhr = async options => {
+        if (options.method === "POST") posts.push(options);
+        return "ok";
+    };
+
+    const ok = await API.claimCard({ offerId: "o1", hash: "h1" });
+
+    assert.equal(ok, true);
+    // 策略1 首选路径成功即返回，不再落到后续策略
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].headers.cookie, "_U=u");
+});
+
+test("front-end rewards block fixes the run date before the /dashboard early-return", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    const start = source.indexOf('if (location.hostname === "rewards.bing.com") {');
+    const end = source.indexOf("// ====== 后台模式入口 ======");
+    assert.ok(start > 0 && end > start, "front-end rewards block not located");
+    const block = source.slice(start, end);
+    // dashboard 分支会在 init() 之前 return：前台块必须自带日期初始化，
+    // 否则 clickPunchCards 以 dateNowNum=0 读写打卡状态键（与其他页面日期错位）
+    assert.match(block, /RewardsAuto\.state\.dateNowNum = Utils\.getTodayNum\(\);/);
+    assert.match(block, /RewardsAuto\.state\.dateNowStr = Utils\.getTodayStr\(\);/);
+});
+
+test("run lock defaults to a 20-minute expiry and renewal only extends the owner's lock", () => {
+    const { TaskManager, storage } = createHarness();
+    const token = TaskManager._acquireRunLock();
+    assert.ok(token);
+    const span = storage.get("Config.runLock").expire - Date.now();
+    assert.ok(span > 19 * 60 * 1000 && span <= 20 * 60 * 1000,
+        `lock expiry should be ~20 minutes out, got ${span}ms`);
+
+    // 续期仅延长自己持有的锁
+    const shortened = Date.now() + 10 * 60 * 1000; // 人为把过期时间拨早
+    storage.set("Config.runLock", { token, expire: shortened });
+    TaskManager._renewRunLock(token);
+    assert.ok(storage.get("Config.runLock").expire > shortened, "renewal must extend the expiry");
+
+    // 锁被他人持有时不得覆盖
+    storage.set("Config.runLock", { token: "someone-else", expire: Date.now() + 1000 });
+    TaskManager._renewRunLock(token);
+    assert.equal(storage.get("Config.runLock").token, "someone-else");
+});
+
+test("runAll holds the run lock with a heartbeat and stops it when finished", async () => {
+    const d = new Date();
+    const today = Number(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`);
+    const { API, TaskManager, intervals } = createHarness({
+        "Config.tasks": { sign: today, read: today, promos: today, search: today, streakDays: 0 },
+        "Config.dailySetDone": today,
+        "Config.punchCardBgDone": today,
+    });
+    API.getBalance = async () => { throw new Error("idle run must not call getBalance"); };
+
+    await TaskManager.runAll();
+
+    // 心跳以 5 分钟周期启动，且在 runAll 结束时停止
+    assert.deepEqual(intervals.set, [5 * 60 * 1000]);
+    assert.equal(intervals.cleared.length, 1);
 });

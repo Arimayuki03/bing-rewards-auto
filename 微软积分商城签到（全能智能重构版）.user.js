@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.5
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.3：payload 复刻真实浏览器上报形状 reportActivity(hash,11,{offerid,form})——从 bundle 内实际调用点反向得出，修复登录态上报 HTTP 500）
+// @version      3.6.6
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.6：claimCard 策略1 补显式 Cookie 头；前台打卡统一日期基准；运行锁改心跳续期，实例意外终止后 20 分钟自动让出）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2179,27 +2179,35 @@ Notice:
                 ? url : "https://rewards.bing.com/earn";
 
             // 策略1: reportactivity + RequestVerificationToken（最稳定，失败后强制刷新 token 重试一次）
-            const postReportActivity = async (token) => Utils.xhr({
-                method: "POST",
-                url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
-                headers: {
+            const postReportActivity = async (token) => {
+                // 显式 Cookie 头：与 API.reportActivity / Server Action 同根因（v3.6.5），
+                // SW 子请求不自动携带 SameSite 登录 cookie，缺失时该端点 401/500，
+                // 首选策略每次白打一次请求才落到后续策略
+                const headers = {
                     "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "user-agent": RewardsAuto.ua.pc,
                     "referer": referer,
                     "origin": "https://rewards.bing.com",
                     "x-requested-with": "XMLHttpRequest"
-                },
-                data: new URLSearchParams({
-                    id: card.offerId,
-                    hash: card.hash,
-                    timeZone: Utils.getTimezoneOffset(),
-                    activityAmount: 1,
-                    dbs: 0,
-                    form: "",
-                    type: "",
-                    __RequestVerificationToken: token
-                }).toString()
-            });
+                };
+                const cookie = await Utils.cookieHeaderFor("https://rewards.bing.com/api/reportactivity");
+                if (cookie) headers.cookie = cookie;
+                return await Utils.xhr({
+                    method: "POST",
+                    url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
+                    headers,
+                    data: new URLSearchParams({
+                        id: card.offerId,
+                        hash: card.hash,
+                        timeZone: Utils.getTimezoneOffset(),
+                        activityAmount: 1,
+                        dbs: 0,
+                        form: "",
+                        type: "",
+                        __RequestVerificationToken: token
+                    }).toString()
+                });
+            };
             try {
                 let token = await this.getRewardsToken();
                 if (token) {
@@ -2466,6 +2474,12 @@ Notice:
     // 活动卡片"连续未确认"放弃上限：某卡片服务端连续 N 次复核仍未确认完成时，
     // 当日不再重复上报（多为需真实访问才结算的开放型卡片），次日按日期清零重试。
     const PROMOS_GIVE_UP_AFTER = 5;
+
+    // 运行锁参数：运行中心跳每 5 分钟续期一次；过期窗口 20 分钟（> 2 个心跳周期），
+    // 既保证活跃长任务不被误判过期，又把实例意外终止（关标签页/SW 被杀）后
+    // 后台停摆的最长时间从 60 分钟压缩到 20 分钟。
+    const RUN_LOCK_EXPIRE_MS = 20 * 60 * 1000;
+    const RUN_LOCK_HEARTBEAT_MS = 5 * 60 * 1000;
 
     const TaskManager = {
         // 任务日期状态
@@ -3418,8 +3432,9 @@ Notice:
         // 跨实例运行锁（尽力而为）：crontab 每 20 分钟触发一次新脚本实例，
         // 而一轮 runAll 可能耗时数分钟到二十分钟。用共享 storage 加锁，
         // 防止两个实例重叠执行造成重复搜索/上报。写入后回读校验降低竞态窗口；
-        // 锁在过期后自动让出，避免实例崩溃导致永久死锁。
-        _acquireRunLock(expireMs = 60 * 60 * 1000) {
+        // 锁在过期后自动让出，避免实例崩溃导致永久死锁（运行中由 runAll 的
+        // 心跳定期续期，过期窗口只需覆盖"实例死亡后到锁让出"的时间）。
+        _acquireRunLock(expireMs = RUN_LOCK_EXPIRE_MS) {
             try {
                 const key = "Config.runLock";
                 const now = Date.now();
@@ -3446,6 +3461,16 @@ Notice:
             } catch (_) {}
         },
 
+        // 续期运行锁：仅当锁仍归属本实例时延长过期时间（运行中心跳调用；
+        // 实例意外终止后心跳停止，锁在过期窗口内自动让出，不覆盖他人持有的锁）
+        _renewRunLock(token, expireMs = RUN_LOCK_EXPIRE_MS) {
+            try {
+                if (!token) return;
+                const cur = GM_getValue("Config.runLock", null);
+                if (cur && cur.token === token) GM_setValue("Config.runLock", { token, expire: Date.now() + expireMs });
+            } catch (_) {}
+        },
+
         async runAll() {
             if (this.running) {
                 Utils.log("🟡", "任务正在运行中，请勿重复触发");
@@ -3458,6 +3483,9 @@ Notice:
                 Utils.log("🟡", "检测到另一脚本实例正在运行（运行锁），本轮跳过");
                 return;
             }
+            // 运行锁心跳：运行中每 5 分钟续期，长任务（含最大搜索间隔配置）不会被
+            // 误判过期；实例意外终止后心跳停止，锁在 20 分钟窗口内自动让出。
+            this._lockHeartbeat = setInterval(() => this._renewRunLock(runLock), RUN_LOCK_HEARTBEAT_MS);
             RewardsAuto.state.startTime = Utils.getTimestamp();
             Utils.log("🚀", "启动全能自动化任务...");
             this.init();
@@ -3657,6 +3685,7 @@ Notice:
                 Utils.log("🎉", `任务执行完成！用时 ${totalTime} 秒`, true);
             }
             } finally {
+                clearInterval(this._lockHeartbeat);
                 this._releaseRunLock(runLock);
                 this.running = false;
             }
@@ -3664,6 +3693,13 @@ Notice:
     };
 
     if (location.hostname === "rewards.bing.com") {
+        // 前台页面（含 /dashboard）先初始化运行起始日：dashboard 分支会在后台入口
+        // init() 之前 return，TaskManager.init() 不会执行；若不在此设置，
+        // clickPunchCards 等处理器会以 dateNowNum=0 读写打卡状态键，与其他页面的
+        // 日期键错位，打卡状态机与每日尝试上限跨页面族失效（重复点击打卡入口）。
+        RewardsAuto.state.dateNowNum = Utils.getTodayNum();
+        RewardsAuto.state.dateNowStr = Utils.getTodayStr();
+
         // 仅保留真正指向打卡/任务详情的选择器，移除 a.cursor-pointer[href]、a.group/ctrl 等
         // 宽泛选择器——它们会误中“兑换奖励”面板的 /redeem/cn?ref=rewardspanel 导航链接，
         // 导致反复打开新窗口
