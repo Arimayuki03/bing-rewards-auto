@@ -1,0 +1,3311 @@
+// ==UserScript==
+// @name         微软积分商城签到（全能智能重构版）
+// @namespace    local.bing-rewards-auto
+// @version      3.3.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报
+// @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
+// @license      MIT
+// @crontab      */20 * * * *
+// @connect      bing.com
+// @connect      login.live.com
+// @connect      rewards.bing.com
+// @connect      prod.rewardsplatform.microsoft.com
+// @connect      hotapi.nntool.cc
+// @connect      hot.baiwumm.com
+// @connect      cnxiaobai.com
+// @connect      disp-qryapi.3g.qq.com
+// @connect      qyapi.weixin.qq.com
+// @connect      oapi.dingtalk.com
+// @connect      open.feishu.cn
+// @connect      push.i-i.me
+// @connect      api.day.app
+// @match        https://login.live.com/oauth20_desktop.srf*
+// @match        https://rewards.bing.com/*
+// @match        https://www.bing.com/*
+// @match        https://cn.bing.com/*
+// @run-at       document-start
+// @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @grant        GM_notification
+// @grant        GM_openInTab
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_cookie
+// @grant        GM_info
+// @grant        GM_log
+// @grant        GM_registerMenuCommand
+// @storageName  BingRewardsAuto_Shared
+// ==/UserScript==
+
+/* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab */
+
+/* ==UserConfig==
+Config:
+    keep:
+        title: 全部完成后仍每20分钟检查（取消勾选=完成后停止循环）
+        type: checkbox
+        default: true
+    lock:
+        title: 锁定国区（非大陆IP自动停止）
+        type: checkbox
+        default: true
+    span:
+        title: 搜索间隔（秒）
+        type: number
+        default: 30
+        min: 30
+        unit: ±15秒
+    api:
+        title: 搜索词接口（offline为随机搜索词）
+        type: select
+        default: offline
+        values: [offline, hot.nntool.cc, hot.baiwumm.com, hot.cnxiaobai.com]
+    debugDailySet:
+        title: 调试日志（输出每日活动原始字段，排查用）
+        type: checkbox
+        default: false
+    code:
+        title: 授权码链接
+        type: textarea
+        description: 粘贴 login.live.com 跳转后的完整URL
+Tasks:
+    sign:
+        title: 每日签入
+        type: checkbox
+        default: true
+    read:
+        title: 新闻阅读
+        type: checkbox
+        default: true
+    promos:
+        title: 活动卡片（含打卡）
+        type: checkbox
+        default: true
+    quiz:
+        title: Quiz 自动答题
+        type: checkbox
+        default: true
+    search:
+        title: PC搜索
+        type: checkbox
+        default: true
+Notice:
+    bro:
+        title: 浏览器通知（当前脚本）
+        type: checkbox
+        default: true
+    wework:
+        title: 企业微信消息推送（群机器人）
+        type: text
+        password: true
+        description: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    wework_on:
+        title: 企业微信推送开关
+        type: checkbox
+        default: false
+    dingding:
+        title: 钉钉群机器人（不加签，关键词：#）
+        type: text
+        password: true
+        description: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+    dingding_on:
+        title: 钉钉推送开关
+        type: checkbox
+        default: false
+    feishu:
+        title: 飞书群机器人（不加签，关键词：#）
+        type: text
+        password: true
+        description: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+    feishu_on:
+        title: 飞书推送开关
+        type: checkbox
+        default: false
+    pushme:
+        title: PushMe（push.i-i.me）
+        type: text
+        password: true
+        description: xxxxxxxxxxxxxxxxxxxx
+    pushme_on:
+        title: PushMe推送开关
+        type: checkbox
+        default: false
+    bark:
+        title: Bark（bark.day.app）
+        type: text
+        password: true
+        description: xxxxxxxxxxxxxxxxxxxx
+    bark_on:
+        title: Bark推送开关
+        type: checkbox
+        default: false
+==/UserConfig== */
+
+(function() {
+    'use strict';
+
+    // 授权码自动捕获
+    if (location.hostname === "login.live.com" && location.pathname === "/oauth20_desktop.srf") {
+        const code = new URLSearchParams(location.search).get("code");
+        if (code) {
+            GM_setValue("Config.code", location.href);
+            GM_setValue("Config.token", false);
+            if (GM_getValue("Notice.bro", true)) {
+                try { GM_notification({ title: "🟢 授权成功", text: "授权码已捕获，可关闭此页" }); } catch(_) {}
+            }
+            try { history.replaceState({}, "", "about:blank"); } catch(_) {}
+            setTimeout(() => { try { window.close(); } catch(_) {} }, 200);
+        }
+        return;
+    }
+
+    const RewardsAuto = {
+        // UA: pc=Edge桌面, mobile=Edge移动, app=BingSapphire真机抓包
+        ua: {
+            pc: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+            mobile: "Mozilla/5.0 (Linux; Android 16; Redmi K20 Pro Build/BP4A.251205.006; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 Mobile Safari/537.36 EdgA/131.0.0.0",
+            // App 端 UA（来自真实抓包数据，Redmi K20 Pro + BingSapphire）
+            app: "Mozilla/5.0 (Linux; Android 16; Redmi K20 Pro Build/BP4A.251205.006; ) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/144.0.7559.132 Mobile Safari/537.36 BingSapphire/32.6.2110003560",
+        },
+        appConfig: {
+            rewardsAppId: "SAAndroid/32.6.2110003560",
+            channel: "SAAndroid",                       // 渠道：Android 版 Bing App
+            offerIds: {
+                dailyCheckIn: "Gamification_Sapphire_DailyCheckIn",  // 每日签到标识
+                readArticle: "ENUS_readarticle3_30points",           // 阅读任务标识
+            }
+        },
+        searchPool: [
+            "what is the weather forecast tomorrow",
+            "how do I make sourdough bread at home",
+            "where can I find cheap flights to tokyo",
+            "why is the sky blue scientific explanation",
+            "how to learn rust programming in 2026",
+            "what time does the world cup final start",
+            "how to fix a leaky kitchen faucet step by step",
+            "what are the best vr games of 2026",
+            "how to start a vegetable garden in spring",
+            "where to watch new movies this week",
+            "how to take care of a bonsai tree",
+            "what is the difference between python async and threading",
+            "how to meditate properly for beginners",
+            "what is the origin of halloween traditions",
+            "how do solar panels actually work",
+            "what is the best mechanical keyboard for typing",
+            "how to tie a windsor knot tie",
+            "what causes northern lights aurora borealis",
+            "how to brew the perfect espresso at home",
+            "what are the symptoms of vitamin d deficiency",
+            "how to sleep better naturally tonight",
+            "why do cats purr when they are happy",
+            // 地点/新闻/购物意图
+            "best coffee shops in san francisco downtown",
+            "italian restaurants near times square",
+            "tokyo cherry blossom season 2026 forecast",
+            "rtx 5070 ti benchmark vs rtx 4080 super",
+            "iphone 17 release date and features",
+            "tesla stock price today nasdaq",
+            "best noise cancelling headphones under 300",
+            "fastest electric cars 0 to 60 mph",
+            "vintage camera brands collectors guide",
+            "budget gaming laptop with rtx 4070 2026",
+            // 操作指南/食谱
+            "easy chocolate chip cookies recipe from scratch",
+            "30 minute home workout routine no equipment",
+            "stretching exercises for lower back pain relief",
+            "easy origami crane folding instructions",
+            "git rebase vs merge which one to use",
+            "markdown cheat sheet with examples",
+            "japanese hiragana chart pronunciation",
+            "ancient rome history quick overview",
+            "pomodoro technique for focus and productivity",
+            "healthy breakfast ideas under 10 minutes",
+            // 中文搜索词
+            "天气预报", "今日新闻热点", "美食食谱家常菜", "旅游攻略", "健康养生知识",
+            "科技资讯", "电影推荐", "股票行情", "体育赛事", "历史上的今天"
+        ],
+        // 热搜API配置
+        apiConfig: {
+            mode: GM_getValue("Config.api", "offline"),
+            arr: [
+                ["hot.baiwumm.com", {
+                    url: "https://hot.baiwumm.com/api/",
+                    hot: ["weibo", "douyin", "baidu", "toutiao", "thepaper", "qq", "netease", "zhihu"],
+                }],
+                ["hot.cnxiaobai.com", {
+                    url: "https://cnxiaobai.com/DailyHotApi/",
+                    hot: ["weibo", "douyin", "baidu", "toutiao", "thepaper", "qq-news", "netease-news", "zhihu"],
+                }],
+                ["hot.nntool.cc", {
+                    url: "https://hotapi.nntool.cc/",
+                    hot: ["weibo", "douyin", "baidu", "toutiao", "thepaper", "qq-news", "netease-news", "zhihu"],
+                }],
+            ],
+            url: "",
+            hot: [],
+            wordList: [],
+            wordIndex: 0,
+        },
+        skipPatterns: [
+            "referral", "refer and earn", "sweepstake", "entries",
+            "install the", "set bing as your default", "bing wallpaper",
+            "punch card", "ancient coin", "sea of thieves", "rewards extension",
+            "redemption goal", "order history", "claim your gift", "shop to earn",
+            "set goal", "Available tomorrow", "Offer is Locked", "Earn -1 points"
+        ],
+        skipHrefs: [
+            "sweepstakes/", "referandearn", "aka.ms/win", "workinprogress",
+            "punchcard", "microsoft-store", "goal/all", "orderhistory",
+            "/redeem", "/redeemgoal", "xbox.com/rewards"
+        ],
+        state: {
+            token: false,
+            region: "CN",
+            host: "www.bing.com",
+            dateNowNum: 0,
+            dateNowStr: "",
+            pcProgress: 0,
+            pcMax: 90,
+            readProgress: 0,
+            readMax: 30,
+            sendMSG: "",
+            lastSearchProgress: -1,
+            restrictedTimes: 0,
+            pc401: false,
+            _rvTokenCache: null,
+            ip: "",
+            ipInfo: "",
+            startTime: 0,
+        }
+    };
+
+    const Webhooks = [
+        {
+            name: "企业微信",
+            url: "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=",
+            get key() { return GM_getValue("Notice.wework", false); },
+            get enabled() { return GM_getValue("Notice.wework_on", false); },
+            msg: {
+                "msgtype": "text",
+                "text": {
+                    get content() {
+                        return `> ${new Date().toLocaleString()}\n\n ## ${GM_info.script.name}\n ${RewardsAuto.state.sendMSG}`
+                    }
+                },
+            },
+        },
+        {
+            name: "钉钉",
+            url: "https://oapi.dingtalk.com/robot/send?access_token=",
+            get key() { return GM_getValue("Notice.dingding", false); },
+            get enabled() { return GM_getValue("Notice.dingding_on", false); },
+            msg: {
+                "msgtype": "markdown",
+                "markdown": {
+                    "title": GM_info.script.name,
+                    get text() {
+                        return `> ${new Date().toLocaleString()}\n ### ${GM_info.script.name}\n ${RewardsAuto.state.sendMSG}`
+                    }
+                },
+            },
+        },
+        {
+            name: "飞书",
+            url: "https://open.feishu.cn/open-apis/bot/v2/hook/",
+            get key() { return GM_getValue("Notice.feishu", false); },
+            get enabled() { return GM_getValue("Notice.feishu_on", false); },
+            msg: {
+                "msg_type": "interactive",
+                "card": {
+                    "schema": "2.0",
+                    "header": {
+                        "title": {
+                            "tag": "plain_text",
+                            "content": GM_info.script.name
+                        },
+                        "template": "orange"
+                    },
+                    "body": {
+                        "elements": [{
+                            "tag": "markdown",
+                            "text_align": "center",
+                            get content() {
+                                return `#### ${new Date().toLocaleString()}\n ${RewardsAuto.state.sendMSG}`
+                            }
+                        }]
+                    }
+                }
+            },
+        },
+        {
+            name: "PushMe",
+            url: "https://push.i-i.me/?push_key=",
+            get key() { return GM_getValue("Notice.pushme", false); },
+            get enabled() { return GM_getValue("Notice.pushme_on", false); },
+            msg: {
+                "type": "markdown",
+                "title": `${GM_info.script.name}[#rewards!https://rewards.bing.com/rewards.png]`,
+                get content() {
+                    return `\n ${RewardsAuto.state.sendMSG}`
+                }
+            },
+        },
+        {
+            name: "Bark",
+            url: "https://api.day.app/",
+            get key() { return GM_getValue("Notice.bark", false); },
+            get enabled() { return GM_getValue("Notice.bark_on", false); },
+            msg: {
+                "group": "rewards",
+                "icon": "https://rewards.bing.com/rewards.png",
+                "title": GM_info.script.name,
+                get markdown() {
+                    return `\n ${RewardsAuto.state.sendMSG}`
+                }
+            },
+        },
+    ];
+
+    const Utils = {
+        // 日志输出（带通知支持）
+        log(icon, msg, push = false, force = false) {
+            GM_log(`${icon} ${msg}`);
+            if (push) {
+                // 每日去重：内容相同（数字归一化后）的通知当天只推送一次，
+                // 避免已完成任务在后续轮次重复弹窗；force=true 时跳过去重（如测试通知）
+                if (!force && !this._dedupePush(msg)) return;
+                if (GM_getValue("Notice.bro", true)) {
+                    try {
+                        GM_notification({
+                            title: GM_info.script.name + ` ${icon}`,
+                            text: msg,
+                            onclick: () => GM_openInTab("https://rewards.bing.com/dashboard", { active: true })
+                        });
+                    } catch(_) {}
+                }
+                // 发送到外部通知接口
+                // 多行内容视为完整汇总报告，原样推送；单行通知才拼接图标前缀
+                RewardsAuto.state.sendMSG = msg.includes("\n") ? msg : `${icon} ${msg}`;
+                this.sendWebhook();
+            }
+        },
+
+        // 推送去重：同一天内内容相同（数字归一化后）的通知只推送一次
+        _dedupePush(msg) {
+            try {
+                const today = Utils.getTodayNum();
+                let rec = GM_getValue("Config.pushDedupe", null);
+                if (!rec || rec.date !== today) rec = { date: today, keys: [] };
+                const key = String(msg).replace(/\d+/g, "#").replace(/\s+/g, "").slice(0, 120);
+                if (rec.keys.includes(key)) return false;
+                rec.keys.push(key);
+                GM_setValue("Config.pushDedupe", rec);
+                return true;
+            } catch (_) {
+                return true; // 去重逻辑异常时不阻断推送
+            }
+        },
+
+        // 发送webhook通知
+        async sendWebhook() {
+            await Promise.all(Webhooks.map(async (i) => {
+                if (!i.enabled || !i.key) return;
+                const safeKey = String(i.key).trim();
+                const targetUrl = safeKey.startsWith("http") ? safeKey : i.url + safeKey;
+                try {
+                    const result = await this.xhr({
+                        method: "POST",
+                        url: targetUrl,
+                        headers: {
+                            "content-type": "application/json; charset=UTF-8",
+                        },
+                        data: JSON.stringify(i.msg),
+                    });
+                    if (result) GM_log(`🔵 「${i.name}」消息推送完成`);
+                } catch (e) {
+                    GM_log(`🔴 「${i.name}」消息推送出错: ${e.message}`);
+                }
+            }));
+        },
+
+        // 封装 GM_xmlhttpRequest，15秒超时，支持重定向
+        xhr(options) {
+            return new Promise((resolve, reject) => {
+                const start = Date.now();
+                GM_xmlhttpRequest({
+                    anonymous: false,
+                    ...options,
+                    timeout: 15000,
+                    onload: (res) => {
+                        const cost = ((Date.now() - start) / 1000).toFixed(2);
+                        if (res.status >= 200 && res.status < 300) {
+                            resolve(res.responseText);
+                        } else if ([301, 302, 307, 308].includes(res.status)) {
+                            const match = res.responseHeaders?.match(/Location:\s*(.*?)\s*\r?\n/i);
+                            resolve(match ? match[1] : false);
+                        } else {
+                            reject(new Error(`HTTP ${res.status}，用时 ${cost} 秒`));
+                        }
+                    },
+                    onerror: (err) => {
+                        const cost = ((Date.now() - start) / 1000).toFixed(2);
+                        reject(new Error(`${err?.error || "网络错误"}，用时 ${cost} 秒`));
+                    },
+                    ontimeout: () => {
+                        const cost = ((Date.now() - start) / 1000).toFixed(2);
+                        reject(new Error(`请求超时，用时 ${cost} 秒`));
+                    }
+                });
+            });
+        },
+
+        randomRange(min, max) {
+            return Math.floor(Math.random() * (max - min + 1) + min);
+        },
+
+        getTimestamp() {
+            return Date.now();
+        },
+
+        getTodayNum() {
+            const d = new Date();
+            return Number(`${d.getFullYear()}${String(d.getMonth()+1).padStart(2,"0")}${String(d.getDate()).padStart(2,"0")}`);
+        },
+
+        getTodayStr() {
+            const d = new Date();
+            return `${d.getMonth()+1}/${d.getDate()}/${d.getFullYear()}`;
+        },
+
+        getRandomUUID() {
+            // 优先使用 crypto.randomUUID；不可用（旧浏览器/非安全上下文）时回退到手动拼接
+            try {
+                if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+                    return crypto.randomUUID().replace(/-/g, "").toUpperCase();
+                }
+            } catch (_) {}
+            const hex = "0123456789ABCDEF";
+            let uuid = "";
+            for (let i = 0; i < 32; i++) {
+                uuid += hex[Math.floor(Math.random() * 16)];
+            }
+            return uuid;
+        },
+
+        isJSON(s) {
+            try { const j = JSON.parse(s); return Array.isArray(j) || (typeof j === "object" && j !== null); }
+            catch { return false; }
+        },
+
+        delay(ms) {
+            return new Promise(r => setTimeout(r, ms));
+        },
+
+        // 防封号核心：所有操作间必须使用随机延迟
+        randomDelay(min = 3000, max = 8000) {
+            return this.delay(this.randomRange(min, max));
+        },
+
+        waitForElement(selector, timeout = 30000) {
+            return new Promise((resolve) => {
+                if (typeof document === "undefined" || !document.body) return resolve(null);
+                const element = document.querySelector(selector);
+                if (element) return resolve(element);
+
+                const observer = new MutationObserver(() => {
+                    const el = document.querySelector(selector);
+                    if (el) { observer.disconnect(); resolve(el); }
+                });
+                observer.observe(document.body, { childList: true, subtree: true });
+
+                setTimeout(() => {
+                    observer.disconnect();
+                    resolve(document.querySelector(selector));
+                }, timeout);
+            });
+        },
+
+        waitForElementsByText(containerSelector, textPatterns, timeout = 30000) {
+            return new Promise((resolve) => {
+                const findElements = () => {
+                    const containers = document.querySelectorAll(containerSelector);
+                    const results = [];
+                    for (const container of containers) {
+                        const text = container.textContent || "";
+                        for (const pattern of textPatterns) {
+                            if (text.includes(pattern)) {
+                                results.push({ element: container, pattern });
+                                break;
+                            }
+                        }
+                    }
+                    return results;
+                };
+
+                if (typeof document === "undefined" || !document.body) return resolve([]);
+                const found = findElements();
+                if (found.length > 0) return resolve(found);
+
+                const observer = new MutationObserver(() => {
+                    const matched = findElements();
+                    if (matched.length > 0) { observer.disconnect(); resolve(matched); }
+                });
+                observer.observe(document.body, { childList: true, subtree: true });
+
+                setTimeout(() => {
+                    observer.disconnect();
+                    resolve(findElements());
+                }, timeout);
+            });
+        }
+    };
+
+    const API = {
+        async getToken(url, maxRetries = 3) {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    const res = await Utils.xhr({ url });
+                    if (!Utils.isJSON(res)) {
+                        if (attempt < maxRetries) {
+                            await Utils.delay(3210);
+                            continue;
+                        }
+                        return false;
+                    }
+                    const data = JSON.parse(res);
+                    if (data.error) {
+                        Utils.log("🔴", `Token错误: ${data.error} - ${data.error_description || ''}`);
+                        if (["invalid_grant","invalid_request"].includes(data.error)) {
+                            GM_setValue("Config.token", false);
+                            GM_setValue("Config.code", "");
+                        }
+                        return false;
+                    }
+                    if (data.refresh_token && data.access_token) {
+                        GM_setValue("Config.token", data.refresh_token);
+                        GM_setValue("Config.tokenTime", Utils.getTimestamp());
+                        RewardsAuto.state.token = data.access_token;
+                        return true;
+                    }
+                    if (attempt < maxRetries) {
+                        await Utils.delay(3210);
+                        continue;
+                    }
+                    return false;
+                } catch (e) {
+                    if (e.message.includes("400") || e.message.includes("401")) {
+                        GM_setValue("Config.token", false);
+                        GM_setValue("Config.code", "");
+                        return false;
+                    }
+                    if (attempt < maxRetries) {
+                        await Utils.delay(3210);
+                        continue;
+                    }
+                    Utils.log("🔴", `Token请求失败: ${e.message}`);
+                    return false;
+                }
+            }
+            return false;
+        },
+
+        // 401 自动刷新 Token 并重试
+        async withTokenRetry(requestFn) {
+            let token = RewardsAuto.state.token;
+            if (!token) return null;
+            try {
+                return await requestFn(token);
+            } catch (e) {
+                if (e.message && e.message.includes("401")) {
+                    Utils.log("🟡", "Token 过期，强制重新授权...");
+                    RewardsAuto.state.token = null;
+                    GM_setValue("Config.token", false);
+                    GM_setValue("Config.tokenTime", 0);
+                    const refreshed = await this.renewToken();
+                    if (!refreshed) return null;
+                    return await requestFn(RewardsAuto.state.token);
+                }
+                throw e;
+            }
+        },
+
+        // ====== 通用请求辅助（消除 DAPI / getuserinfo 重复样板） ======
+
+        // 解析请求区域：锁定中国区或跟随账号区域
+        _resolveRegion() {
+            return GM_getValue("Config.lock", true) ? "cn" : RewardsAuto.state.region.toLowerCase();
+        },
+
+        // 生成 64 位活动 ID（两段 UUID 去连字符拼接，匹配 App 实际上报格式）
+        _genActivityId() {
+            return Utils.getRandomUUID() + Utils.getRandomUUID().slice(0, 24);
+        },
+
+        // 统一的 DAPI 请求：自动携带 App 端鉴权头、Token 失效重试，返回原始响应文本
+        async _dapiRequest({ path = "/me/activities", method = "POST", body = null, region = null, extraHeaders = {} }) {
+            const country = region || this._resolveRegion();
+            return this.withTokenRetry(token => Utils.xhr({
+                method,
+                url: `https://prod.rewardsplatform.microsoft.com/dapi${path}`,
+                headers: {
+                    "content-type": "application/json; charset=UTF-8",
+                    "user-agent": RewardsAuto.ua.app,
+                    "authorization": `Bearer ${token}`,
+                    "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
+                    "x-rewards-ismobile": "true",
+                    "x-rewards-country": country,
+                    "x-rewards-language": "zh",
+                    ...extraHeaders
+                },
+                data: body ? JSON.stringify(body) : undefined
+            }));
+        },
+
+        // 统一的 getuserinfo 请求（无需 Token），解析失败返回 null
+        async _getUserInfo() {
+            try {
+                const res = await Utils.xhr({
+                    url: `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${Date.now()}`,
+                    headers: {
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": "https://rewards.bing.com/",
+                        "x-requested-with": "XMLHttpRequest"
+                    }
+                });
+                return Utils.isJSON(res) ? JSON.parse(res) : null;
+            } catch (_) {
+                return null;
+            }
+        },
+
+        async renewToken() {
+            if (!GM_getValue("Tasks.sign", true) && !GM_getValue("Tasks.read", true)) return true;
+
+            const authUrl = "https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&response_type=code&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&redirect_uri=https://login.live.com/oauth20_desktop.srf";
+            // @crontab 在 service_worker 中运行，无微软登录 Cookie，自动获取授权码必然失败，直接跳过
+            const isBackground = typeof document === "undefined";
+
+            // 获取授权码：前台先尝试自动重定向捕获；后台/失败时打开授权页等待用户手动完成
+            const fetchCode = async (msg) => {
+                Utils.log("🟡", `${msg}，尝试获取授权码...`);
+
+                // 优先检查用户是否已提前粘贴授权码（脚本设置或授权页自动捕获），有则直接用，不清空
+                const existing = GM_getValue("Config.code", "");
+                if (existing) {
+                    let code = null;
+                    if (existing.includes("code=")) {
+                        try { code = new URL(existing).searchParams.get("code"); } catch {}
+                    }
+                    if (!code && existing.length > 20 && !existing.includes("http")) {
+                        code = existing.trim();
+                    }
+                    if (code && code.length > 10) {
+                        Utils.log("🟢", "检测到已保存的授权码，直接使用");
+                        return code;
+                    }
+                }
+
+                // 无有效授权码，清空残留值后等待用户输入
+                GM_setValue("Config.code", "");
+
+                if (!isBackground) {
+                    try {
+                        const res = await new Promise((resolve, reject) => {
+                            GM_xmlhttpRequest({
+                                method: "GET",
+                                url: authUrl,
+                                headers: { "User-Agent": navigator.userAgent },
+                                onload: (r) => resolve(r),
+                                onerror: () => reject(new Error("请求失败")),
+                                ontimeout: () => reject(new Error("超时")),
+                                timeout: 8000
+                            });
+                        });
+                        const code = new URL(res.finalUrl || "").searchParams.get("code");
+                        if (code) {
+                            Utils.log("🟢", "自动获取授权码成功");
+                            return code;
+                        }
+                    } catch (e) {
+                        Utils.log("🟡", `自动获取失败: ${e.message}`);
+                    }
+                } else {
+                    Utils.log("🟡", "后台模式无登录态，跳过自动获取");
+                }
+
+                Utils.log("🟡", "请手动完成授权...");
+                try { GM_openInTab(authUrl, { active: true, insert: true }); } catch(_) {}
+
+                if (GM_getValue("Notice.bro", true)) {
+                    try {
+                        GM_notification({
+                            text: "完成后粘贴地址栏URL到脚本设置的「授权码链接」",
+                            title: "🟡 需要授权", timeout: 0
+                        });
+                    } catch(_) {}
+                }
+
+                // 等待用户粘贴或授权页自动捕获授权码（最长 90 秒，避免 crontab 超时被终止）
+                for (let i = 0; i < 90; i++) {
+                    await Utils.delay(1000);
+                    const raw = GM_getValue("Config.code", "");
+                    if (!raw) continue;
+
+                    let code = null;
+                    if (raw.includes("code=")) {
+                        try { code = new URL(raw).searchParams.get("code"); } catch {}
+                    }
+                    if (!code && raw.length > 20 && !raw.includes("http")) {
+                        code = raw.trim();
+                    }
+                    if (code && code.length > 10) {
+                        Utils.log("🟢", "授权码获取成功");
+                        return code;
+                    }
+                }
+                Utils.log("🔴", "授权码获取超时", true);
+                return null;
+            };
+
+            // 改为循环（原递归会丢弃刚获取的授权码，导致用户需重复授权）
+            for (let attempt = 0; attempt < 3; attempt++) {
+                let refreshToken = GM_getValue("Config.token", false);
+                const tokenTime = GM_getValue("Config.tokenTime", 0);
+
+                // Token 超过 7 天记录日志（仍用 refresh_token 续期；微软 refresh_token 有效期 90 天，
+                // 续期成功后 tokenTime 会刷新，无需强制走授权码流程）
+                if (tokenTime > 0) {
+                    const days = (Utils.getTimestamp() - tokenTime) / (1000 * 60 * 60 * 24);
+                    if (days > 7) {
+                        Utils.log("🟡", `Token已${Math.floor(days)}天，尝试续期`);
+                    }
+                }
+
+                if (refreshToken) {
+                    // 优先用 refresh_token 续期
+                    const url = `https://login.live.com/oauth20_token.srf?client_id=0000000040170455&refresh_token=${encodeURIComponent(refreshToken)}&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&grant_type=REFRESH_TOKEN`;
+                    if (await this.getToken(url)) return true;
+                    // 续期失败，清除 token，下轮改用授权码
+                    GM_setValue("Config.token", false);
+                    continue;
+                }
+
+                // 无 refreshToken，通过授权码换取 token
+                const code = await fetchCode(attempt === 0 ? "需要授权码" : "上次授权码已失效，请重新授权");
+                if (!code) return false;
+
+                const url = `https://login.live.com/oauth20_token.srf?client_id=0000000040170455&code=${encodeURIComponent(code)}&redirect_uri=https://login.live.com/oauth20_desktop.srf&grant_type=authorization_code`;
+                if (await this.getToken(url)) {
+                    Utils.log("🟢", "Token获取成功！", true);
+                    return true;
+                }
+                // 授权码失效，清除后下轮重新获取
+                GM_setValue("Config.token", false);
+                GM_setValue("Config.code", "");
+            }
+
+            Utils.log("🔴", "Token 多次获取失败，请检查账号授权状态", true);
+            return false;
+        },
+
+        // 优先从 earn 页面“今日积分”表格解析，DAPI 只做兜底
+        async getRewardsInfo(maxRetries = 3) {
+            for (let attempt = 1; attempt <= maxRetries; attempt++) {
+                try {
+                    const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+                    const clean = html.replace(/\\"/g, '"');
+                    
+                    // 尝试从Next.js RSC数据中解析
+                    let balance = 0;
+                    let pcMax = 60, pcCur = 0, mobMax = 0, mobCur = 0;
+                    let dailyOffer = 0;
+                    let searchQuotaFound = false;
+                    
+                    // 从 RSC JSON 数据中解析 pointsCounters（兼容有/无 mobile 字段、不同字段顺序）
+                    const pcIdx = clean.indexOf('"pointsCounters":{');
+                    if (pcIdx !== -1) {
+                        let start = pcIdx + 17, depth = 0, end = start;
+                        for (let i = start; i < clean.length && i < start + 500; i++) {
+                            if (clean[i] === '{') depth++;
+                            if (clean[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+                        }
+                        try {
+                            const pts = JSON.parse(clean.substring(start, end));
+                            pcMax = pts.pc?.max ?? 60;
+                            pcCur = pts.pc?.progress ?? 0;
+                            mobMax = pts.mobile?.max ?? 0;
+                            mobCur = pts.mobile?.progress ?? 0;
+                            dailyOffer = pts.dailyOffer ?? 0;
+                            if (pts.totalPoints != null) balance = Number(pts.totalPoints);
+                        } catch {}
+                    }
+
+                    // 补充获取 balance
+                    if (balance === 0) {
+                        const balMatch = clean.match(/"balance":(\d+)/) || clean.match(/"availablePoints":(\d+)/);
+                        if (balMatch) balance = parseInt(balMatch[1]);
+                    }
+
+                    // 解析今日积分明细
+                    const todayDetails = [];
+                    
+                    // 从RSC数据中解析活动卡片（括号深度匹配，兼容嵌套数组）
+                    const acIdx = clean.indexOf('"activityCards":[');
+                    if (acIdx !== -1) {
+                        let acStart = acIdx + 16, acDepth = 0, acEnd = acStart;
+                        for (let i = acStart; i < clean.length && i < acStart + 5000; i++) {
+                            if (clean[i] === '[') acDepth++;
+                            if (clean[i] === ']') { acDepth--; if (acDepth === 0) { acEnd = i + 1; break; } }
+                        }
+                        try {
+                            const cardsStr = clean.substring(acStart, acEnd);
+                            const cardRegex = /"title":"([^"]+)".*?"points":(\d+).*?"isCompleted":(true|false)/g;
+                            let cardMatch;
+                            while ((cardMatch = cardRegex.exec(cardsStr)) !== null) {
+                                const title = cardMatch[1];
+                                const points = parseInt(cardMatch[2]);
+                                const isCompleted = cardMatch[3] === "true";
+                                if (points > 0 && isCompleted) {
+                                    todayDetails.push({ title, points });
+                                }
+                            }
+                        } catch {}
+                    }
+                    
+                    // 方法2: 从HTML中解析搜索进度
+                    const toNum = value => parseInt(String(value).replace(/,/g, ''), 10) || 0;
+                    const searchRowMatch = clean.match(/<p>\s*必应搜索\s*<\/p>\s*<\/div>\s*<div(?=[^>]*justify-self-end)[^>]*>([\s\S]{0,500}?)<\/div>/i);
+                    const searchHtmlMatch = searchRowMatch
+                        ? (searchRowMatch[1].match(/<span[^>]*>([\d,]+)<\/span>\s*<span[^>]*>\s*\/\s*([\d,]+)\s*<\/span>/i)
+                            || searchRowMatch[1].match(/([\d,]+)\s*\/\s*([\d,]+)/))
+                        : null;
+                    if (searchHtmlMatch) {
+                        pcCur = toNum(searchHtmlMatch[1]);
+                        pcMax = toNum(searchHtmlMatch[2]);
+                        searchQuotaFound = pcMax > 0;
+                        todayDetails.push({ 
+                            title: '必应搜索', 
+                            points: pcCur,
+                            max: pcMax
+                        });
+                        Utils.log("🔍", `页面表格配额: PC ${pcCur}/${pcMax}`);
+                    }
+                    
+                    // 方法3: 从RSC数据中解析搜索进度
+                    const searchRscMatch = clean.match(/"combinedSearch":\{[^}]*"progress":(\d+)[^}]*"max":(\d+)/);
+                    if (searchRscMatch && !todayDetails.some(d => d.title === '必应搜索')) {
+                        pcCur = toNum(searchRscMatch[1]);
+                        pcMax = toNum(searchRscMatch[2]);
+                        searchQuotaFound = pcMax > 0;
+                        todayDetails.push({
+                            title: '必应搜索',
+                            points: pcCur,
+                            max: pcMax
+                        });
+                    }
+                    
+                    // 添加dailyOffer到今日明细
+                    if (dailyOffer > 0) {
+                        todayDetails.push({ title: '优惠', points: dailyOffer });
+                    }
+                    
+                    // 匹配其他活动（如"优惠"）
+                    const otherActivityRegex = /<p>([^<]+)<\/p><\/div><div[^>]*>(\d+)<\/div>/g;
+                    let otherMatch;
+                    while ((otherMatch = otherActivityRegex.exec(clean)) !== null) {
+                        const title = otherMatch[1];
+                        const points = parseInt(otherMatch[2]);
+                        if (points > 0 && !todayDetails.some(d => d.title === title)) {
+                            todayDetails.push({ title, points });
+                        }
+                    }
+
+                    // 解析历史积分
+                    const history = {
+                        month: 0,
+                        year: 0,
+                        lifetime: 0
+                    };
+                    
+                    // 方法1: 从RSC数据中解析历史积分
+                    const historyRscMatch = clean.match(/"pointsHistory":\{[^}]*"thisMonth":\{"earn":(\d+)[^}]*"thisYear":\{"earn":(\d+)[^}]*"lifetime":\{"earn":(\d+)/);
+                    if (historyRscMatch) {
+                        history.month = parseInt(historyRscMatch[1]);
+                        history.year = parseInt(historyRscMatch[2]);
+                        history.lifetime = parseInt(historyRscMatch[3]);
+                    } else {
+                        // 方法2: 从HTML中解析历史积分
+                        const monthHtmlMatch = clean.match(/本月.*?(\d[\d,]*)<\/div>/);
+                        const yearHtmlMatch = clean.match(/今年.*?(\d[\d,]*)<\/div>/);
+                        const lifetimeHtmlMatch = clean.match(/生存期.*?(\d[\d,]*)<\/div>/);
+                        
+                        // JSON格式
+                        const monthJsonMatch = clean.match(/"monthlyPoints":(\d+)/);
+                        const yearJsonMatch = clean.match(/"yearlyPoints":(\d+)/);
+                        const lifetimeJsonMatch = clean.match(/"lifetimePoints":(\d+)/);
+                        
+                        if (monthHtmlMatch) {
+                            history.month = parseInt(monthHtmlMatch[1].replace(/,/g, ''));
+                        } else if (monthJsonMatch) {
+                            history.month = parseInt(monthJsonMatch[1]);
+                        }
+                        
+                        if (yearHtmlMatch) {
+                            history.year = parseInt(yearHtmlMatch[1].replace(/,/g, ''));
+                        } else if (yearJsonMatch) {
+                            history.year = parseInt(yearJsonMatch[1]);
+                        }
+                        
+                        if (lifetimeHtmlMatch) {
+                            history.lifetime = parseInt(lifetimeHtmlMatch[1].replace(/,/g, ''));
+                        } else if (lifetimeJsonMatch) {
+                            history.lifetime = parseInt(lifetimeJsonMatch[1]);
+                        }
+                    }
+
+                    if (!searchQuotaFound) {
+                        const userInfoResult = await this.getSearchQuotaFromUserInfo();
+                        if (userInfoResult) {
+                            Utils.log("🟢", "页面未命中搜索配额，使用 getuserinfo 兜底");
+                            return userInfoResult;
+                        }
+                    }
+
+                    if (!searchQuotaFound && RewardsAuto.state.token) {
+                        const apiResult = await this.getSearchQuotaFromAPI();
+                        if (apiResult) {
+                            Utils.log("🟢", "页面未命中搜索配额，使用 DAPI 兜底");
+                            return apiResult;
+                        }
+                    }
+                    
+                    // 补充阅读进度（仅在有 token 时查询，避免无谓的告警日志）
+                    let readProgress = 0, readMax = 30;
+                    if (RewardsAuto.state.token) {
+                        try {
+                            const readInfo = await this.getReadProgress();
+                            if (readInfo) {
+                                readProgress = readInfo.progress;
+                                readMax = readInfo.max;
+                            }
+                        } catch (e) {}
+                    }
+                    
+                    return {
+                        balance,
+                        pc: { progress: pcCur, max: pcMax },
+                        mobile: { progress: mobCur, max: mobMax },
+                        readProgress,
+                        readMax,
+                        dailyOffer,
+                        todayDetails,
+                        history
+                    };
+                } catch (e) {
+                    if (attempt < maxRetries) {
+                        await Utils.delay(3210);
+                        continue;
+                    }
+                    Utils.log("🔴", `仪表盘获取失败: ${e.message}`);
+                    return false;
+                }
+            }
+            return false;
+        },
+
+        async signApp() {
+            const region = this._resolveRegion();
+            try {
+                const res = await this._dapiRequest({
+                    region,
+                    extraHeaders: { "x-rewards-partnerid": "startapp", "x-rewards-flights": "rwgobig" },
+                    body: {
+                        amount: 1,
+                        id: this._genActivityId(),
+                        type: 103,
+                        country: region,
+                        channel: RewardsAuto.appConfig.channel
+                    }
+                });
+                if (Utils.isJSON(res)) {
+                    const data = JSON.parse(res);
+                    const response = data.response || {};
+                    if (response.activity) return Number(response.activity.p || response.activity.points || 0);
+                    if (response.isDuplicate || response.activity === null) return 0;
+                    Utils.log("🟡", `App签入响应未确认: ${String(res).slice(0, 120)}`);
+                }
+            } catch (e) {
+                Utils.log("🔴", `App签入失败: ${e.message}`);
+            }
+            return -1;
+        },
+
+        async getRequestVerificationToken(pageUrl = "https://rewards.bing.com/") {
+            // 默认 rewards 首页复用带缓存的 getRewardsToken，避免重复请求
+            if (pageUrl === "https://rewards.bing.com/") {
+                const token = await this.getRewardsToken();
+                return token || "";
+            }
+            try {
+                const html = await Utils.xhr({
+                    url: pageUrl,
+                    headers: {
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": "https://rewards.bing.com/"
+                    },
+                    anonymous: false
+                });
+                const tokenMatch = html.match(/name=["']__RequestVerificationToken["'][^>]*value=["']([^"']+)["']/i)
+                    || html.match(/RequestVerificationToken.*?value=["']([^"']+)["']/i)
+                    || html.match(/"verificationToken"\s*:\s*"([^"]+)"/i)
+                    || html.match(/"__RequestVerificationToken"\s*:\s*"([^"]+)"/i);
+                return tokenMatch ? tokenMatch[1].replace(/&amp;/g, "&") : "";
+            } catch (e) {
+                Utils.log("🟡", `活动Token获取失败: ${e.message}`);
+                return "";
+            }
+        },
+
+        async reportActivity(offerId, hash, referer = "https://rewards.bing.com/") {
+            const token = await this.getRequestVerificationToken(referer);
+            const params = new URLSearchParams({
+                id: offerId,
+                hash: hash || "1",
+                activityAmount: "1"
+            });
+            if (token) params.set("__RequestVerificationToken", token);
+
+            const headers = {
+                "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "user-agent": RewardsAuto.ua.pc,
+                "referer": referer,
+                "origin": "https://rewards.bing.com",
+                "x-requested-with": "XMLHttpRequest"
+            };
+            if (token) headers["RequestVerificationToken"] = token;
+
+            try {
+                return await Utils.xhr({
+                    method: "POST",
+                    url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
+                    headers,
+                    data: params.toString(),
+                    anonymous: false
+                });
+            } catch (e) {
+                // HTTP 400：该活动类型（如 Gamification_DailySet）不被 reportactivity 接口支持，属预期，静默返回
+                if (e.message && e.message.includes("400")) return false;
+                throw e;
+            }
+        },
+
+        // 每日活动上报：通过 reportActivity API 完成（匹配浏览器行为）
+        async reportDailyActivity(searchUrl) {
+            try {
+                const fullUrl = searchUrl.startsWith("http") ? searchUrl : `https://cn.bing.com${searchUrl}`;
+                const urlObj = new URL(fullUrl);
+                const sp = urlObj.searchParams;
+                const ig = Utils.getRandomUUID().replace(/-/g, '').substring(0, 32).toUpperCase();
+
+                // cn.bing.com 版本的 URL（用作 referer 和 body url）
+                const cnUrl = fullUrl.replace(/^https?:\/\/www\.bing\.com/, "https://cn.bing.com")
+                                     .replace(/^https:\/\/bing\.com/, "https://cn.bing.com");
+                const cnUrlObj = new URL(cnUrl);
+                const cnSp = cnUrlObj.searchParams;
+
+                // 构建 reportActivity 查询参数（匹配浏览器抓包：IID=commerce.5067，不含 ajaxreq）
+                const reportParams = new URLSearchParams();
+                reportParams.set("IG", ig);
+                reportParams.set("IID", "commerce.5067");
+                if (cnSp.get("form")) reportParams.set("form", cnSp.get("form"));
+                if (cnSp.get("ocid") || cnSp.get("OCID")) reportParams.set("ocid", cnSp.get("ocid") || cnSp.get("OCID"));
+                if (cnSp.get("rnoreward")) reportParams.set("rnoreward", cnSp.get("rnoreward"));
+
+                // 步骤1: GET 加载活动页面（服务器记录访问）
+                try {
+                    await Utils.xhr({
+                        method: "GET",
+                        url: cnUrl,
+                        headers: {
+                            "user-agent": RewardsAuto.ua.pc,
+                            "referer": "https://rewards.bing.com/",
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
+                        }
+                    });
+                } catch (_) {}
+
+                // 步骤2: 发送 ncheader（匹配浏览器的预请求）
+                const ncheaderParams = new URLSearchParams();
+                ncheaderParams.set("ver", String(Date.now()).substring(0, 8));
+                ncheaderParams.set("IID", "commerce.5057");
+                ncheaderParams.set("IG", ig);
+                try {
+                    await Utils.xhr({
+                        method: "POST",
+                        url: `https://cn.bing.com/rewardsapp/ncheader?${ncheaderParams.toString()}`,
+                        headers: {
+                            "content-type": "application/x-www-form-urlencoded",
+                            "user-agent": RewardsAuto.ua.pc,
+                            "referer": cnUrl,
+                            "origin": "https://cn.bing.com",
+                            "accept": "*/*",
+                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
+                        },
+                        data: "wb=1;i=1;v=1"
+                    });
+                } catch (_) { /* ncheader 失败不阻断 */ }
+
+                // 步骤3: 发送 reportActivity
+                const bodyParams = new URLSearchParams();
+                bodyParams.set("url", cnUrl);
+                bodyParams.set("V", "web");
+
+                await Utils.xhr({
+                    method: "POST",
+                    url: `https://cn.bing.com/rewardsapp/reportActivity?${reportParams.toString()}`,
+                    headers: {
+                        "content-type": "application/x-www-form-urlencoded",
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": cnUrl,
+                        "origin": "https://cn.bing.com",
+                        "accept": "*/*",
+                        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
+                    },
+                    data: bodyParams.toString()
+                });
+                return true;
+            } catch (e) {
+                Utils.log("🟡", `每日活动上报失败: ${e.message}`);
+                return false;
+            }
+        },
+
+        // 获取今日每日活动列表（getuserinfo 结构化数据，含已完成项）
+        async getDailySetItems() {
+            const items = [];
+            try {
+                const data = await this._getUserInfo();
+                if (!data) return items;
+                const dashboard = data.dashboard || data;
+                const dailySetPromotions = dashboard.dailySetPromotions || {};
+                const now = new Date();
+                const todayKeys = [
+                    `${String(now.getMonth() + 1).padStart(2, "0")}/${String(now.getDate()).padStart(2, "0")}/${now.getFullYear()}`,
+                    `${now.getMonth() + 1}/${now.getDate()}/${now.getFullYear()}`
+                ];
+                for (const dateKey of todayKeys) {
+                    const dailyItems = dailySetPromotions[dateKey];
+                    if (!Array.isArray(dailyItems)) continue;
+                    for (const item of dailyItems) {
+                        if (!item) continue;
+                        const offerId = item.offerId || item.offerid || item.name || item.id;
+                        if (!offerId || items.some(it => it.offerId === offerId)) continue;
+                        const doneMax = Number(item.pointProgressMax || 0);
+                        const doneCur = Number(item.pointProgress || 0);
+                        // 拓宽 URL 字段捕获（兼容不同版本的字段命名），确保 bing.com 访问上报可用
+                        const url = item.destinationUrl || item.destination || item.url || item.link
+                            || item.clickUrl || item.activityUrl || item.attributes?.url || "";
+                        // 调试：输出活动项字段，便于定位真实 URL/hash 字段名
+                        if (GM_getValue("Config.debugDailySet", false)) {
+                            Utils.log("🔵", `每日活动原始字段: ${Object.keys(item).join(",")}`);
+                            Utils.log("🔵", `每日活动项: ${JSON.stringify(item).slice(0, 400)}`);
+                        }
+                        items.push({
+                            title: item.title || item.name || "",
+                            points: Number(item.pointProgressMax ?? item.points ?? 0),
+                            offerId,
+                            hash: item.hash || item.activityId || "",
+                            url,
+                            complete: !!(item.complete || item.isCompleted || item.completed || (doneMax > 0 && doneCur >= doneMax))
+                        });
+                    }
+                    if (items.length > 0) break;
+                }
+            } catch (e) {
+                Utils.log("🟡", `每日活动列表获取失败: ${e.message}`);
+            }
+            return items;
+        },
+
+        async signPC() {
+            try {
+                const res = await this.reportActivity("Gamification_DailyCheckIn", "1", "https://rewards.bing.com/");
+                if (Utils.isJSON(res)) {
+                    const data = JSON.parse(res);
+                    return Number(data.points || data.response?.activity?.p || 0);
+                }
+            } catch (e) {
+                if (e.message?.includes("401")) RewardsAuto.state.pc401 = true;
+                Utils.log("🟡", `PC签入失败: ${e.message}`);
+            }
+            return -1;
+        },
+
+        async appActivity(type, offerid) {
+            const region = this._resolveRegion();
+            const body = {
+                amount: 1,
+                country: region,
+                id: this._genActivityId(),
+                type: type,
+                channel: RewardsAuto.appConfig.channel
+            };
+            if (offerid) {
+                body.attributes = { offerid: offerid };
+            }
+            try {
+                const res = await this._dapiRequest({ region, body });
+                if (Utils.isJSON(res)) {
+                    const data = JSON.parse(res);
+                    const points = data.response?.activity?.p || 0;
+                    const isDuplicate = data.response?.isDuplicate || false;
+                    const balance = data.response?.balance || 0;
+                    return { points, isDuplicate, balance };
+                }
+            } catch (e) {
+                Utils.log("🔴", `App活动失败(${offerid}): ${e.message}`);
+            }
+            return null;
+        },
+
+        async getReadProgress() {
+            try {
+                const res = await this._dapiRequest({
+                    method: "GET",
+                    path: "/me?channel=SAAndroid&options=613",
+                    region: "cn"
+                });
+                if (Utils.isJSON(res)) {
+                    const promos = JSON.parse(res).response?.promotions || [];
+                    const readOfferId = RewardsAuto.appConfig.offerIds.readArticle;
+                    const task = promos.find(x => x.attributes?.offerid === readOfferId);
+                    if (task && task.attributes) {
+                        const progress = parseInt(task.attributes.progress) || 0;
+                        const max = parseInt(task.attributes.max) || 30;
+                        Utils.log("📊", `阅读进度查询: ${progress}/${max} (offerid: ${readOfferId})`);
+                        return { progress, max };
+                    } else {
+                        Utils.log("🟡", `阅读任务未找到 (offerid: ${readOfferId})`);
+                    }
+                } else {
+                    Utils.log("🟡", `DAPI 响应不是 JSON: ${String(res).substring(0, 100)}`);
+                }
+            } catch (e) {
+                Utils.log("🔴", `阅读进度获取失败: ${e.message}`);
+            }
+            return false;
+        },
+
+        // 获取 RequestVerificationToken（用于 reportactivity API，带缓存避免重复请求）
+        async getRewardsToken(force = false) {
+            const cache = RewardsAuto.state._rvTokenCache;
+            if (!force && cache && cache.token && (Date.now() - cache.time < 30 * 60 * 1000)) {
+                return cache.token;
+            }
+            try {
+                const html = await Utils.xhr({
+                    url: "https://rewards.bing.com/",
+                    headers: {
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": "https://rewards.bing.com/"
+                    },
+                    anonymous: false
+                });
+                if (html) {
+                    const match = html.match(/name=["']__RequestVerificationToken["'][^>]*value=["']([^"']+)["']/i)
+                        || html.replace(/\s/g, "").match(/RequestVerificationToken(.*?)value="(.*?)"/)
+                        || html.match(/"verificationToken"\s*:\s*"([^"]+)"/i)
+                        || html.match(/"__RequestVerificationToken"\s*:\s*"([^"]+)"/i);
+                    if (match) {
+                        const token = match[match.length - 1].replace(/&amp;/g, "&");
+                        RewardsAuto.state._rvTokenCache = { token, time: Date.now() };
+                        return token;
+                    }
+                }
+            } catch (e) {
+                Utils.log("🟡", `RequestVerificationToken 获取失败: ${e.message}`);
+            }
+            return false;
+        },
+
+        async getSearchQuotaFromUserInfo() {
+            try {
+                const data = await this._getUserInfo();
+                if (!data) return false;
+                const dashboard = data.dashboard || data;
+                const userStatus = dashboard.userStatus || {};
+                const counters = userStatus.counters || {};
+
+                const sumCounter = items => {
+                    if (!Array.isArray(items)) return { progress: 0, max: 0 };
+                    return items.reduce((acc, item) => {
+                        acc.progress += Number(item.pointProgress || 0);
+                        acc.max += Number(item.pointProgressMax || item.pointMax || 0);
+                        return acc;
+                    }, { progress: 0, max: 0 });
+                };
+
+                const pc = sumCounter(counters.pcSearch);
+                if (pc.max === 0) return false;
+
+                const balance = Number(userStatus.availablePoints || dashboard.availablePoints || 0);
+
+                // 获取阅读进度
+                let readProgress = 0, readMax = 30;
+                try {
+                    const readInfo = await API.getReadProgress();
+                    if (readInfo) {
+                        readProgress = readInfo.progress;
+                        readMax = readInfo.max;
+                    }
+                } catch (e) {}
+
+                Utils.log("📊", `getuserinfo查询: PC ${pc.progress}/${pc.max}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+
+                return {
+                    balance,
+                    pc,
+                    readProgress,
+                    readMax,
+                    dailyOffer: 0,
+                    todayDetails: pc.max > 0 ? [{ title: "必应搜索", points: pc.progress, max: pc.max }] : [],
+                    history: null
+                };
+            } catch (e) {
+                if (GM_getValue("Config.debugDAPI", false)) {
+                    Utils.log("🟡", `getuserinfo 查询失败: ${e.message}`);
+                }
+                return false;
+            }
+        },
+
+        // 查不到 counters 或配额 0/0 时返回 false，回退到 HTML 解析
+        async getSearchQuotaFromAPI() {
+            try {
+                const res = await this._dapiRequest({
+                    method: "GET",
+                    path: "/me?channel=SAAndroid&options=613",
+                    region: "cn"
+                });
+                if (Utils.isJSON(res)) {
+                    const data = JSON.parse(res);
+                    const response = data.response || {};
+                    const promos = response.promotions || [];
+                    if (GM_getValue("Config.debugDAPI", false)) {
+                        const promoNames = promos.map(p => p.name || p.attributes?.offerid || "?").join(", ");
+                        Utils.log("🔵", `DAPI promotions(${promos.length}): ${promoNames}`);
+
+                        for (let i = 0; i < Math.min(promos.length, 5); i++) {
+                            const p = promos[i];
+                            const attrs = p.attributes || {};
+                            const attrStr = Object.entries(attrs).map(([k, v]) => `${k}=${v}`).join(", ").slice(0, 300);
+                            Utils.log("🔵", `DAPI promo[${i}] ${p.name}: ${attrStr}`);
+                        }
+                    }
+
+                    const counters = response.counters || response.userStatus?.counters;
+                    if (!counters) {
+                        if (GM_getValue("Config.debugDAPI", false)) {
+                            Utils.log("🟡", "DAPI 未返回 counters，回退到页面解析");
+                        }
+                        return false;
+                    }
+
+                    let pcCur = 0, pcMax = 0;
+                    if (counters?.pcSearch && counters.pcSearch.length > 0) {
+                        pcCur = counters.pcSearch[0].pointProgress || 0;
+                        pcMax = counters.pcSearch[0].pointProgressMax || 0;
+                    }
+
+                    if (pcMax === 0) {
+                        if (GM_getValue("Config.debugDAPI", false)) {
+                            Utils.log("🟡", "DAPI 返回配额 0，回退到页面解析");
+                        }
+                        return false;
+                    }
+
+                    const balance = response.balance || response.userStatus?.availablePoints || 0;
+
+                    // 获取阅读进度
+                    let readProgress = 0, readMax = 30;
+                    try {
+                        const readInfo = await API.getReadProgress();
+                        if (readInfo) {
+                            readProgress = readInfo.progress;
+                            readMax = readInfo.max;
+                        }
+                    } catch (e) {}
+
+                    Utils.log("📊", `DAPI查询: PC ${pcCur}/${pcMax}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+
+                    return {
+                        balance,
+                        pc: { progress: pcCur, max: pcMax },
+                        readProgress,
+                        readMax,
+                        dailyOffer: 0,
+                        todayDetails: [],
+                        history: null
+                    };
+                }
+            } catch (e) {
+                Utils.log("🟡", `DAPI查询失败: ${e.message}`);
+            }
+            return false;
+        },
+
+        // 查询当前积分余额
+        async getBalance() {
+            // 方法1: DAPI（需要 Token）
+            try {
+                const res = await this._dapiRequest({
+                    method: "GET",
+                    path: "/me?channel=SAAndroid&options=105",
+                    region: "cn"
+                });
+                if (Utils.isJSON(res)) {
+                    const data = JSON.parse(res);
+                    return data.response?.balance || 0;
+                }
+            } catch (e) {}
+
+            // 方法2: getuserinfo API（不需要 Token）
+            try {
+                const data2 = await this._getUserInfo();
+                if (data2) {
+                    return data2.dashboard?.availablePoints || data2.balance || 0;
+                }
+            } catch (e) {}
+
+            return 0;
+        },
+
+        // 执行阅读
+        async doRead() {
+            const region = this._resolveRegion();
+            try {
+                const res = await this._dapiRequest({
+                    region,
+                    body: {
+                        amount: 1,
+                        country: region,
+                        id: this._genActivityId(),
+                        type: 101,
+                        attributes: { offerid: RewardsAuto.appConfig.offerIds.readArticle }
+                    }
+                });
+                if (Utils.isJSON(res)) {
+                    const data = JSON.parse(res);
+                    const points = data.response?.activity?.p || 0;
+                    const isDuplicate = data.response?.isDuplicate || false;
+                    return { points, isDuplicate };
+                }
+                return null;
+            } catch (e) {
+                Utils.log("🔴", `阅读请求失败: ${e.message}`);
+                return false;
+            }
+        },
+
+        // 多层级解析：activityCards → promotionCards → 全局扫描 → HTML data 属性
+        async discoverCards() {
+            const cards = [];
+            const seenCardKeys = new Set();
+            try {
+                const html = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+                if (!html) { Utils.log("🔴", "earn 页面返回空"); return cards; }
+
+                // unescape 版本供 RSC 解析使用
+                const clean = html.replace(/\\"/g, '"');
+
+                // ---------- 动态提取 next-action（供 claimCard 使用） ----------
+                const naMatch = html.match(/name":"next-action"[^}]*"value":"([a-f0-9]{40,})"/)
+                    || html.match(/next-action["']\s*:\s*["']([a-f0-9]{40,})["']/)
+                    || clean.match(/"next-action"[^"]*"([a-f0-9]{40,})"/);
+                if (naMatch) {
+                    RewardsAuto._nextAction = naMatch[1];
+                    Utils.log("🟢", `动态 next-action: ${naMatch[1].slice(0, 12)}…`);
+                }
+
+                const pushCard = (card) => {
+                    if (!card || !card.offerId || !card.hash || card.points <= 0) return;
+                    const key = `${card.offerId}:${card.hash}`;
+                    if (seenCardKeys.has(key)) return;
+                    seenCardKeys.add(key);
+                    cards.push(card);
+                };
+
+                const inferKind = (offerId, title = "") => {
+                    const text = `${offerId} ${title}`;
+                    if (/quiz|trivia/i.test(text)) return "quiz";
+                    if (/puzzle/i.test(text)) return "puzzle";
+                    if (/image/i.test(text)) return "image_creator";
+                    if (/explore|search/i.test(text)) return "explore_search";
+                    if (/dailyset|daily/i.test(text)) return "daily";
+                    if (/streak/i.test(text)) return "streak";
+                    return "open_only";
+                };
+
+                // ---------- 辅助：从字符串提取单张卡片对象 ----------
+                const parseCard = (obj) => {
+                    const offerIdMatch = obj.match(/"offerId":"([^"]+)"/i)
+                        || obj.match(/"offerid":"([^"]+)"/i)
+                        || obj.match(/"offer_id":"([^"]+)"/i);
+                    const hashMatch = obj.match(/"hash":"([^"]+)"/)
+                        || obj.match(/"activityId":"([^"]+)"/)
+                        || obj.match(/"id":"([^"]+)"/);
+                    if (!offerIdMatch || !hashMatch) return null;
+
+                    const offerId = offerIdMatch[1];
+                    const hash = hashMatch[1];
+                    const pointsMatch = obj.match(/"points":(\d+)/);
+                    const isCompletedMatch = obj.match(/"isCompleted":(true|false)/i)
+                        || obj.match(/"completed":(true|false)/i)
+                        || obj.match(/"state":"(completed|CLAIMED)"/i);
+                    const titleMatch = obj.match(/"title":"([^"]+)"/)
+                        || obj.match(/"name":"([^"]+)"/)
+                        || obj.match(/"displayName":"([^"]+)"/);
+
+                    const points = pointsMatch ? parseInt(pointsMatch[1]) : 0;
+                    const isCompleted = isCompletedMatch
+                        ? (isCompletedMatch[1] === "true" || isCompletedMatch[1] === "completed" || isCompletedMatch[1] === "CLAIMED")
+                        : false;
+                    if (isCompleted) return null;
+
+                    const title = titleMatch ? titleMatch[1] : "";
+
+                    const skip = RewardsAuto.skipPatterns.some(p =>
+                        title.toLowerCase().includes(p.toLowerCase()) ||
+                        offerId.toLowerCase().includes(p.toLowerCase())
+                    );
+                    if (skip) return null;
+
+                    return { title, points, offerId, hash, kind: inferKind(offerId, title) };
+                };
+
+                // ---------- 方法0: getuserinfo 结构化数据 ----------
+                try {
+                    const data = await this._getUserInfo();
+                    if (data) {
+                        const dashboard = data.dashboard || data;
+                        const now = new Date();
+                        const todayKeys = new Set([
+                            `${String(now.getMonth() + 1).padStart(2, "0")}/${String(now.getDate()).padStart(2, "0")}/${now.getFullYear()}`,
+                            `${now.getMonth() + 1}/${now.getDate()}/${now.getFullYear()}`
+                        ]);
+
+                        const normalizeDashboardCard = (item, kind) => {
+                            if (!item) return null;
+                            const offerId = item.offerId || item.offerid || item.id || item.name;
+                            const hash = item.hash || item.activityId;
+                            const title = item.title || item.name || item.description || "";
+                            const points = Number(item.points ?? item.pointProgressMax ?? item.max ?? 0);
+                            const doneMax = Number(item.pointProgressMax || 0);
+                            const doneCur = Number(item.pointProgress || 0);
+                            const isCompleted = item.isCompleted || item.complete || item.completed || (doneMax > 0 && doneCur >= doneMax);
+                            if (!offerId || !hash || points <= 0 || isCompleted) return null;
+                            const skip = RewardsAuto.skipPatterns.some(p =>
+                                title.toLowerCase().includes(p.toLowerCase()) ||
+                                offerId.toLowerCase().includes(p.toLowerCase())
+                            );
+                            if (skip) return null;
+                            return {
+                                title,
+                                points,
+                                offerId,
+                                hash,
+                                kind: kind || inferKind(offerId, title),
+                                source: "getuserinfo",
+                                url: item.destinationUrl || item.destination || "https://rewards.bing.com/"
+                            };
+                        };
+
+                        const dailySetPromotions = dashboard.dailySetPromotions || {};
+                        for (const dateKey of todayKeys) {
+                            const dailyItems = dailySetPromotions[dateKey];
+                            if (Array.isArray(dailyItems)) {
+                                for (const item of dailyItems) pushCard(normalizeDashboardCard(item, "daily"));
+                            }
+                        }
+
+                        const morePromotions = dashboard.morePromotions || dashboard.promotions || [];
+                        if (Array.isArray(morePromotions)) {
+                            for (const item of morePromotions) pushCard(normalizeDashboardCard(item));
+                        }
+
+                        if (cards.length > 0) {
+                            Utils.log("🧩", `getuserinfo 命中 ${cards.length} 个活动卡片`);
+                        }
+                    }
+                } catch (e) {
+                    Utils.log("🟡", `getuserinfo 活动解析跳过: ${e.message}`);
+                }
+
+                // ---------- 方法1: activityCards 数组 ----------
+                const m1 = clean.match(/"activityCards":\[([\s\S]*?)\](?=,"|,"[a-z]|}$)/i);
+                if (m1) {
+                    Utils.log("🧩", "命中 activityCards 数组");
+                    const cardObjRegex = /\{[^{}]*\}/g;
+                    let m;
+                    while ((m = cardObjRegex.exec(m1[1])) !== null) {
+                        const card = parseCard(m[0]);
+                        pushCard(card);
+                    }
+                }
+
+                // ---------- 方法2: promotionCards / promotions 数组 ----------
+                if (cards.length === 0) {
+                    const m2 = clean.match(/"(?:promotionCards|promotions|dailySet|cards)":\[([\s\S]*?)\](?=,"|,"[a-z]|}$)/i);
+                    if (m2) {
+                        Utils.log("🧩", "命中 promotionCards/promotions 数组");
+                        const cardObjRegex = /\{[^{}]*\}/g;
+                        let m;
+                        while ((m = cardObjRegex.exec(m2[1])) !== null) {
+                            const card = parseCard(m[0]);
+                            pushCard(card);
+                        }
+                    }
+                }
+
+                // ---------- 方法3: 全局扫描含 offerId+hash 的对象（平衡括号匹配） ----------
+                if (cards.length === 0) {
+                    Utils.log("🧩", "全局扫描 RSC payload 中的卡片对象");
+                    const seen = new Set();
+                    const offerIdRe = /"offerId"|"offerid"|"offer_id"/gi;
+                    let m;
+                    while ((m = offerIdRe.exec(clean)) !== null) {
+                        let start = m.index;
+                        while (start > 0 && clean[start] !== '{') start--;
+                        if (clean[start] !== '{') continue;
+                        let depth = 0, end = start;
+                        for (let i = start; i < clean.length; i++) {
+                            if (clean[i] === '{') depth++;
+                            if (clean[i] === '}') { depth--; if (depth === 0) { end = i + 1; break; } }
+                        }
+                        if (depth !== 0) continue;
+                        const obj = clean.slice(start, end);
+                        if (!/"(?:hash|activityId|id)"\s*:/.test(obj)) continue;
+                        const key = obj.slice(0, 80);
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        const card = parseCard(obj);
+                        pushCard(card);
+                    }
+                }
+
+                // ---------- 方法4: 从 Next.js RSC flight payload 中提取 ----------
+                if (cards.length === 0) {
+                    Utils.log("🧩", "尝试解析 RSC flight payload");
+                    // RSC 格式: 数字:{JSON}\n
+                    const flightRegex = /\d+:(\{[\s\S]*?"(?:offerId|offerid)"[\s\S]*?\})\n/g;
+                    let m;
+                    const seen = new Set();
+                    while ((m = flightRegex.exec(clean)) !== null) {
+                        const key = m[1].slice(0, 80);
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        const card = parseCard(m[1]);
+                        pushCard(card);
+                    }
+                }
+
+                // ---------- 方法5: 从 HTML data-* 属性中提取 ----------
+                if (cards.length === 0) {
+                    Utils.log("🧩", "尝试从 HTML data 属性中提取卡片");
+                    const dataRegex = /data-offer-id="([^"]+)"[^>]*data-hash="([^"]+)"/gi;
+                    let m;
+                    while ((m = dataRegex.exec(html)) !== null) {
+                        const offerId = m[1];
+                        const hash = m[2];
+                        const skip = RewardsAuto.skipPatterns.some(p => offerId.toLowerCase().includes(p.toLowerCase()));
+                        if (skip) continue;
+                        pushCard({ title: "", points: 1, offerId, hash, kind: "open_only" });
+                    }
+                }
+
+                if (cards.length === 0) {
+                    // 输出前 500 字符供调试
+                    const snippet = clean.slice(0, 500).replace(/[\r\n]+/g, ' ');
+                    Utils.log("🟡", `所有方法均未命中，页面前500字符: ${snippet}`);
+                }
+            } catch (e) {
+                Utils.log("🔴", `卡片解析失败: ${e.message}`);
+            }
+            return cards;
+        },
+
+        // 领取卡片奖励（多种策略尝试，兼容所有卡片类型）
+        async claimCard(card) {
+            const nextAction = RewardsAuto._nextAction || "70babbc81d2724f60d29a95c03b3d739cba77cea92";
+            const url = card.url || "https://rewards.bing.com/earn";
+            const referer = card.url || "https://rewards.bing.com/";
+
+            // 策略1: reportactivity + RequestVerificationToken（最稳定，失败后强制刷新 token 重试一次）
+            const postReportActivity = async (token) => Utils.xhr({
+                method: "POST",
+                url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
+                headers: {
+                    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "user-agent": RewardsAuto.ua.pc,
+                    "referer": referer,
+                    "origin": "https://rewards.bing.com",
+                    "x-requested-with": "XMLHttpRequest"
+                },
+                data: new URLSearchParams({
+                    id: card.offerId,
+                    hash: card.hash,
+                    timeZone: 480,
+                    activityAmount: 1,
+                    dbs: 0,
+                    form: "",
+                    type: "",
+                    __RequestVerificationToken: token
+                }).toString()
+            });
+            try {
+                let token = await this.getRewardsToken();
+                if (token) {
+                    try {
+                        await postReportActivity(token);
+                        return true;
+                    } catch (_) {
+                        // token 可能已失效，强制刷新后重试一次
+                        token = await this.getRewardsToken(true);
+                        if (token) {
+                            await postReportActivity(token);
+                            return true;
+                        }
+                    }
+                }
+            } catch (e1) {
+                Utils.log("🟡", `reportactivity+token 失败: ${card.offerId}`);
+            }
+
+            // 策略2: Server Action（原始 hash）
+            try {
+                await Utils.xhr({
+                    method: "POST", url,
+                    headers: { "content-type": "text/plain;charset=UTF-8", "next-action": nextAction, referer },
+                    data: JSON.stringify([card.hash, 11, { offerid: card.offerId, isPromotional: "$undefined", timezoneOffset: "-480" }])
+                });
+                return true;
+            } catch (e2) {
+                Utils.log("🟡", `Server Action 失败: ${card.offerId}`);
+            }
+
+            // 策略3: reportActivity（原始 hash）
+            try {
+                await this.reportActivity(card.offerId, card.hash, referer);
+                return true;
+            } catch (e3) {
+                Utils.log("🟡", `reportActivity 失败: ${card.offerId}`);
+            }
+
+            // 策略4: reportActivity（hash "1"）
+            try {
+                await this.reportActivity(card.offerId, "1", referer);
+                return true;
+            } catch (e4) {
+                Utils.log("🟡", `卡片领取失败(${card.offerId}): 所有策略均失败`);
+                return false;
+            }
+        },
+
+        async getSearchPage(query, isMobile = false) {
+            const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
+            const deviceType = isMobile ? "m" : "d";
+            return Utils.xhr({
+                url: `https://${RewardsAuto.state.host}/search?q=${encodeURIComponent(query)}&form=QBLH${mkt}`,
+                headers: {
+                    "user-agent": isMobile ? RewardsAuto.ua.mobile : RewardsAuto.ua.pc,
+                    "cookie": `_Rwho=u=${deviceType}&ts=${RewardsAuto.state.dateNowStr}`,
+                    "referer": `https://${RewardsAuto.state.host}/?form=QBLH`
+                }
+            });
+        },
+
+        async reportSearch(html, query, isMobile = false) {
+            try {
+                const ig = Utils.getRandomUUID();
+                const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
+                const params = `q=${encodeURIComponent(query)}&form=QBLH${mkt}`;
+                const deviceType = isMobile ? "m" : "d";
+                const headers = {
+                    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+                    "user-agent": isMobile ? RewardsAuto.ua.mobile : RewardsAuto.ua.pc,
+                    "referer": `https://${RewardsAuto.state.host}/?form=QBLH`,
+                    "cookie": `_Rwho=u=${deviceType}&ts=${RewardsAuto.state.dateNowStr}`
+                };
+
+                await Utils.xhr({
+                    method: "POST",
+                    url: `https://${RewardsAuto.state.host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
+                    headers,
+                    data: "wb=1%3bi%3d1%3bv%3d1"
+                });
+                await Utils.xhr({
+                    method: "POST",
+                    url: `https://${RewardsAuto.state.host}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&ajaxreq=1`,
+                    headers,
+                    data: `url=${encodeURIComponent(`https://${RewardsAuto.state.host}/search?${params}`)}&V=web`
+                });
+                return true;
+            } catch (e) {
+                Utils.log("🟡", `搜索上报失败: ${e.message}`);
+                return false;
+            }
+        },
+
+        async checkRegion(retryCount = 0) {
+            if (!GM_getValue("Config.lock", true)) return true;
+            try {
+                const html = await Utils.xhr({ url: `https://${RewardsAuto.state.host}/` });
+                if (!html) {
+                    if (retryCount < 2) {
+                        Utils.log("🟡", `地区检测返回空，第${retryCount + 1}次重试...`);
+                        await Utils.randomDelay(3000, 8000);
+                        return await this.checkRegion(retryCount + 1);
+                    }
+                    Utils.log("🔴", "地区检测失败（无响应）");
+                    return false;
+                }
+                const match = html.replace(/\s/g, "").match(/Region:"(.*?)"(.*?)RevIpCC:"(.*?)"/);
+                if (match) {
+                    RewardsAuto.state.region = match[3].toUpperCase();
+                    if (RewardsAuto.state.region !== "CN") {
+                        // 获取IP详细信息（来自比尔脚本）
+                        await this.getIPInfo();
+                        Utils.log("🔴", `IP非大陆(${RewardsAuto.state.region})，已停止\n${RewardsAuto.state.ipInfo}`, true);
+                        return false;
+                    }
+                    Utils.log("🟢", `地区检测通过: ${RewardsAuto.state.region}`);
+                    return true;
+                }
+                // 正则未匹配到，可能是页面结构变化
+                if (retryCount < 2) {
+                    Utils.log("🟡", `地区检测格式异常，第${retryCount + 1}次重试...`);
+                    await Utils.randomDelay(3000, 8000);
+                    return await this.checkRegion(retryCount + 1);
+                }
+                Utils.log("🔴", "地区检测失败（格式不匹配）");
+                return false;
+            } catch (e) {
+                if (retryCount < 2) {
+                    Utils.log("🟡", `地区检测异常: ${e.message}，第${retryCount + 1}次重试...`);
+                    await Utils.randomDelay(3000, 8000);
+                    return await this.checkRegion(retryCount + 1);
+                }
+                Utils.log("🔴", `地区检测失败: ${e.message}`);
+                return false;
+            }
+        },
+
+        async getIPInfo() {
+            try {
+                const qryResult = await Utils.xhr({
+                    url: "https://disp-qryapi.3g.qq.com/v1/dispatch",
+                    headers: { "referer": "https://3g.qq.com/" }
+                });
+                if (qryResult && Utils.isJSON(qryResult)) {
+                    const resJSON = JSON.parse(qryResult);
+                    RewardsAuto.state.ip = (resJSON.code == 0 && resJSON.extra && resJSON.extra.ip) ? resJSON.extra.ip : "";
+                    let rawInfo = (resJSON.code == 0 && resJSON.ipInfo) ? String(resJSON.ipInfo) : "";
+                    rawInfo = rawInfo.replace(/[#*]+/g, " ").trim();
+                    RewardsAuto.state.ipInfo = rawInfo ? `🌏所在地区：${rawInfo}` : "";
+                }
+            } catch {
+                console.debug("获取附加 IP 信息失败");
+            }
+        },
+
+        async getHotSearchWord() {
+            const keywords = ["天气预报", "今日新闻", "体育赛事", "股票行情", "电影推荐", "科技资讯", "美食食谱", "旅游攻略", "历史上的今天", "健康常识"];
+            const baseWord = keywords[Utils.randomRange(0, keywords.length - 1)];
+            const randomSuffix = Math.random().toString(36).slice(2, 6);
+            let sentence = `${baseWord} ${randomSuffix}`;
+
+            if (RewardsAuto.apiConfig.mode !== "offline") {
+                if (RewardsAuto.apiConfig.wordIndex < 1 || RewardsAuto.apiConfig.wordList.length < 1) {
+                    // 获取随机API配置
+                    const apiArr = RewardsAuto.apiConfig.arr;
+                    const lastApiIndex = parseInt(GM_getValue("Config.apiIndex", -1));
+                    const filteredArr = apiArr.filter((_, index) => index !== lastApiIndex);
+                    const randomIndex = Utils.randomRange(0, filteredArr.length - 1);
+                    GM_setValue("Config.apiIndex", randomIndex);
+                    
+                    const [apiName, apiConfig] = filteredArr[randomIndex];
+                    RewardsAuto.apiConfig.url = apiConfig.url;
+                    RewardsAuto.apiConfig.hot = apiConfig.hot;
+
+                    try {
+                        const hotSource = RewardsAuto.apiConfig.hot[Utils.randomRange(0, RewardsAuto.apiConfig.hot.length - 1)];
+                        const result = await Utils.xhr({ url: RewardsAuto.apiConfig.url + hotSource });
+                        if (result && Utils.isJSON(result)) {
+                            const res = JSON.parse(result);
+                            if (res.code == 200) {
+                                RewardsAuto.apiConfig.wordList = (res.data || [])
+                                    .map(d => d && d.title)
+                                    .filter(t => typeof t === "string" && t.trim());
+                                if (RewardsAuto.apiConfig.wordList.length > 0) {
+                                    // 随机打乱数组
+                                    RewardsAuto.apiConfig.wordList.sort(() => Math.random() - 0.5);
+                                    // 从首个词开始使用，避免跳过首词及单词表时取到 undefined
+                                    RewardsAuto.apiConfig.wordIndex = 0;
+                                    sentence = RewardsAuto.apiConfig.wordList[0].substring(0, Utils.randomRange(20, 32));
+                                    return sentence;
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        Utils.log("🟡", `热搜词获取失败: ${e.message}`);
+                    }
+                } else {
+                    RewardsAuto.apiConfig.wordIndex++;
+                    if (RewardsAuto.apiConfig.wordIndex > RewardsAuto.apiConfig.wordList.length - 1) {
+                        RewardsAuto.apiConfig.wordIndex = 0;
+                    }
+                    sentence = RewardsAuto.apiConfig.wordList[RewardsAuto.apiConfig.wordIndex];
+                    sentence = sentence.substring(0, Utils.randomRange(20, 32));
+                    return sentence;
+                }
+                Utils.log("🟡", "热搜词接口异常，已使用随机搜索词");
+            }
+            return sentence;
+        },
+
+        async checkSearchRestricted() {
+            // 用服务器实际进度判断，避免本地虚增导致误判
+            const info = await this.getRewardsInfo();
+            const currentTotal = info
+                ? info.pc.progress
+                : RewardsAuto.state.pcProgress;
+            const lastTotal = RewardsAuto.state.lastSearchProgress;
+
+            if (lastTotal !== -1) {
+                if (currentTotal === lastTotal &&
+                    currentTotal < RewardsAuto.state.pcMax) {
+                    RewardsAuto.state.restrictedTimes++;
+                } else {
+                    RewardsAuto.state.restrictedTimes = 0;
+                }
+            }
+
+            RewardsAuto.state.lastSearchProgress = currentTotal;
+            GM_setValue("Config.lastSearchProgress", currentTotal);
+            GM_setValue("Config.restrictedTimes", RewardsAuto.state.restrictedTimes);
+
+            if (RewardsAuto.state.restrictedTimes >= 3) {
+                Utils.log("🔴", "搜索受限或账号异常，已中断今日搜索！", true);
+                return true;
+            }
+            return false;
+        }
+    };
+
+    const TaskManager = {
+        // 任务日期状态
+        signDate: 0, readDate: 0, promosDate: 0, searchDate: 0, streakDays: 0,
+        signPoint: -1, signTimes: 0, readTimes: 0, promosTimes: 0,
+
+        // 初始化任务状态
+        init() {
+            RewardsAuto.state.dateNowNum = Utils.getTodayNum();
+            RewardsAuto.state.dateNowStr = Utils.getTodayStr();
+            const tasks = GM_getValue("Config.tasks", {});
+            this.signDate = tasks.sign || 0;
+            this.readDate = tasks.read || 0;
+            this.promosDate = tasks.promos || 0;
+            this.searchDate = tasks.search || 0;
+            this.streakDays = tasks.streakDays || 0;
+            this.signPoint = GM_getValue("Config.signPoint", -1);
+            // 恢复搜索受限检测状态，保证跨运行连续性（否则持久化的值从不被读取）
+            RewardsAuto.state.lastSearchProgress = GM_getValue("Config.lastSearchProgress", -1);
+            RewardsAuto.state.restrictedTimes = GM_getValue("Config.restrictedTimes", 0);
+        },
+
+        // 保存任务状态
+        save() {
+            GM_setValue("Config.tasks", {
+                sign: this.signDate, read: this.readDate,
+                promos: this.promosDate, search: this.searchDate,
+                streakDays: this.streakDays
+            });
+        },
+
+        async doSign() {
+            if (!GM_getValue("Tasks.sign", true) || this.signTimes > 2) return;
+            if (this.signPoint >= 0 && this.signDate === RewardsAuto.state.dateNowNum) {
+                Utils.log("✅", `签入已完成(${this.signPoint}积分)`);
+                return;
+            }
+
+            await Utils.randomDelay();
+            
+            let totalPoint = 0;
+            let signOk = false;
+            
+            // App 端签到（静默执行，不写入通知）
+            const appPoint = await API.signApp();
+            if (appPoint >= 0) {
+                signOk = true;
+                if (appPoint > 0) {
+                    GM_log(`📱 App签入静默成功 +${appPoint}积分`);
+                    totalPoint += appPoint;
+                } else {
+                    GM_log("📱 App签入已确认，无新增积分");
+                }
+            }
+            
+            // PC 端签到
+            await Utils.randomDelay(3000, 8000);
+            const pcPoint = await API.signPC();
+            if (pcPoint >= 0) {
+                signOk = true;
+                Utils.log("💻", `PC签入成功！+${pcPoint}积分`);
+                totalPoint += pcPoint;
+            }
+            
+            if (signOk) {
+                this.signPoint = totalPoint;
+                this.signDate = RewardsAuto.state.dateNowNum;
+                GM_setValue("Config.signPoint", totalPoint);
+                this.save();
+                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`, true);
+            } else {
+                this.signTimes++;
+                Utils.log("🟡", `签入失败，稍后重试`);
+            }
+        },
+
+        async doRead() {
+            if (!GM_getValue("Tasks.read", true) || this.readTimes > 2) return;
+            if (this.readDate === RewardsAuto.state.dateNowNum) {
+                // 二次验证：检查实际进度是否真的满了
+                const verifyProgress = await API.getReadProgress();
+                if (verifyProgress && verifyProgress.progress >= verifyProgress.max) {
+                    Utils.log("✅", `阅读任务已完成（已验证 ${verifyProgress.progress}/${verifyProgress.max}）`);
+                    return;
+                } else if (verifyProgress) {
+                    // readDate 被错误设置，重置
+                    Utils.log("🟡", `阅读标记有误（${verifyProgress.progress}/${verifyProgress.max}），重置并继续`);
+                    this.readDate = 0;
+                    this.save();
+                } else {
+                    Utils.log("🟡", "无法验证阅读进度，跳过");
+                    return;
+                }
+            }
+
+            const progress = await API.getReadProgress();
+            if (!progress) {
+                this.readTimes++;
+                Utils.log("🟡", "无法获取阅读进度，稍后重试");
+                return;
+            }
+
+            const { progress: cur, max } = progress;
+            Utils.log("📖", `阅读进度: ${cur}/${max}`);
+
+            if (cur >= max) {
+                this.readDate = RewardsAuto.state.dateNowNum;
+                this.save();
+                Utils.log("✅", "阅读任务已完成");
+                return;
+            }
+
+            let successCount = 0;
+            const maxPerDay = 10; // 每天最多 10 篇
+            const remaining = Math.min(max - cur, maxPerDay);
+            Utils.log("📖", `今日还可阅读 ${remaining} 篇（上限 ${maxPerDay} 篇/天）`);
+
+            for (let i = 0; i < remaining; i++) {
+                const result = await API.doRead();
+                if (!result) { Utils.log("🟡", `阅读第 ${i + 1} 篇失败，中止`); break; }
+                successCount++;
+                Utils.log("📖", `阅读文章 ${i + 1}/${remaining} +${result.points}积分`);
+                await Utils.randomDelay(3000, 8000);
+            }
+
+            if (successCount === 0) {
+                this.readTimes++;
+                Utils.log("🟡", "阅读全部失败，稍后重试");
+                return;
+            }
+
+            // 二次验证
+            const verify = await API.getReadProgress();
+            if (verify && verify.progress >= verify.max) {
+                this.readDate = RewardsAuto.state.dateNowNum;
+                this.save();
+                Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`, true);
+            } else {
+                this.readTimes++;
+                Utils.log("🟡", `阅读已执行但未完成，下次继续`);
+            }
+        },
+
+        async doPromos() {
+            if (!GM_getValue("Tasks.promos", true) || this.promosTimes > 2) return;
+            if (this.promosDate === RewardsAuto.state.dateNowNum) {
+                Utils.log("✅", "活动卡片已完成");
+                return;
+            }
+
+            Utils.log("🧩", "扫描活动卡片...");
+            const cards = await API.discoverCards();
+
+            if (cards.length === 0) {
+                this.promosDate = RewardsAuto.state.dateNowNum;
+                this.save();
+                Utils.log("✅", "无新活动卡片");
+                return;
+            }
+
+            Utils.log("🧩", `发现 ${cards.length} 个卡片`);
+            let ok = 0, fail = 0;
+
+            for (const card of cards) {
+                Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
+                
+                // Quiz 任务需要单独处理（可选开启）
+                if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
+                
+                // 【防封号】领取卡片前随机延迟
+                await Utils.randomDelay(3000, 8000);
+                const result = await API.claimCard(card);
+                result ? ok++ : fail++;
+            }
+
+            // 全部失败时累计失败次数并不标记完成，允许下轮重试（与 doSign/doRead 一致）；
+            // 否则 promosTimes 守卫因计数器从不递增而完全失效
+            if (ok === 0 && fail > 0) {
+                this.promosTimes++;
+                Utils.log("🟡", `活动卡片全部失败（${fail} 个），稍后重试`);
+                return;
+            }
+
+            this.promosDate = RewardsAuto.state.dateNowNum;
+            this.save();
+            Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败`, true);
+        },
+
+        async doSearch() {
+            if (!GM_getValue("Tasks.search", true)) return;
+
+            const info = await API.getRewardsInfo();
+            if (!info) { Utils.log("🔴", "无法获取积分信息"); return; }
+
+            RewardsAuto.state.pcProgress = info.pc.progress;
+            RewardsAuto.state.pcMax = info.pc.max;
+
+            Utils.log("🔍", `搜索配额: PC ${info.pc.progress}/${info.pc.max}`);
+
+            const pcDone = info.pc.progress >= info.pc.max;
+            if (pcDone) {
+                this.searchDate = RewardsAuto.state.dateNowNum;
+                this.save();
+                Utils.log("✅", `搜索配额已满 PC: ${info.pc.progress}/${info.pc.max}`);
+                return;
+            }
+
+            if (this.searchDate === RewardsAuto.state.dateNowNum) {
+                Utils.log("🟡", "搜索配额未满，继续执行搜索任务");
+                this.searchDate = 0;
+            }
+
+            const isRestricted = await API.checkSearchRestricted();
+            if (isRestricted) {
+                this.searchDate = RewardsAuto.state.dateNowNum;
+                this.save();
+                return;
+            }
+
+            const limit = Utils.randomRange(4, 7);
+            for (let i = 0; i < limit; i++) {
+                if (RewardsAuto.state.pcProgress >= RewardsAuto.state.pcMax) break;
+
+                let query;
+                if (RewardsAuto.apiConfig.mode !== "offline") {
+                    query = await API.getHotSearchWord();
+                } else {
+                    query = RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
+                }
+
+                Utils.log("🔍", `[PC] 搜索 ${i+1}/${limit}: ${query}`);
+
+                try {
+                    const html = await API.getSearchPage(query, false);
+                    if (html) {
+                        await API.reportSearch(html, query, false);
+                        // 每次搜索通常计 1 分，仅用于循环内提前退出判断；
+                        // 真实配额以最终 getRewardsInfo 复查为准，避免虚增导致提前结束
+                        RewardsAuto.state.pcProgress += 1;
+                    }
+                } catch (e) {
+                    Utils.log("🟡", `搜索失败: ${e.message}`);
+                }
+
+                const span = Number(GM_getValue("Config.span", 30)) || 30;
+                // 限制 span 范围，避免配置过小时 (span-15) 为负导致延迟为负/过短
+                const safeSpan = Math.min(Math.max(span, 15), 120);
+                const wait = Utils.randomRange((safeSpan - 15) * 1000, (safeSpan + 15) * 1000);
+                Utils.log("⏳", `等待 ${wait/1000}秒`);
+                await Utils.delay(wait);
+            }
+
+            const finalInfo = await API.getRewardsInfo();
+            if (finalInfo) {
+                const pcDone2 = finalInfo.pc.progress >= finalInfo.pc.max;
+                if (pcDone2) {
+                    this.searchDate = RewardsAuto.state.dateNowNum;
+                    this.save();
+                    RewardsAuto.state.restrictedTimes = 0;
+                    GM_setValue("Config.restrictedTimes", 0);
+                    GM_setValue("Config.lastSearchProgress", -1);
+                    Utils.log("🔵", `🔍 搜索任务完成！PC: ${finalInfo.pc.progress}/${finalInfo.pc.max}`, true);
+                } else {
+                    Utils.log("🟡", `搜索已执行，配额未满 PC: ${finalInfo.pc.progress}/${finalInfo.pc.max}`);
+                }
+            } else {
+                Utils.log("🟡", "搜索已执行，但无法获取最终配额状态");
+            }
+        },
+
+        async doDailySet() {
+            const today = Utils.getTodayNum();
+            const processedKey = "Config.dailySetProcessed";
+            let processed = GM_getValue(processedKey, []);
+            if (processed.length > 0 && processed[0]?.date !== today) processed = [];
+            const processedIds = new Set(processed.map(p => p.offerId));
+
+            Utils.log("📅", `开始执行每日活动（已处理 ${processedIds.size} 个）...`);
+            await Utils.randomDelay(3000, 8000);
+
+            // 1) getuserinfo 获取今日每日活动（含完成状态，用于过滤已完成项）
+            const items = await API.getDailySetItems();
+            const pendingItems = items.filter(it => !it.complete && !processedIds.has(it.offerId));
+            if (items.length > 0 && pendingItems.length === 0) {
+                Utils.log("✅", `每日活动均已完成（共 ${items.length} 个）`);
+                GM_setValue(processedKey, items.filter(it => it.complete).map(it => ({ date: today, offerId: it.offerId })));
+                GM_setValue("Config.dailySetDone", today);
+                return;
+            }
+
+            // 2) 优先：从 dashboard RSC 提取每个活动的专属 hash，发送 Server Action 完成（纯后台请求，不打开网页）
+            const hashes = await this._extractDailySetHashes();
+            if (hashes.length > 0) {
+                Utils.log("📅", `提取到 ${hashes.length} 个每日活动 hash，发送 Server Action 完成...`);
+                for (const h of hashes) {
+                    Utils.log("📅", `完成每日活动: ${h.offerId}`);
+                    const ok = await this._sendDailySetAction(h.offerId, h.hash);
+                    if (!ok) Utils.log("🟡", `Server Action 上报未成功(${h.offerId})`);
+                    await Utils.randomDelay(4000, 8000);
+                }
+
+                // 复查完成状态
+                await Utils.randomDelay(4000, 8000);
+                const after = await API.getDailySetItems();
+                if (after.length > 0) {
+                    const completedIds = new Set(after.filter(it => it.complete).map(it => it.offerId));
+                    GM_setValue(processedKey, [...completedIds].map(id => ({ date: today, offerId: id })));
+                    const okCount = after.filter(it => it.complete).length;
+                    if (okCount >= after.length) {
+                        GM_setValue("Config.dailySetDone", today);
+                        Utils.log("🔵", `每日活动完成 ${okCount}/${after.length} 个`, true);
+                    } else {
+                        Utils.log("🟡", `每日活动完成 ${okCount}/${after.length} 个，未完成项下轮重试`);
+                    }
+                } else {
+                    Utils.log("🟡", "每日活动已上报，无法复查完成状态，下轮重新校验");
+                }
+                return;
+            }
+
+            // 3) 兜底：hash 提取失败时后台静默打开活动链接（不打开 dashboard）
+            Utils.log("🟡", "未提取到活动 hash，回退为后台打开活动链接");
+            let urls = await this._extractDailySetUrls();
+            if (urls.length === 0) {
+                urls = items.filter(it => !it.complete && it.url && /bing\.com/i.test(it.url)).map(it => it.url);
+            }
+            for (let i = 0; i < urls.length; i++) {
+                try {
+                    GM_openInTab(urls[i], { active: false, insert: true });
+                } catch (e) {
+                    Utils.log("🟡", `打开活动链接失败: ${e.message}`);
+                }
+                await Utils.randomDelay(6000, 12000);
+            }
+        },
+
+        // 打卡任务（后台模式）：从 dashboard 发现打卡页 → 提取子任务链接 → 逐个 XHR 模拟点击
+        async doPunchCard() {
+            const today = Utils.getTodayNum();
+            const doneKey = "Config.punchCardBgDone";
+            if (GM_getValue(doneKey, 0) === today) {
+                Utils.log("📅", "打卡任务今日已尝试");
+                return;
+            }
+
+            Utils.log("📅", "检查打卡任务...");
+
+            // 1) 从 dashboard HTML 中发现打卡详情页 URL
+            let punchUrl = null;
+            try {
+                const html = await Utils.xhr({
+                    url: "https://rewards.bing.com/dashboard",
+                    headers: { "user-agent": RewardsAuto.ua.pc }
+                });
+                if (!html) return;
+                const clean = html.replace(/\\"/g, '"').replace(/\\u0026/gi, "&").replace(/&amp;/g, "&");
+                const m = clean.match(/https?:\/\/rewards\.bing\.com\/earn\/quest\/[\w-]*punchcard[\w-]*/i);
+                if (m) punchUrl = m[0];
+            } catch (e) {
+                Utils.log("🟡", `打卡链接获取失败: ${e.message}`);
+                return;
+            }
+
+            if (!punchUrl) {
+                Utils.log("📅", "未发现打卡任务");
+                GM_setValue(doneKey, today);
+                return;
+            }
+
+            Utils.log("📅", `发现打卡页: ${punchUrl}`);
+
+            // 2) GET 打卡详情页，提取子任务链接
+            let taskLinks = [];
+            try {
+                const detailHtml = await Utils.xhr({
+                    url: punchUrl,
+                    headers: {
+                        "user-agent": RewardsAuto.ua.pc,
+                        "referer": "https://rewards.bing.com/",
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                    }
+                });
+                if (!detailHtml) return;
+                const clean = detailHtml.replace(/\\"/g, '"').replace(/\\u0026/gi, "&").replace(/&amp;/g, "&");
+
+                // 提取 bing 活动链接（搜索/活动页），排除导航/登录/兑换类
+                const linkRegex = /https?:\/\/(?:www\.|cn\.)?bing\.com\/[^"'\s\\<>]+/gi;
+                const seen = new Set();
+                let m;
+                while ((m = linkRegex.exec(clean)) !== null) {
+                    const url = m[0];
+                    if (/^https?:\/\/(?:www\.|cn\.)?bing\.com\/?(?:\?|$)/i.test(url)) continue;
+                    if (/\/redeem|login\.live|aka\.ms|rewardspanel|microsoft-store|account\.microsoft/i.test(url)) continue;
+                    if (seen.has(url)) continue;
+                    seen.add(url);
+                    taskLinks.push(url);
+                }
+            } catch (e) {
+                Utils.log("🟡", `打卡详情页获取失败: ${e.message}`);
+                return;
+            }
+
+            if (taskLinks.length === 0) {
+                Utils.log("📅", "打卡页无子任务链接（可能已全部完成）");
+                GM_setValue(doneKey, today);
+                return;
+            }
+
+            // 打卡子任务通常 3-10 个；过多说明混入了导航链接，截取前 10 个
+            if (taskLinks.length > 10) {
+                Utils.log("🟡", `提取到 ${taskLinks.length} 个链接，可能混入导航链接，仅取前 10 个`);
+                taskLinks = taskLinks.slice(0, 10);
+            }
+
+            Utils.log("📅", `发现 ${taskLinks.length} 个打卡子任务链接，模拟点击...`);
+
+            // 3) 逐个 GET 子任务链接（模拟真实点击访问，服务器记录完成）
+            let ok = 0;
+            for (let i = 0; i < taskLinks.length; i++) {
+                try {
+                    await Utils.xhr({
+                        url: taskLinks[i],
+                        headers: {
+                            "user-agent": RewardsAuto.ua.pc,
+                            "referer": punchUrl,
+                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
+                        }
+                    });
+                    ok++;
+                } catch (e) {
+                    Utils.log("🟡", `打卡子任务 ${i + 1} 失败: ${e.message}`);
+                }
+                // 【防封号】每个子任务间隔 5-12 秒
+                await Utils.randomDelay(5000, 12000);
+            }
+
+            GM_setValue(doneKey, today);
+            if (ok > 0) {
+                Utils.log("🔵", `打卡任务: ${ok}/${taskLinks.length} 个子任务完成`, true);
+            } else {
+                Utils.log("🟡", "打卡子任务全部失败");
+            }
+        },
+
+        // 从 dashboard HTML 中提取每日活动真实链接（rnoreward=1）
+        async _extractDailySetUrls() {
+            const urls = [];
+            try {
+                const html = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
+                if (!html) return urls;
+                const clean = html.replace(/\\"/g, '"').replace(/\\u0026/gi, "&").replace(/&amp;/g, "&");
+                const linkRegex = /https?:\/\/(?:www\.|cn\.)?bing\.com\/[^"'\s\\<>]*rnoreward=1[^"'\s\\<>]*/gi;
+                const seen = new Set();
+                let m;
+                while ((m = linkRegex.exec(clean)) !== null) {
+                    if (seen.has(m[0])) continue;
+                    seen.add(m[0]);
+                    urls.push(m[0]);
+                }
+                if (urls.length > 0) Utils.log("📅", `dashboard 提取到 ${urls.length} 个每日活动链接`);
+            } catch (e) {
+                Utils.log("🟡", `dashboard 链接提取失败: ${e.message}`);
+            }
+            return urls;
+        },
+
+        // 从 dashboard RSC 数据中提取每个每日活动的专属 hash（紧邻 offerId 的 64 位十六进制串）
+        async _extractDailySetHashes() {
+            const result = [];
+            try {
+                const rsc = await Utils.xhr({
+                    url: "https://rewards.bing.com/dashboard",
+                    headers: { "rsc": "1", "accept": "text/x-component", "user-agent": RewardsAuto.ua.pc }
+                });
+                if (!rsc) return result;
+                const clean = rsc.replace(/\\"/g, '"').replace(/\\u0026/gi, "&");
+                const offerRegex = /Gamification_DailySet[\w-]*Child\d+/g;
+                const seen = new Set();
+                let m;
+                while ((m = offerRegex.exec(clean)) !== null) {
+                    const offerId = m[0];
+                    if (seen.has(offerId)) continue;
+                    seen.add(offerId);
+                    // 在 offerId 前后 400 字符范围内查找最近的 64 位十六进制 hash
+                    const start = Math.max(0, m.index - 400);
+                    const ctx = clean.slice(start, m.index + offerId.length + 400);
+                    const center = m.index - start;
+                    const hexRegex = /[0-9a-f]{64}/g;
+                    let best = null;
+                    let hm;
+                    while ((hm = hexRegex.exec(ctx)) !== null) {
+                        const dist = Math.abs(hm.index - center);
+                        if (!best || dist < best.dist) best = { hash: hm[0], dist };
+                    }
+                    if (best) result.push({ offerId, hash: best.hash });
+                }
+                if (result.length > 0) {
+                    Utils.log("📅", `提取到 ${result.length} 个每日活动 hash`);
+                } else if (GM_getValue("Config.debugDailySet", false)) {
+                    const idx = clean.indexOf("Gamification_DailySet");
+                    Utils.log("🔵", `RSC 未提取到 hash；DailySet 上下文: ${idx >= 0 ? clean.slice(idx - 120, idx + 200) : "(未找到 DailySet)"}`);
+                }
+            } catch (e) {
+                Utils.log("🟡", `每日活动 hash 提取失败: ${e.message}`);
+            }
+            return result;
+        },
+
+        // 发送每日活动完成 Server Action（精确复刻浏览器 next-action 请求）
+        async _sendDailySetAction(offerId, hash) {
+            try {
+                const body = JSON.stringify([hash, 11, {
+                    offerid: offerId,
+                    isPromotional: "$undefined",
+                    timezoneOffset: String(-new Date().getTimezoneOffset())
+                }]);
+                await Utils.xhr({
+                    method: "POST",
+                    url: "https://rewards.bing.com/dashboard",
+                    headers: {
+                        "accept": "text/x-component",
+                        "content-type": "text/plain;charset=UTF-8",
+                        "next-action": "70babbc81d2724f60d29a95c03b3d739cba77cea92",
+                        "origin": "https://rewards.bing.com",
+                        "referer": "https://rewards.bing.com/dashboard",
+                        "user-agent": RewardsAuto.ua.pc
+                    },
+                    data: body,
+                    anonymous: false
+                });
+                return true;
+            } catch (e) {
+                Utils.log("🟡", `Server Action 请求失败(${offerId}): ${e.message}`);
+                return false;
+            }
+        },
+
+        async doClaimPoints() {
+            // 通过 XHR 检测可领取积分（兼容 service worker）
+            try {
+                const dashboardHtml = await Utils.xhr({ url: "https://rewards.bing.com/dashboard" });
+                if (!dashboardHtml) {
+                    Utils.log("✅", "无法获取 dashboard 页面");
+                    return;
+                }
+
+                const claimableMatch = dashboardHtml.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
+                if (!claimableMatch) {
+                    Utils.log("✅", "无可领取积分");
+                    return;
+                }
+
+                const amount = parseInt(claimableMatch[1].replace(/,/g, '')) || 0;
+                if (amount > 0) {
+                    // 仅检测提醒，不再弹窗打开 dashboard（避免干扰前台）；打开 dashboard 时前台处理器会自动领取
+                    Utils.log("🎁", `检测到 ${amount} 积分待领取（打开 dashboard 时将自动领取）`);
+                } else {
+                    Utils.log("✅", "可领取积分为 0");
+                }
+            } catch (e) {
+                Utils.log("🟡", `检测可领取积分失败: ${e.message}`);
+            }
+        },
+
+        // ====== 连签任务检测（通过 XHR 获取 earn 页面信息） ======
+        async doStreak() {
+            Utils.log("📅", "开始检测连签任务...");
+            try {
+                // 获取 earn 页面 HTML
+                const earnHtml = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+                if (!earnHtml) { Utils.log("🟡", "无法获取 earn 页面"); return; }
+
+                // 去除 HTML 标签，保留纯文本用于正则匹配
+                const text = earnHtml.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ');
+
+                // 解析每日连续打卡天数（新格式："每日连续打卡 7"）
+                const streakDaysMatch = text.match(/每日连续打卡\s*(\d+)/);
+                if (streakDaysMatch) {
+                    this.streakDays = parseInt(streakDaysMatch[1]) || 0;
+                    Utils.log("📅", `每日连续打卡：${this.streakDays} 天`);
+                }
+
+                // 解析连签任务状态（适配 2026-07 新 DOM 格式）
+                // 新格式示例："必应搜索连续打卡 已完成连续打卡 5 天，共 7 天。 搜索: 1/1"
+                const taskPatterns = [
+                    { name: "必应搜索连续打卡", pattern: /必应搜索连续打卡[\s\S]*?搜索:\s*(\d+)\/(\d+)/ },
+                    { name: "每日连续打卡活动", pattern: /每日连续打卡活动[\s\S]*?活动:\s*(\d+)\/(\d+)/ },
+                    { name: "必应应用连续打卡", pattern: /必应应用连续打卡[\s\S]*?签到:\s*(\d+)\/(\d+)/ },
+                    { name: "视觉搜索连续打卡", pattern: /视觉搜索连续打卡[\s\S]*?活动:\s*(\d+)\/(\d+)/ },
+                ];
+
+                let visualSearchDone = true;
+                for (const { name, pattern } of taskPatterns) {
+                    const m = text.match(pattern);
+                    if (m) {
+                        const cur = parseInt(m[1]), max = parseInt(m[2]);
+                        const done = cur >= max;
+                        Utils.log(done ? "✅" : "📅", `${name}: ${cur}/${max}${done ? " 已完成" : ""}`);
+                        if (name === "视觉搜索连续打卡" && !done) {
+                            visualSearchDone = false;
+                        }
+                    }
+                }
+
+                // 视觉搜索未完成仅记录日志，不再自动打开页面（避免弹窗干扰前台）
+                if (!visualSearchDone) {
+                    Utils.log("📅", "视觉搜索连续打卡未完成（如需完成可手动访问必应视觉搜索）");
+                }
+
+                // 解析 1,000 奖励印章进度（新格式："赚取 12 个印章"）
+                const stampMatch = text.match(/(\d+)\s*个印章/) || text.match(/印章\s*(\d+)/);
+                if (stampMatch) {
+                    Utils.log("📅", `连签奖励印章进度: ${stampMatch[1]}/12`);
+                }
+
+                // 连签任务的实际完成由 doPromos() 的 discoverCards + claimCard 统一处理
+                Utils.log("📅", "连签任务检测完成，未完成任务将由活动卡片模块处理");
+            } catch (e) {
+                Utils.log("🔴", `连签任务异常: ${e.message}`);
+            }
+        },
+
+        async runAll() {
+            if (this.running) {
+                Utils.log("🟡", "任务正在运行中，请勿重复触发");
+                return;
+            }
+            this.running = true;
+            try {
+            RewardsAuto.state.startTime = Utils.getTimestamp();
+            Utils.log("🚀", "启动全能自动化任务...");
+            this.init();
+
+            // 记录初始积分
+            const startBalance = await API.getBalance();
+            Utils.log("📊", `初始积分: ${startBalance}`);
+
+            const regionOK = await API.checkRegion();
+            
+            // Token 续期
+            let isTokenOK = false;
+            if (regionOK) {
+                isTokenOK = await API.renewToken();
+                if (!isTokenOK) {
+                    Utils.log("🟡", "Token失败，跳过签入/阅读", true);
+                }
+            } else {
+                Utils.log("🔴", "IP非国内，已暂停全部任务", true);
+                return;
+            }
+
+            // setTimeout 重试机制
+            const retryDelay = 60000; // 重试间隔 60 秒
+            const maxRetries = 2;
+
+            const withRetry = async (taskFn, taskName, retries = 0) => {
+                try {
+                    const result = await taskFn();
+                    if (result === false && retries < maxRetries) {
+                        Utils.log("🟡", `${taskName} 失败，${retryDelay/1000}秒后重试 (${retries + 1}/${maxRetries})`);
+                        await Utils.delay(retryDelay);
+                        return withRetry(taskFn, taskName, retries + 1);
+                    }
+                    return result;
+                } catch (e) {
+                    if (retries < maxRetries) {
+                        Utils.log("🟡", `${taskName} 异常: ${e.message}，${retryDelay/1000}秒后重试`);
+                        await Utils.delay(retryDelay);
+                        return withRetry(taskFn, taskName, retries + 1);
+                    }
+                    Utils.log("🔴", `${taskName} 失败: ${e.message}`);
+                    return false;
+                }
+            };
+
+            if (regionOK && isTokenOK) {
+                await withRetry(() => this.doSign(), "签到");
+                await Utils.randomDelay();
+                if (!RewardsAuto.state.pc401) {
+                    await withRetry(() => this.doRead(), "阅读");
+                    await Utils.randomDelay();
+                } else {
+                    Utils.log("🟡", "PC会话已过期，跳过阅读任务");
+                }
+            } else if (regionOK) {
+                // Token（DAPI）失败但 Cookie 可能仍有效，尝试 PC 签入
+                await withRetry(() => this.doSign(), "签到");
+                if (RewardsAuto.state.pc401) {
+                    Utils.log("🟡", "Cookie 已过期，请在浏览器登录 bing.com 后重试", true);
+                }
+                await Utils.randomDelay();
+            }
+
+            await withRetry(() => this.doPromos(), "活动卡片");
+            await Utils.randomDelay();
+
+            await withRetry(() => this.doSearch(), "搜索");
+
+            // 连签任务检测
+            await withRetry(() => this.doStreak(), "连签检测");
+            await Utils.randomDelay();
+
+            Utils.log("📅", "开始执行每日活动任务...");
+            await Utils.randomDelay();
+            await withRetry(() => this.doDailySet(), "每日活动");
+
+            // 打卡任务（后台 XHR 模拟点击子任务链接）
+            await Utils.randomDelay();
+            await withRetry(() => this.doPunchCard(), "打卡任务");
+
+            // 领取待领取积分
+            try {
+                await this.doClaimPoints();
+            } catch (e) {
+                Utils.log("🟡", `领取积分执行异常: ${e.message}`);
+            }
+
+            // 二次扫描机制（来自Python版）：完成一轮任务后再次扫描新解锁的卡片
+            Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
+            await Utils.randomDelay(3000, 8000);
+            const newCards = await API.discoverCards();
+            if (newCards.length > 0) {
+                Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
+                let ok = 0, fail = 0;
+                for (const card of newCards) {
+                    Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
+                    if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
+                    await Utils.randomDelay(3000, 8000);
+                    const result = await API.claimCard(card);
+                    result ? ok++ : fail++;
+                }
+                Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
+            } else {
+                Utils.log("✅", "二次扫描：无新卡片");
+            }
+
+            // 任务完成汇总
+            const endTime = Utils.getTimestamp();
+            const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
+
+            // 查询最终积分
+            const endBalance = await API.getBalance();
+            const earned = (startBalance > 0 && endBalance > 0) ? (endBalance - startBalance) : 0;
+
+            const info = await API.getRewardsInfo();
+            if (info) {
+                // 构建简洁日志
+                const signOk = this.signDate === RewardsAuto.state.dateNowNum;
+                const readOk = this.readDate === RewardsAuto.state.dateNowNum;
+                const searchOk = info.pc.progress >= info.pc.max;
+                const promosOk = this.promosDate === RewardsAuto.state.dateNowNum;
+
+                let logMsg = `签到\t\t${signOk ? '✅' : '❌'}\n`;
+                logMsg += `阅读\t\t${readOk ? '✅' : '❌'} ${info.readProgress || 0}/${info.readMax || 30}\n`;
+                logMsg += `PC 搜索\t${searchOk ? '✅' : '⏳'} ${info.pc.progress}/${info.pc.max}\n`;
+                logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
+                logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
+                logMsg += `今日获取\t+${earned}\n`;
+                logMsg += `总积分\t\t${info.balance || endBalance}`;
+
+                // 发送通知
+                RewardsAuto.state.sendMSG = logMsg;
+                Utils.log("📊", logMsg, true);
+            } else {
+                Utils.log("🎉", `任务执行完成！用时 ${totalTime} 秒`, true);
+            }
+            } finally {
+                this.running = false;
+            }
+        }
+    };
+
+    if (location.hostname === "rewards.bing.com") {
+        // 仅保留真正指向打卡/任务详情的选择器，移除 a.cursor-pointer[href]、a.group/ctrl 等
+        // 宽泛选择器——它们会误中“兑换奖励”面板的 /redeem/cn?ref=rewardspanel 导航链接，
+        // 导致反复打开新窗口
+        const punchCardSelectors = [
+            "a[href*='punchcard']",
+            "a[href*='/earn/quest/']",
+            "a[href*='quest']",
+            "a[data-rac][href*='earn']",
+            "a[data-bi-id][href*='earn']",
+            "a[href*='promotional']",
+        ];
+        const textPatterns = ["每日活动", "Daily Set", "限时活动", "特别活动", "打卡", "Punch", "Quest",
+            "月度", "Monthly", "亮点", "Highlights", "搜索", "Search", "奖励", "Reward"];
+
+        // href 安全过滤：排除兑换/推荐/设置等非打卡导航链接，防止误点击开新窗口
+        const isSafePunchHref = (href = "") => {
+            if (!href) return false;
+            const blocked = ["/redeem", "redeemgoal", "ref=", "refer", "sweepstakes", "aka.ms",
+                "microsoft-store", "orderhistory", "xbox.com", "goal/all", "/dashboard",
+                "login.live.com", "bing.com/redeem", "rewardspanel"];
+            return !blocked.some(b => href.toLowerCase().includes(b.toLowerCase()));
+        };
+        
+        const detailTextPatterns = [
+            "关注赛事", "访问网站", "开始搜索",
+            "发现", "探索", "获取", "Learn more", "了解更多",
+            "Start", "Begin", "Watch", "View", "Check",
+            "立即开始", "立即参与", "立即前往", "立即访问",
+            "参加活动", "参与活动", "前往活动"
+        ];
+
+        const clickDetailTasks = async () => {
+            const today = Utils.getTodayNum();
+            const detailDateKey = "Config.punchCardDetailDate";
+            const detailDoneKey = "Config.punchCardDetailDone";
+
+            // 今日已处理过则跳过
+            if (GM_getValue(detailDateKey, 0) === today && GM_getValue(detailDoneKey, false)) {
+                console.log("[Rewards Auto] 详情页任务今日已处理");
+                return true;
+            }
+
+            console.log("[Rewards Auto] 开始执行详情页任务点击...");
+            // 【防封号】操作前随机延迟
+            await Utils.randomDelay(3000, 6000);
+
+            // 拓宽选择器：打卡详情页的任务按钮可能是 a/button，可能有也可能没有 data-rac
+            const selectors = [
+                "a[data-rac][target='_blank']:not([aria-disabled='true']):not([data-disabled='true'])",
+                "a[target='_blank'][href*='bing.com']:not([aria-disabled='true']):not([data-disabled='true'])",
+                "a[target='_blank'][href*='rewards']:not([aria-disabled='true']):not([data-disabled='true'])",
+            ];
+
+            let allButtons = [];
+            for (const sel of selectors) {
+                allButtons = Array.from(document.querySelectorAll(sel));
+                if (allButtons.length > 0) {
+                    console.log(`[Rewards Auto] 选择器 ${sel} 命中 ${allButtons.length} 个按钮`);
+                    break;
+                }
+            }
+
+            // 过滤已完成/禁用/无文本的按钮
+            const clickable = allButtons.filter(b => {
+                const text = (b.textContent || "").trim();
+                const ariaLabel = b.getAttribute("aria-label") || "";
+                const combined = text + " " + ariaLabel;
+                if (/已完成|completed|done|✓|✔|已领取|claimed/i.test(combined)) return false;
+                if (b.disabled || b.getAttribute("aria-disabled") === "true") return false;
+                return combined.length > 1;
+            });
+
+            if (clickable.length === 0) {
+                console.log("[Rewards Auto] 未找到可点击的任务按钮（可能全部完成或页面结构变化）");
+                // 打印页面按钮诊断信息
+                const diag = Array.from(document.querySelectorAll("a[target='_blank'], button"))
+                    .map(b => (b.textContent || "").trim().substring(0, 30)).filter(t => t).slice(0, 10).join(" | ");
+                if (diag) console.log(`[Rewards Auto] 页面按钮诊断: ${diag}`);
+                GM_setValue(detailDateKey, today);
+                GM_setValue(detailDoneKey, true);
+                return true;
+            }
+
+            console.log(`[Rewards Auto] 找到 ${clickable.length} 个可点击任务按钮，逐个点击...`);
+            let clicked = 0;
+
+            // 快照方式逐个点击（每个按钮只点一次，避免重复）
+            for (const btn of clickable) {
+                const btnText = (btn.textContent || "").trim().substring(0, 40) || btn.getAttribute("aria-label") || "未知任务";
+                console.log(`[Rewards Auto] 点击任务 (${clicked + 1}/${clickable.length}): "${btnText}"`);
+                // 【防封号】点击前随机延迟
+                await Utils.randomDelay(3000, 8000);
+                try {
+                    btn.click();
+                    clicked++;
+                } catch (e) {
+                    console.error(`[Rewards Auto] 点击失败: ${e.message}`);
+                }
+            }
+
+            console.log(`[Rewards Auto] 详情页任务完成，共点击 ${clicked} 个任务按钮`);
+            GM_setValue(detailDateKey, today);
+            GM_setValue(detailDoneKey, true);
+            return true;
+        };
+
+        const clickPunchCards = async (depth = 0) => {
+            if (depth > 5) {
+                console.log("[Rewards Auto] 打卡递归深度超限，停止");
+                return;
+            }
+            const today = Utils.getTodayNum();
+            const stateKey = "Config.punchCardState";
+            const dateKey = "Config.punchCardDate";
+            const attemptKey = "Config.punchCardAttempts";
+            const attemptDateKey = "Config.punchCardAttemptDate";
+            const savedDate = GM_getValue(dateKey, 0);
+            let state = savedDate === today ? GM_getValue(stateKey, 0) : 0;
+
+            if (state >= 2) {
+                console.log("[Rewards Auto] 打卡任务已完成");
+                return;
+            }
+
+            // 每日尝试上限：当页面上没有可安全点击的打卡链接时，封顶尝试次数，
+            // 避免每次页面加载都重复点击、无限打开新窗口
+            const savedAttemptDate = GM_getValue(attemptDateKey, 0);
+            let attempts = savedAttemptDate === today ? GM_getValue(attemptKey, 0) : 0;
+            if (attempts >= 3) {
+                console.log("[Rewards Auto] 今日打卡尝试已达上限，停止");
+                return;
+            }
+
+            console.log(`[Rewards Auto] 打卡任务: ${state}/2`);
+            // 【防封号】操作前随机延迟 3-8 秒
+            await Utils.randomDelay(3000, 8000);
+
+            let found = [];
+            for (const sel of punchCardSelectors) {
+                try {
+                    const matched = await Utils.waitForElementsByText(sel, textPatterns, 10000);
+                    // 只保留 href 安全的元素，排除兑换/推荐等导航链接
+                    const safe = matched.filter(m => isSafePunchHref(m.element?.href || ""));
+                    if (safe.length > 0) { found = safe; break; }
+                } catch {}
+            }
+
+            // 兜底：文本模式未命中时，直接用选择器查找安全链接（不依赖活动名称）
+            if (found.length === 0) {
+                for (const sel of punchCardSelectors) {
+                    try {
+                        const els = Array.from(document.querySelectorAll(sel));
+                        const safe = els.filter(el => isSafePunchHref(el.href || ""));
+                        if (safe.length > 0) {
+                            found = safe.map(el => ({ element: el, pattern: "selector-fallback" }));
+                            console.log(`[Rewards Auto] 文本未命中，选择器兜底找到 ${safe.length} 个打卡入口`);
+                            break;
+                        }
+                    } catch {}
+                }
+            }
+
+            // 无论是否找到，都累加尝试次数并持久化
+            GM_setValue(attemptKey, attempts + 1);
+            GM_setValue(attemptDateKey, today);
+
+            if (found.length === 0) {
+                console.log("[Rewards Auto] 未找到可安全点击的打卡卡片");
+                return;
+            }
+
+            if (state < found.length) {
+                const target = found[state];
+                console.log(`[Rewards Auto] 点击: ${target.pattern}`);
+                // 【防封号】点击前随机延迟
+                await Utils.randomDelay();
+                try {
+                    target.element.click();
+                    GM_setValue(stateKey, state + 1);
+                    GM_setValue(dateKey, today);
+                    if (state + 1 < 2) {
+                        // 【防封号】两次点击间隔 5-10 秒
+                        await Utils.randomDelay(5000, 10000);
+                        await clickPunchCards(depth + 1);
+                    }
+                } catch (e) {
+                    console.error(`[Rewards Auto] 点击失败: ${e.message}`);
+                }
+            }
+        };
+
+        const startPunchCards = () => {
+            setTimeout(async () => {
+                const path = location.pathname;
+                if (path.includes("/earn/quest/") || path.includes("punchcard")) {
+                    console.log("[Rewards Auto] 检测到打卡详情页，开始执行任务点击...");
+                    await clickDetailTasks();
+                } else {
+                    console.log("[Rewards Auto] 检测到奖励主页，开始执行卡片点击...");
+                    await clickPunchCards();
+                }
+                // 每日活动与积分领取由 dashboard 专用前台处理器（autoClickDailySet/autoClaimPoints）
+                // 及后台 crontab 的 doDailySet/doClaimPoints 负责，此处不再重复调用，
+                // 避免在 /dashboard 页面与另一套处理器重叠执行造成重复上报
+            }, 3000); // 延迟 3 秒等待页面渲染
+        };
+        
+        if (document.readyState === "complete" || document.readyState === "interactive") {
+            startPunchCards();
+        } else {
+            document.addEventListener("DOMContentLoaded", startPunchCards);
+        }
+    }
+
+    GM_registerMenuCommand("🔑 手动授权", () => {
+        GM_openInTab("https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&response_type=code&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&redirect_uri=https://login.live.com/oauth20_desktop.srf", { active: true });
+    });
+
+    GM_registerMenuCommand("📋 粘贴授权码", () => {
+        const code = prompt("粘贴授权页面跳转后的完整URL:");
+        if (code?.trim()) {
+            GM_setValue("Config.code", code.trim());
+            alert("已保存！");
+        }
+    });
+
+    GM_registerMenuCommand("📊 Token状态", () => {
+        const token = GM_getValue("Config.token", false);
+        const time = GM_getValue("Config.tokenTime", 0);
+        let ageStr = "未知";
+        if (time > 0) {
+            const diff = Utils.getTimestamp() - time;
+            const days = Math.floor(diff / 86400000);
+            const hours = Math.floor((diff % 86400000) / 3600000);
+            const minutes = Math.floor((diff % 3600000) / 60000);
+            const parts = [];
+            if (days > 0) parts.push(`${days}天`);
+            if (hours > 0) parts.push(`${hours}小时`);
+            parts.push(`${minutes}分钟`);
+            ageStr = parts.join("");
+        }
+        const tokenDate = time > 0 ? new Date(time).toLocaleString("zh-CN") : "未知";
+        alert(`Token: ${token ? "已保存" : "无"}\n获取时间: ${tokenDate}\n已过: ${ageStr}\n授权码: ${GM_getValue("Config.code", "") ? "有" : "无"}`);
+    });
+
+    GM_registerMenuCommand("🚀 立即运行", () => TaskManager.runAll());
+
+    // 通知接口配置菜单
+    GM_registerMenuCommand("🔔 配置通知接口", () => {
+        const configNames = [
+            { key: "Notice.wework", name: "企业微信 Webhook", hint: "群机器人webhook key" },
+            { key: "Notice.dingding", name: "钉钉机器人 Access Token", hint: "不加签，关键词需包含 #" },
+            { key: "Notice.feishu", name: "飞书机器人 Webhook", hint: "不加签，关键词需包含 #" },
+            { key: "Notice.pushme", name: "PushMe Key", hint: "push.i-i.me 推送key" },
+            { key: "Notice.bark", name: "Bark Key", hint: "bark.day.app 推送key" }
+        ];
+        
+        let configStr = "🔔 通知接口配置\n";
+        configStr += "==================\n\n";
+        configNames.forEach((item, index) => {
+            const saved = GM_getValue(item.key, "");
+            configStr += `${index + 1}. ${item.name}\n`;
+            configStr += `   状态: ${saved ? "✅ 已配置" : "❌ 未配置"}\n`;
+            configStr += `   说明: ${item.hint}\n\n`;
+        });
+        configStr += "请输入要配置的编号 (1-5)，或输入 0 清除所有配置：";
+        
+        const choice = prompt(configStr);
+        if (!choice) return;
+        
+        const num = parseInt(choice);
+        if (num === 0) {
+            if (confirm("确定要清除所有通知接口配置吗？")) {
+                configNames.forEach(item => GM_setValue(item.key, ""));
+                alert("所有通知接口配置已清除！");
+            }
+            return;
+        }
+        
+        if (num >= 1 && num <= 5) {
+            const selected = configNames[num - 1];
+            const current = GM_getValue(selected.key, "");
+            const newValue = prompt(`配置 ${selected.name}\n\n当前值: ${current || "(空)"}\n\n请输入新的值：`, current);
+            if (newValue !== null) {
+                GM_setValue(selected.key, newValue.trim());
+                alert(`${selected.name} 已${newValue.trim() ? "配置" : "清除"}！`);
+            }
+        } else {
+            alert("无效的编号！");
+        }
+    });
+
+    // 各推送渠道独立开关（默认关闭；即使已配置 key，也需开启对应开关才会推送）
+    [
+        { key: "Notice.wework_on", name: "企业微信" },
+        { key: "Notice.dingding_on", name: "钉钉" },
+        { key: "Notice.feishu_on", name: "飞书" },
+        { key: "Notice.pushme_on", name: "PushMe" },
+        { key: "Notice.bark_on", name: "Bark" },
+    ].forEach(ch => {
+        GM_registerMenuCommand(GM_getValue(ch.key, false) ? `📢 ${ch.name}推送: 开` : `📢 ${ch.name}推送: 关`, () => {
+            const cur = GM_getValue(ch.key, false);
+            GM_setValue(ch.key, !cur);
+            alert(`${ch.name}推送已${!cur ? "开启" : "关闭"}${!cur ? "（请确认已在「配置通知接口」中填写 key）" : ""}`);
+        });
+    });
+
+    GM_registerMenuCommand("📢 测试通知", () => {
+        RewardsAuto.state.sendMSG = "🧪 这是一条测试消息\n如果你看到这条消息，说明通知接口配置成功！";
+        Utils.log("📢", "测试通知已发送", true, true);
+        alert("测试消息已发送，请检查各通知渠道！");
+    });
+
+    // 浏览器通知静默开关
+    const updateBroMenu = () => {
+        const enabled = GM_getValue("Notice.bro", true);
+        return enabled ? "🔕 关闭浏览器通知" : "🔔 开启浏览器通知";
+    };
+    GM_registerMenuCommand(updateBroMenu(), () => {
+        const current = GM_getValue("Notice.bro", true);
+        GM_setValue("Notice.bro", !current);
+        alert(`浏览器通知已${!current ? "开启" : "关闭"}`);
+        location.reload();
+    });
+
+    // 调试模式开关：输出每日活动原始字段/前台 DOM 样例，用于定位上报与点击问题
+    GM_registerMenuCommand(GM_getValue("Config.debugDailySet", false) ? "🐛 关闭调试日志" : "🐛 开启调试日志", () => {
+        const cur = GM_getValue("Config.debugDailySet", false);
+        GM_setValue("Config.debugDailySet", !cur);
+        alert(`调试日志已${!cur ? "开启" : "关闭"}`);
+    });
+
+    // 任务全部完成后是否停止循环（开启后：签到/阅读/活动/搜索/每日活动全部完成则不再运行）
+    GM_registerMenuCommand(GM_getValue("Config.keep", true) ? "💤 完成后停止循环: 关" : "💤 完成后停止循环: 开", () => {
+        const keep = GM_getValue("Config.keep", true);
+        GM_setValue("Config.keep", !keep);
+        alert(!keep
+            ? "已开启「完成后停止循环」：今日任务全部完成后将不再重复运行"
+            : "已关闭「完成后停止循环」：任务完成后仍会每20分钟检查一次");
+    });
+
+    GM_registerMenuCommand("📋 查看通知状态", () => {
+        const channels = [
+            { name: "企业微信", key: "Notice.wework" },
+            { name: "钉钉", key: "Notice.dingding" },
+            { name: "飞书", key: "Notice.feishu" },
+            { name: "PushMe", key: "Notice.pushme" },
+            { name: "Bark", key: "Notice.bark" },
+        ];
+        let status = "📊 通知接口配置状态：\n\n";
+        channels.forEach(c => {
+            const configured = !!GM_getValue(c.key, "");
+            const on = GM_getValue(c.key + "_on", false);
+            status += `${c.name}: ${configured ? "✅已配置" : "❌未配置"} | 推送${on ? "🔔开" : "🔕关"}\n`;
+        });
+        status += `\n浏览器通知: ${GM_getValue("Notice.bro", true) ? "🔔开" : "🔕关"}`;
+        alert(status);
+    });
+
+    const init = () => {
+        TaskManager.init();
+
+        // 检查今日任务是否已完成
+        const isKeep = GM_getValue("Config.keep", true);
+        const checkDone = (enabled, date) => !enabled || date === RewardsAuto.state.dateNowNum;
+        const isAllDone = checkDone(GM_getValue("Tasks.sign"), TaskManager.signDate) &&
+                          checkDone(GM_getValue("Tasks.read"), TaskManager.readDate) &&
+                          checkDone(GM_getValue("Tasks.promos"), TaskManager.promosDate) &&
+                          checkDone(GM_getValue("Tasks.search"), TaskManager.searchDate) &&
+                          GM_getValue("Config.dailySetDone", 0) === RewardsAuto.state.dateNowNum;
+
+        if (!isKeep && isAllDone) {
+            Utils.log("💤", "今日任务已全部完成");
+            return;
+        }
+
+        // 【防封号核心】随机延迟 5-95 秒启动，避免定时器特征
+        const delay = Utils.randomRange(5000, 95000);
+        Utils.log("⏳", `${delay/1000}秒后启动...`);
+        setTimeout(() => TaskManager.runAll(), delay);
+    };
+
+    // 清除可能影响搜索的 Cookie
+    GM_cookie("delete", { url: "https://bing.com", name: "_EDGE_S" });
+
+    // ====== 前台页面处理器（dashboard 页面内执行 DOM 操作） ======
+    if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {
+        Utils.log("📅", "前台模式：监听后台指令...");
+
+        // 自动领取积分函数（带重试：页面数据可能异步加载，首轮未命中时最多重试 5 轮）
+        const autoClaimPoints = async () => {
+            try {
+                const MAX_RETRY = 5;
+                for (let attempt = 1; attempt <= MAX_RETRY; attempt++) {
+                    // 等待页面加载（外部已等 5 秒，此处首轮再等 3 秒，后续每轮等 4 秒）
+                    await new Promise(r => setTimeout(r, attempt === 1 ? 3000 : 4000));
+
+                    // 查找可领取按钮（拓宽到 button 和 [role="button"]，排除禁用态/已领取）
+                    const claimableBtn = Array.from(document.querySelectorAll('button, [role="button"]')).find(b => {
+                        const text = (b.textContent || "").trim();
+                        if (!text) return false;
+                        if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+                        return text.includes("可领取") || (text.includes("领取") && !text.includes("已领取"));
+                    });
+
+                    if (!claimableBtn) {
+                        if (attempt < MAX_RETRY) continue; // 页面数据可能尚未加载完，下一轮重试
+                        const btnTexts = Array.from(document.querySelectorAll('button, [role="button"]'))
+                            .map(b => (b.textContent || "").trim()).filter(t => t).slice(0, 15).join(" | ");
+                        Utils.log("📅", `重试 ${MAX_RETRY} 轮后仍无可领取积分按钮；页面按钮: ${btnTexts || "(无)"}`);
+                        return;
+                    }
+
+                    const amountMatch = (claimableBtn.textContent || "").match(/(\d[\d,]*)/);
+                    const amount = amountMatch ? parseInt(amountMatch[1].replace(/,/g, '')) : 0;
+                    Utils.log("🎁", `发现可领取积分按钮${amount > 0 ? `（${amount} 积分）` : ""}，开始领取...（第 ${attempt} 轮）`);
+
+                    // 点击可领取按钮
+                    claimableBtn.click();
+                    await new Promise(r => setTimeout(r, 2500));
+
+                    // 若弹出确认对话框，查找并点击其中的领取按钮；未弹窗视为直接领取
+                    const dialog = document.querySelector('[role="dialog"]');
+                    if (dialog) {
+                        const claimBtn = Array.from(dialog.querySelectorAll('button, [role="button"]')).find(b => {
+                            const t = (b.innerText || b.textContent || "").trim();
+                            return (t.includes("领取") || /claim/i.test(t)) && !t.includes("已领取");
+                        });
+                        if (claimBtn) {
+                            claimBtn.click();
+                            await new Promise(r => setTimeout(r, 2500));
+                        } else {
+                            Utils.log("🟡", `第 ${attempt} 轮弹出对话框但未找到确认按钮，将重试`);
+                            continue;
+                        }
+                    }
+
+                    Utils.log("🎁", `${amount > 0 ? amount + " " : ""}积分领取操作完成`, true);
+                    return;
+                }
+            } catch (e) {
+                Utils.log("🟡", `自动领取积分失败: ${e.message}`);
+            }
+        };
+
+        // 自动点击每日活动函数
+        const autoClickDailySet = async () => {
+            try {
+                // 等待页面加载
+                await new Promise(r => setTimeout(r, 3000));
+
+                // 查找每日活动链接（rnoreward/earn 任务链接，排除兑换/推荐/导航类）
+                const links = Array.from(document.querySelectorAll('a[href]')).filter(a => {
+                    const href = (a.href || "").toLowerCase();
+                    if (!href || href.startsWith("javascript:")) return false;
+                    const blocked = ["/redeem", "ref=", "refer", "sweepstakes", "aka.ms", "orderhistory",
+                        "goal/all", "login.live.com", "rewardspanel", "microsoft-store", "xbox.com"];
+                    if (blocked.some(b => href.includes(b))) return false;
+                    return href.includes("rnoreward") || href.includes("/earn/") || href.includes("punchcard");
+                });
+
+                // 过滤已完成的
+                const incompleteLinks = links.filter(link => {
+                    const text = link.textContent || "";
+                    return !text.includes("已完成") && !text.includes("Completed");
+                });
+
+                Utils.log("📅", `找到 ${incompleteLinks.length} 个未完成的每日活动`);
+                if (incompleteLinks.length === 0) {
+                    const sample = Array.from(document.querySelectorAll('a[href]'))
+                        .map(a => a.href).filter(h => h).slice(0, 10).join(" , ");
+                    Utils.log("🔵", `未找到每日活动链接；页面链接样例: ${sample || "(无)"}`);
+                }
+                let clickCount = 0;
+
+                for (const link of incompleteLinks) {
+                    const title = link.querySelector('p')?.textContent?.trim()?.substring(0, 30) || "未知活动";
+                    Utils.log("📅", `点击活动: ${title}`);
+                    await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
+                    link.click();
+                    clickCount++;
+                    await new Promise(r => setTimeout(r, 3000 + Math.random() * 5000));
+                }
+
+                if (clickCount > 0) {
+                    Utils.log("📅", `每日活动完成，点击了 ${clickCount} 个活动`);
+                }
+            } catch (e) {
+                Utils.log("🟡", `每日活动点击失败: ${e.message}`);
+            }
+        };
+
+        // 页面加载后自动执行
+        setTimeout(async () => {
+            Utils.log("📅", "页面加载完成，开始自动处理...");
+            await autoClaimPoints();
+            await autoClickDailySet();
+        }, 5000);
+
+        // 监听后台指令
+        GM_addValueChangeListener("BingRewards_cmd", (name, oldValue, newValue) => {
+            if (!newValue || newValue.processed) return;
+
+            const cmd = newValue;
+            Utils.log("📅", `收到后台指令: ${cmd.action}`);
+
+            if (cmd.action === "clickDailySet") {
+                autoClickDailySet().then(() => {
+                    cmd.processed = true;
+                    GM_setValue("BingRewards_cmd", cmd);
+                });
+            } else if (cmd.action === "claimPoints") {
+                autoClaimPoints().then(() => {
+                    cmd.processed = true;
+                    GM_setValue("BingRewards_cmd", cmd);
+                });
+            } else {
+                cmd.processed = true;
+                GM_setValue("BingRewards_cmd", cmd);
+            }
+        });
+
+        // 前台模式不执行后台任务
+        return;
+    }
+
+    // ====== 后台模式入口 ======
+    init();
+
+})();
+
+
+

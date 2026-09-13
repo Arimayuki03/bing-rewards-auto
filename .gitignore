@@ -1,0 +1,10 @@
+# 凭证：含微软账号 refresh_token 与 OAuth 授权码，严禁入库
+*.storage.json
+
+# 编辑器/工具目录
+.claude/
+.qoder/
+
+# 依赖与日志
+node_modules/
+*.log
