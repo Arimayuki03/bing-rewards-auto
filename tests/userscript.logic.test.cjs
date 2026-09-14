@@ -5,6 +5,7 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const scriptPath = path.resolve(__dirname, "..", "微软积分商城签到（全能智能重构版）.user.js");
+const pageProxyPath = path.resolve(__dirname, "..", "微软积分商城签到-页面代理.user.js");
 
 function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     const storage = new Map(Object.entries(initialStorage));
@@ -1172,16 +1173,38 @@ test("claimCard strategy 1 (earn action) attaches the explicit cookie header", a
     assert.equal(posts[0].anonymous, true, "v3.7.0：显式链可用时关掉自动附带的碎片 cookie");
 });
 
-test("front-end rewards block fixes the run date before the /dashboard early-return", () => {
-    const source = fs.readFileSync(scriptPath, "utf8");
-    const start = source.indexOf('if (location.hostname === "rewards.bing.com") {');
-    const end = source.indexOf("// ====== 后台模式入口 ======");
-    assert.ok(start > 0 && end > start, "front-end rewards block not located");
-    const block = source.slice(start, end);
-    // dashboard 分支会在 init() 之前 return：前台块必须自带日期初始化，
+test("page-proxy script fixes the run date and keeps the bgprobe tab passive", () => {
+    const source = fs.readFileSync(pageProxyPath, "utf8");
+    // 前台块自带日期初始化：dashboard 分支在后台任务入口之前 return，
     // 否则 clickPunchCards 以 dateNowNum=0 读写打卡状态键（与其他页面日期错位）
-    assert.match(block, /RewardsAuto\.state\.dateNowNum = Utils\.getTodayNum\(\);/);
-    assert.match(block, /RewardsAuto\.state\.dateNowStr = Utils\.getTodayStr\(\);/);
+    assert.match(source, /RewardsAuto\.state\.dateNowNum = Utils\.getTodayNum\(\);/);
+    assert.match(source, /RewardsAuto\.state\.dateNowStr = Utils\.getTodayStr\(\);/);
+    // 后台救援标签页（?bgprobe=1）只维持转发通道，打卡处理器与 DOM 自动处理都必须早退
+    assert.match(source, /if \(location\.search\.includes\("bgprobe"\)\) return;/);
+});
+
+test("v3.8.0 split: page-proxy script carries the front-end channel and shares storage", () => {
+    const source = fs.readFileSync(pageProxyPath, "utf8");
+    assert.match(source, /@storageName\s+BingRewardsAuto_Shared/, "必须与后台脚本同存储区，桥接才成立");
+    assert.doesNotMatch(source, /^\/\/ @crontab/m, "页面代理脚本不得带 @crontab 元数据（否则又变回不注入的后台脚本）");
+    assert.match(source, /@match\s+https:\/\/rewards\.bing\.com\/\*/);
+    assert.match(source, /const setupPageProxy = \(\) =>/);
+    assert.match(source, /GM_addValueChangeListener\("BingRewards_req"/);
+    assert.match(source, /GM_setValue\("BingRewards_alive"/);
+    assert.match(source, /通道诊断（本页）/);
+});
+
+test("v3.8.0 split: background script keeps the SW side and drops dead page code", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    assert.match(source, /@crontab/, "后台脚本保留 @crontab 定时能力");
+    assert.match(source, /@storageName\s+BingRewardsAuto_Shared/);
+    // 页面执行器/DOM 处理器已迁出——后台脚本不再包含注入页面才生效的死代码
+    assert.doesNotMatch(source, /const setupPageProxy/);
+    assert.doesNotMatch(source, /clickPunchCards/);
+    assert.doesNotMatch(source, /autoClaimPoints/);
+    // 后台侧转发协议与失联分诊仍在，且指引指向页面代理脚本
+    assert.match(source, /GM_setValue\("BingRewards_req"/);
+    assert.match(source, /页面代理/);
 });
 
 test("run lock defaults to a 20-minute expiry and renewal only extends the owner's lock", () => {
@@ -1369,7 +1392,8 @@ test("www.bing.com requests are never routed through the page channel", async ()
 });
 
 test("front-end wires the proxy and gives bgprobe tabs a DOM-processing-free mode", () => {
-    const source = fs.readFileSync(scriptPath, "utf8");
+    // v3.8.0：页面侧代码整体迁至《页面代理》脚本（后台脚本因 @crontab 不注入页面）
+    const source = fs.readFileSync(pageProxyPath, "utf8");
     // 页面侧：执行器带真实 cookie（fetch credentials:include / xhr withCredentials 已在
     // v3.6.9 执行器测试中断言），监听器把请求交给执行器执行并回包
     assert.match(source, /const pageProxyExecutor = \(\) => \{[\s\S]*?credentials: "include"/);
@@ -1391,19 +1415,21 @@ test("background detection uses hostname, not just typeof document (sandbox has 
 // ====== v3.6.13：页面注入标记与失联分诊 ======
 
 test("page leaves an injection marker and the SW timeout message triages the cause", () => {
-    const source = fs.readFileSync(scriptPath, "utf8");
+    const pageSrc = fs.readFileSync(pageProxyPath, "utf8");
     // 代理页挂载前先写注入标记（区分"未注入"与"注入但无心跳"）
-    assert.match(source, /const setupPageProxy = \(\) => \{\s*[^}]*?GM_setValue\("BingRewards_injected"/);
-    // 未就绪日志三分诊：心跳存在 / 注入标记新鲜 / 从未注入
-    assert.ok(source.includes('"BingRewards_injected"'));
-    assert.ok(source.includes("代理页从未被脚本注入"));
-    assert.ok(source.includes("「前台运行/网页脚本」开关与站点权限"));
+    assert.match(pageSrc, /const setupPageProxy = \(\) => \{\s*[^}]*?GM_setValue\("BingRewards_injected"/);
+    // v3.8.0：未就绪分诊文案指向页面代理脚本（旧「前台运行开关」排查路径已作废——
+    // 根因是 @crontab 后台脚本类别不注入页面，与用户侧开关无关）
+    const bgSrc = fs.readFileSync(scriptPath, "utf8");
+    assert.ok(bgSrc.includes('"BingRewards_injected"'));
+    assert.ok(bgSrc.includes("页面代理脚本未注入"));
+    assert.ok(!bgSrc.includes("「前台运行/网页脚本」开关与站点权限"));
 });
 
 // ====== v3.6.15：诊断菜单只在页面上下文注册（后台注册是假阳性）======
 
 test("the channel diagnostic menu is registered on rewards pages only, before any early-return", () => {
-    const source = fs.readFileSync(scriptPath, "utf8");
+    const source = fs.readFileSync(pageProxyPath, "utf8");
     const rewards = source.indexOf('if (location.hostname === "rewards.bing.com") {');
     const dash = source.indexOf('if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {');
     assert.ok(rewards > 0 && dash > rewards);
@@ -1412,6 +1438,8 @@ test("the channel diagnostic menu is registered on rewards pages only, before an
     assert.match(block, /setupPageProxy\(\);[\s\S]{0,200}?GM_registerMenuCommand\("🔗 通道诊断（本页）"/);
     assert.equal(source.split('GM_registerMenuCommand("🔗 通道诊断（本页）"').length - 1, 1,
         "background-registered diagnostic gives a false 'injection OK' (v3.6.14 bug)");
+    assert.ok(!fs.readFileSync(scriptPath, "utf8").includes("通道诊断（本页）"),
+        "v3.8.0：诊断菜单只存在于页面代理脚本");
     assert.match(block, /BingRewards_alive/);
 });
 
@@ -1440,7 +1468,7 @@ test("non-fetch executor modes (xhr/uwfetch) still route through the page channe
 });
 
 test("page proxy executor falls back fetch→uw.fetch→XHR→uw.XHR and always heartbeats", () => {
-    const source = fs.readFileSync(scriptPath, "utf8");
+    const source = fs.readFileSync(pageProxyPath, "utf8");
     assert.match(source, /const pageProxyExecutor = \(\) => \{[\s\S]*?typeof uw\.fetch === "function"[\s\S]*?typeof XMLHttpRequest === "function"[\s\S]*?typeof uw\.XMLHttpRequest === "function"[\s\S]*?return null;/);
     // 即使没有任何执行器也必须心跳上报 mode:"none"（后台据此立即禁用，不再干等 25s）
     assert.match(source, /mode: ex \? ex\.mode : "none"/);
