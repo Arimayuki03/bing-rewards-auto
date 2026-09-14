@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.7
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.7：运行锁加固——心跳失联/持有超90分钟/过期值异常一律接管，跳过时记录持有者诊断，杜绝卡死实例把后台永久锁死）
+// @version      3.6.8
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.8：rewards.bing.com 请求优先经前台标签页同源转发（真实登录cookie，治 Server Action 500/签入 401），无前台时自动开隐藏代理页；修复 crontab sandbox 被误判为前台）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -48,6 +48,10 @@ Config:
         default: true
     lock:
         title: 锁定国区（非大陆IP自动停止）
+        type: checkbox
+        default: true
+    pageProxy:
+        title: rewards.bing.com 请求优先经前台标签页同源转发（带真实登录cookie，推荐开启）
         type: checkbox
         default: true
     span:
@@ -161,6 +165,10 @@ Notice:
     }
 
     const RewardsAuto = {
+        // v3.6.8 前台同源转发通道状态：救援标签页句柄 / 本轮是否已尝试救援 / 本轮通道是否已禁用
+        _pageTabHandle: null,
+        _pageRescueUsed: false,
+        _pageChannelOff: false,
         // UA: pc=Edge桌面, mobile=Edge移动, app=BingSapphire真机抓包
         ua: {
             pc: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
@@ -438,11 +446,92 @@ Notice:
             }));
         },
 
+        // ====== 前台同源转发通道 · 后台侧（v3.6.8）======
+        // SW/sandbox 对 rewards.bing.com 的子请求不携带（或被剥掉）真实登录 cookie 链，
+        // 这是 Server Action 500 / PC 签入 401 / 卡片领取策略团灭的共同根因
+        // （v3.6.5 curl 重放结论：payload 正确 + 全量浏览器 cookie = 200）。
+        // 前台页面上下文里 fetch 由浏览器附带全量真实 cookie，等价于真实点击重放。
+        // 页面侧协议：BingRewards_alive={ts} 心跳（20s）；BingRewards_req={id,method,url,
+        // headers,data} 请求；BingRewards_resp={id,ok,status,text,finalUrl,headers} 回包。
+        _pageRouted(url) {
+            return typeof url === "string" && /^https:\/\/rewards\.bing\.com\//i.test(url) &&
+                GM_getValue("Config.pageProxy", true);
+        },
+
+        _pageChannelAlive() {
+            try {
+                const a = GM_getValue("BingRewards_alive", null);
+                // 心跳每 20 秒一次，45 秒容差（>2 个周期）判定页面在线
+                return !!(a && typeof a.ts === "number" && Date.now() - a.ts < 45000);
+            } catch (_) { return false; }
+        },
+
+        // 确保通道可用：有活页面直接用；没有则开一个隐藏代理标签页（dashboard?bgprobe，
+        // 该页只挂转发监听、不跑前台 DOM 自动处理）等心跳出现。
+        // 每轮至多救援一次；救援失败或环境不支持时本轮禁用通道，避免反复开标签页。
+        async ensurePageChannel() {
+            if (this._pageChannelAlive()) return true;
+            if (RewardsAuto._pageChannelOff || RewardsAuto._pageRescueUsed) return false;
+            RewardsAuto._pageRescueUsed = true;
+            try {
+                const handle = GM_openInTab("https://rewards.bing.com/dashboard?bgprobe=1", { active: false, insert: false });
+                if (handle && typeof handle === "object") RewardsAuto._pageTabHandle = handle;
+            } catch (_) {}
+            if (!RewardsAuto._pageTabHandle) {
+                RewardsAuto._pageChannelOff = true; // 无法开标签页（环境不支持），本轮直接请求
+                return false;
+            }
+            Utils.log("🔗", "已打开后台代理标签页，等待同源通道就绪...");
+            const deadline = Date.now() + 25000;
+            while (Date.now() < deadline) {
+                await Utils.delay(1000);
+                if (this._pageChannelAlive()) return true;
+            }
+            RewardsAuto._pageChannelOff = true; // 代理页未响应（被重定向到登录/加载失败）
+            Utils.log("🟡", "后台代理标签页未就绪，本轮回退直连请求");
+            return false;
+        },
+
+        // 把一个请求转交前台页面同源执行；成功返回 {status,text,finalUrl,headers}，
+        // 失败/超时返回 null，由调用方回退 SW 直连（转发失败绝不能演变为任务失败）。
+        async pageRequest(options, waitMs = 22000) {
+            try {
+                const id = Utils.getRandomUUID();
+                GM_setValue("BingRewards_req", {
+                    id,
+                    method: (options.method || "GET").toUpperCase(),
+                    url: options.url,
+                    headers: options.headers || {},
+                    data: options.data,
+                });
+                const deadline = Date.now() + waitMs;
+                while (Date.now() < deadline) {
+                    await Utils.delay(250);
+                    const r = GM_getValue("BingRewards_resp", null);
+                    if (!r || r.id !== id) continue; // 旧回包/他人回包：忽略
+                    return (r.ok && typeof r.status === "number") ? r : null; // 页面执行失败 → 回退直连
+                }
+                return null; // 页面未应答（被关闭/正在导航）→ 回退直连
+            } catch (_) { return null; }
+        },
+
         // 封装 GM_xmlhttpRequest，15秒超时。
         // GET 重定向自动跟随并返回最终页面内容（earn/dashboard 常见区域跳转），
         // 避免调用方拿到 Location 字符串后误当 HTML 解析、静默失败；非 GET 请求
         // 遇重定向仍返回 Location（或 false），由调用方决定后续处理。
-        xhr(options, _redirects = 0) {
+        // rewards.bing.com 的请求优先尝试前台页面同源转发（真实登录 cookie），
+        // 通道不可用/转发失败时无感回退下面的 SW 直连路径。
+        async xhr(options, _redirects = 0) {
+            if (_redirects === 0 && this._pageRouted(options && options.url)) {
+                if (await this.ensurePageChannel()) {
+                    const via = await this.pageRequest(options);
+                    if (via) {
+                        if (via.status >= 200 && via.status < 300) return via.text || "";
+                        if (options.acceptErrorBody) return { status: via.status, body: via.text || "", headers: via.headers || "" };
+                        throw new Error(`HTTP ${via.status}（同源转发）`);
+                    }
+                }
+            }
             return new Promise((resolve, reject) => {
                 const start = Date.now();
                 const isGetLike = !options.method || options.method.toUpperCase() === "GET";
@@ -1043,8 +1132,10 @@ Notice:
             if (!GM_getValue("Tasks.sign", true) && !GM_getValue("Tasks.read", true)) return true;
 
             const authUrl = "https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&response_type=code&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&redirect_uri=https://login.live.com/oauth20_desktop.srf";
-            // @crontab 在 service_worker 中运行，无微软登录 Cookie，自动获取授权码必然失败，直接跳过
-            const isBackground = typeof document === "undefined";
+            // @crontab 运行环境（service_worker/sandbox）无微软登录 Cookie，自动获取授权码
+            // 必然失败，直接跳过。注意 ScriptCat 的 crontab 可能在 sandbox 页面里执行且带
+            // document——只判 typeof document 会把后台误判为前台，故以主机名是否为 bing 系为准。
+            const isBackground = typeof document === "undefined" || !/(^|\.)bing\.com$/.test(location.hostname || "");
 
             // 获取授权码：前台先尝试自动重定向捕获；后台/失败时打开授权页等待用户手动完成
             const fetchCode = async (msg) => {
@@ -3530,6 +3621,9 @@ Notice:
                     this._lockHeartbeat = null;
                 }
             }, RUN_LOCK_HEARTBEAT_MS);
+            // 每轮重置同源转发通道的救援状态（v3.6.8）
+            RewardsAuto._pageRescueUsed = false;
+            RewardsAuto._pageChannelOff = false;
             RewardsAuto.state.startTime = Utils.getTimestamp();
             Utils.log("🚀", "启动全能自动化任务...");
             this.init();
@@ -3732,11 +3826,59 @@ Notice:
                 clearInterval(this._lockHeartbeat);
                 this._releaseRunLock(runLock);
                 this.running = false;
+                // 关闭本轮自行打开的后台代理标签页（用户自己的标签页不在句柄内，不受影响）
+                if (RewardsAuto._pageTabHandle) {
+                    try { RewardsAuto._pageTabHandle.close(); } catch (_) {}
+                    RewardsAuto._pageTabHandle = null;
+                }
             }
         }
     };
 
+    // ====== 前台同源转发通道 · 页面侧（v3.6.8）======
+    // 挂 20 秒心跳并监听 BingRewards_req：在页面上下文 fetch 执行后台转来的
+    // rewards.bing.com 同源 GET/POST（浏览器自动附带全量真实登录 cookie），
+    // 结果按 {id,ok,status,text,...} 写回 BingRewards_resp。任何异常不应答，
+    // 后台将回退直连——转发通道只能改善、绝不能恶化既有任务路径。
+    const setupPageProxy = () => {
+        if (typeof fetch === "undefined") return;
+        const beat = () => { try { GM_setValue("BingRewards_alive", { ts: Date.now() }); } catch (_) {} };
+        beat();
+        setInterval(beat, 20000);
+        GM_addValueChangeListener("BingRewards_req", async (name, oldV, req) => {
+            try {
+                if (!req || !req.id || req.answered) return;
+                if (!/^https:\/\/rewards\.bing\.com\//i.test(req.url || "")) return;
+                if (!["GET", "POST"].includes(req.method)) return;
+                req.answered = true;
+                try { GM_setValue(name, req); } catch (_) {} // 认领标记，多标签页时尽量只执行一次
+                try {
+                    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+                    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, 20000) : null;
+                    const res = await fetch(req.url, {
+                        method: req.method,
+                        headers: req.headers && Object.keys(req.headers).length ? req.headers : undefined,
+                        body: req.method === "POST" ? req.data : undefined,
+                        credentials: "include",
+                        redirect: "follow",
+                        signal: ctrl ? ctrl.signal : undefined,
+                    });
+                    if (timer) clearTimeout(timer);
+                    const text = await res.text();
+                    GM_setValue("BingRewards_resp", {
+                        id: req.id, ok: true, status: res.status,
+                        text: text.slice(0, 500000),
+                        finalUrl: res.url || req.url,
+                        headers: Array.from(res.headers || []).map(([k, v]) => `${k}: ${v}`).join("\r\n"),
+                    });
+                } catch (e) {
+                    GM_setValue("BingRewards_resp", { id: req.id, ok: false, err: String((e && e.message) || e).slice(0, 200) });
+                }
+            } catch (_) { /* 转发异常不应答，后台超时后自行回退 */ }
+        });
+    };
     if (location.hostname === "rewards.bing.com") {
+        setupPageProxy();
         // 前台页面（含 /dashboard）先初始化运行起始日：dashboard 分支会在后台入口
         // init() 之前 return，TaskManager.init() 不会执行；若不在此设置，
         // clickPunchCards 等处理器会以 dateNowNum=0 读写打卡状态键，与其他页面的
@@ -4134,7 +4276,9 @@ Notice:
 
         // 【防封号核心】随机延迟启动，避免定时器特征。
         // 后台 crontab 受执行时间预算限制，缩短随机等待；前台页面保持 5-95 秒。
-        const isBackground = typeof document === "undefined";
+        // 与 renewToken 的同款修正：ScriptCat crontab 可能在带 document 的 sandbox 页面
+        // 中执行（实测日志 "⏳ 54.731秒后启动... {env:service_worker}"），以主机名为准。
+        const isBackground = typeof document === "undefined" || !/(^|\.)bing\.com$/.test(location.hostname || "");
         const delay = isBackground ? Utils.randomRange(2000, 5000) : Utils.randomRange(5000, 95000);
         Utils.log("⏳", `${delay/1000}秒后启动...`);
         setTimeout(() => TaskManager.runAll(), delay);
@@ -4146,6 +4290,12 @@ Notice:
 
     // ====== 前台页面处理器（dashboard 页面内执行 DOM 操作） ======
     if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {
+        // 后台救援标签页（?bgprobe=1）：只维持同源转发通道心跳/监听，
+        // 不跑 DOM 自动领取与点击，避免页面导航打断转发、也避免误触前台 UI
+        if (location.search.includes("bgprobe")) {
+            Utils.log("🔗", "后台代理标签页就绪：仅维持同源转发通道，跳过前台 DOM 自动处理");
+            return;
+        }
         Utils.log("📅", "前台模式：监听后台指令...");
 
         // 自动领取积分函数（带重试：页面数据可能异步加载，首轮未命中时最多重试 5 轮）

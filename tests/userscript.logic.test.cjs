@@ -1281,3 +1281,91 @@ test("runAll heartbeat timer stops itself once the hold ceiling is reached", asy
     assert.equal(intervals.set.length, 1);
     void runPromise;
 });
+
+// ====== v3.6.8：rewards.bing.com 前台同源转发通道 ======
+
+test("rewards.bing.com requests ride the page channel when a live page heartbeats", async () => {
+    let swCalls = 0;
+    const gmXhr = o => { swCalls++; o.onload({ status: 200, responseText: "SW", responseHeaders: "" }); };
+    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now() } }, { gmXhr });
+    Utils.getRandomUUID = () => "req-fixed-0001"; // 固定转发请求 id，便于预置回包
+    storage.set("BingRewards_resp", { id: "req-fixed-0001", ok: true, status: 200, text: "RSC:OK", headers: "x: y" });
+
+    const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "[1]" });
+
+    assert.equal(body, "RSC:OK");
+    assert.equal(swCalls, 0, "channel hit must not issue an SW request");
+    assert.equal(storage.get("BingRewards_req").url, "https://rewards.bing.com/dashboard");
+});
+
+test("page-channel non-2xx keeps acceptErrorBody / rejection semantics", async () => {
+    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now() } });
+    Utils.getRandomUUID = () => "req-fixed-0002";
+    storage.set("BingRewards_resp", { id: "req-fixed-0002", ok: true, status: 500, text: "E80", headers: "" });
+    const r = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", acceptErrorBody: true });
+    assert.equal(r.status, 500);
+    assert.equal(r.body, "E80");
+
+    Utils.getRandomUUID = () => "req-fixed-0003";
+    storage.set("BingRewards_resp", { id: "req-fixed-0003", ok: true, status: 401, text: "", headers: "" });
+    await assert.rejects(
+        () => Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard" }),
+        /HTTP 401/);
+});
+
+test("page execution failure falls back to the direct SW path", async () => {
+    const calls = [];
+    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
+    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now() } }, { gmXhr });
+    Utils.getRandomUUID = () => "req-fixed-0004";
+    storage.set("BingRewards_resp", { id: "req-fixed-0004", ok: false, err: "CORS blocked" });
+
+    const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "d" });
+
+    assert.equal(body, "SW-OK");
+    assert.deepEqual(calls, ["https://rewards.bing.com/dashboard"]);
+});
+
+test("without live page or tab capability the channel disables once and goes direct", async () => {
+    const calls = [];
+    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
+    const { Utils, RewardsAuto } = createHarness({}, { gmXhr });
+    // harness 的 GM_openInTab 返回 undefined：救援不可用 → 通道立即禁用，绝不挂 25 秒
+
+    const body = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+
+    assert.equal(body, "SW-OK");
+    assert.equal(RewardsAuto._pageChannelOff, true);
+    assert.equal(RewardsAuto._pageRescueUsed, true);
+    await Utils.xhr({ url: "https://rewards.bing.com/earn" });
+    assert.equal(calls.length, 2, "disabled channel: later requests go direct without retrying the tab");
+});
+
+test("www.bing.com requests are never routed through the page channel", async () => {
+    const calls = [];
+    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
+    const { Utils } = createHarness({ "BingRewards_alive": { ts: Date.now() } }, { gmXhr });
+
+    const body = await Utils.xhr({ url: "https://www.bing.com/search?q=abc" });
+
+    assert.equal(body, "SW-OK");
+    assert.equal(calls.length, 1);
+});
+
+test("front-end wires the proxy and gives bgprobe tabs a DOM-processing-free mode", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    // 页面侧：监听请求 + 页面 fetch 带真实 cookie（credentials:include）
+    assert.match(source, /const setupPageProxy = \(\) => \{[\s\S]*?GM_addValueChangeListener\("BingRewards_req"[\s\S]*?credentials: "include"/);
+    // 通道挂在 rewards.bing.com 块最前，先于 dashboard 分支
+    const rewards = source.indexOf('if (location.hostname === "rewards.bing.com") {');
+    const dash = source.indexOf('if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {');
+    assert.ok(rewards > 0 && rewards < dash);
+    assert.match(source.slice(rewards, rewards + 120), /setupPageProxy\(\);/);
+    assert.match(source.slice(dash, dash + 500), /location\.search\.includes\("bgprobe"\)/);
+});
+
+test("background detection uses hostname, not just typeof document (sandbox has document)", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    const fixed = '!/(^|\\.)bing\\.com$/.test(location.hostname || "");';
+    assert.equal(source.split(fixed).length - 1, 2);
+});
