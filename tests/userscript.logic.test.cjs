@@ -1394,6 +1394,16 @@ test("page leaves an injection marker and the SW timeout message triages the cau
     assert.ok(source.includes("「前台运行/网页脚本」开关与站点权限"));
 });
 
+// ====== v3.6.14：前台可视化诊断菜单 ======
+
+test("a menu command exposes on-page channel diagnostics for manual verification", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    assert.match(source, /GM_registerMenuCommand\("🔗 通道诊断（本页）"/);
+    // 菜单必须读取注入标记与心跳，并提示"保持一个 rewards 页面打开"
+    assert.match(source, /通道诊断（本页）"[\s\S]{0,1200}?BingRewards_alive/);
+    assert.match(source, /至少保持一个 rewards\.bing\.com 页面打开/);
+});
+
 // ====== v3.6.9：转发执行器多级回退 / 心跳带 mode / 授权码保留 ======
 
 test("a mode:none heartbeat disables the channel instead of per-request timeouts", async () => {

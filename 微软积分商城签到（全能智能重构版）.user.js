@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.13
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.13：页面注入标记——代理页失联时日志可直接分诊"未注入（查ScriptCat开关）"还是"注入但重定向登录"；含v3.6.12 阅读复核竞态修复+x-deployment-id、v3.6.11 卡片链路按登录态抓包重写、同源转发通道）
+// @version      3.6.14
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.14：新增"🔗 通道诊断（本页）"菜单——在 rewards 页面一键查看前台注入/执行器/心跳状态；含v3.6.13 注入标记失联分诊、v3.6.12 阅读复核竞态修复、v3.6.11 卡片链路按登录态抓包重写、同源转发通道）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -4283,6 +4283,34 @@ Notice:
         if (code?.trim()) {
             GM_setValue("Config.code", code.trim());
             alert("已保存！");
+        }
+    });
+
+    // v3.6.14 前台诊断：在 rewards.bing.com 页面能看到本菜单 = 前台注入正常；
+    // 心跳长期"无/离线"则说明没有任何 rewards 页面保持打开（代理通道无从挂载）。
+    GM_registerMenuCommand("🔗 通道诊断（本页）", () => {
+        try {
+            const now = Date.now();
+            const alive = GM_getValue("BingRewards_alive", null);
+            const inj = GM_getValue("BingRewards_injected", null);
+            const age = ts => (typeof ts === "number" ? `${Math.max(0, Math.round((now - ts) / 1000))} 秒前` : "无");
+            const aliveStr = alive && typeof alive.ts === "number"
+                ? `${age(alive.ts)}（mode=${alive.mode || "?"}，${now - alive.ts < 45000 ? "在线 ✅" : "已离线"}）`
+                : "无";
+            const injStr = inj && typeof inj.ts === "number" ? `${age(inj.ts)} @ ${inj.url || "?"}` : "无";
+            const exec = typeof fetch === "function" ? "fetch"
+                : (typeof XMLHttpRequest === "function" ? "XHR" : "无（沙箱全封，将用 unsafeWindow 回退）");
+            alert([
+                "前台脚本注入: ✅ 正常（能看到本菜单即证明）",
+                `本页可用执行器: ${exec}`,
+                `最近注入标记: ${injStr}`,
+                `通道心跳: ${aliveStr}`,
+                "",
+                "心跳长期'无/离线'时：请在装 ScriptCat 的浏览器里",
+                "至少保持一个 rewards.bing.com 页面打开（后台会自动复用并经它转发上报）。",
+            ].join("\n"));
+        } catch (e) {
+            alert("诊断失败: " + (e && e.message || e));
         }
     });
 
