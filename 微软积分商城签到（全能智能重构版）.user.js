@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.12
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.12：修复阅读/每日活动"入账延迟+轮内缓存"导致的完成误报——复核强制绕缓存+延迟+乐观标记；Server Action 直连补 x-deployment-id 指纹头；代理页未挂载时每日一次通知引导手动开页。含v3.6.11 卡片链路按登录态抓包重写）
+// @version      3.6.13
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.13：页面注入标记——代理页失联时日志可直接分诊"未注入（查ScriptCat开关）"还是"注入但重定向登录"；含v3.6.12 阅读复核竞态修复+x-deployment-id、v3.6.11 卡片链路按登录态抓包重写、同源转发通道）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -490,11 +490,16 @@ Notice:
                 if (this._pageChannelAlive()) return true;
             }
             RewardsAuto._pageChannelOff = true; // 代理页未响应（被重定向到登录/未注入/无执行器）
-            let why = "代理页无心跳：可能未注入脚本或被重定向到登录页";
+            let why = "代理页无心跳";
             try {
                 const a = GM_getValue("BingRewards_alive", null);
+                const inj = GM_getValue("BingRewards_injected", null);
                 if (a && typeof a.ts === "number") {
                     why = `心跳 ${Math.max(0, Math.round((Date.now() - a.ts) / 1000))} 秒前、mode=${a.mode || "?"}`;
+                } else if (inj && typeof inj.ts === "number" && Date.now() - inj.ts < 120000) {
+                    why = "rewards 页面脚本已注入但代理页无心跳（页面可能被重定向到登录）";
+                } else {
+                    why = "代理页从未被脚本注入 → 检查 ScriptCat 该脚本的「前台运行/网页脚本」开关与站点权限";
                 }
             } catch (_) {}
             Utils.log("🟡", `后台代理标签页未就绪（${why}），本轮回退直连请求`);
@@ -4007,6 +4012,10 @@ Notice:
         return null;
     };
     const setupPageProxy = () => {
+        // v3.6.13 注入标记：只要有任意 rewards 页面执行到脚本，就留下痕迹。
+        // 后台据此区分"代理页从未被注入（ScriptCat 前台注入开关/权限问题）"
+        // 与"注入了但执行器全缺（mode:none）"——连续多轮零心跳时后者不该出现。
+        try { GM_setValue("BingRewards_injected", { ts: Date.now(), url: (location.href || "").slice(0, 80) }); } catch (_) {}
         const ex = pageProxyExecutor();
         const beat = () => { try { GM_setValue("BingRewards_alive", { ts: Date.now(), mode: ex ? ex.mode : "none" }); } catch (_) {} };
         beat();

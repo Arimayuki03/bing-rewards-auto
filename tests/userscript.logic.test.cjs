@@ -1382,6 +1382,18 @@ test("background detection uses hostname, not just typeof document (sandbox has 
     assert.equal(source.split(fixed).length - 1, 2);
 });
 
+// ====== v3.6.13：页面注入标记与失联分诊 ======
+
+test("page leaves an injection marker and the SW timeout message triages the cause", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    // 代理页挂载前先写注入标记（区分"未注入"与"注入但无心跳"）
+    assert.match(source, /const setupPageProxy = \(\) => \{\s*[^}]*?GM_setValue\("BingRewards_injected"/);
+    // 未就绪日志三分诊：心跳存在 / 注入标记新鲜 / 从未注入
+    assert.ok(source.includes('"BingRewards_injected"'));
+    assert.ok(source.includes("代理页从未被脚本注入"));
+    assert.ok(source.includes("「前台运行/网页脚本」开关与站点权限"));
+});
+
 // ====== v3.6.9：转发执行器多级回退 / 心跳带 mode / 授权码保留 ======
 
 test("a mode:none heartbeat disables the channel instead of per-request timeouts", async () => {
