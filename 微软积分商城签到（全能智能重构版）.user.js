@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.17
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.17：卡片按 offerId 去重——多源同卡因 hash 轮换重复入列致二次领取空转、整轮误判部分失败；v3.6.16 直连实测：Server Action POST 仍 500 但策略5 open-link 直连可独立入账；含通道、抓包契约卡片链路、阅读复核竞态修复）
+// @version      3.7.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.7.0 路线重写：登录态浏览器逆向实证——入账唯一判据为 Server Action 响应含 1:true，缺 cookie 链的 200 是页面重渲染、action 未执行；cookie 链三形式兼容+error 上抛+每轮诊断日志；显式链可用时关掉 SW 自动附带碎片 cookie；XHR 访问活动链接证实无效改开真实后台标签页；v3.6.17 卡片按 offerId 去重；含通道、抓包契约卡片链路、阅读复核竞态修复）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -606,21 +606,60 @@ Notice:
         // 的登录 cookie（.MSA.Auth/_U/rn_S 等）。GM_cookie 可无视 SameSite 读取，
         // 显式放进 Cookie 头即可补齐。不可用（非 ScriptCat/未授权/超时）返回 ""，
         // 调用方保持隐式 cookie 行为不变。
+        // v3.7.0：三形式兼容（ScriptCat action 形 / TM .list 形 / GM.cookie Promise 形）
+        // 并上抛 error——此前回调只取首参，授权拒绝/接口缺失时静默返回 ""，直连请求
+        // 长期在缺 cookie 状态下发出而无从排查（2026-09-15 抓包：缺链请求 200 但
+        // action 不执行、半截链 500）。每轮首次获取记录 form/count/error 诊断日志。
         cookieHeaderFor(url, timeoutMs = 2500) {
             return new Promise((resolve) => {
                 let done = false;
-                const finish = (value) => { if (!done) { done = true; resolve(value); } };
+                const report = (cookie, diag) => {
+                    if (done) return; done = true;
+                    clearTimeout(timer);
+                    RewardsAuto.state.cookieDiag = diag || { form: "ok", count: (cookie.match(/=/g) || []).length };
+                    if (diag && !RewardsAuto.state.cookieDiagLogged) {
+                        RewardsAuto.state.cookieDiagLogged = true;
+                        Utils.log("🟡", `cookie 链诊断(${diag.form}): ${diag.error} —— SW 直连将缺 SameSite 登录 cookie（Server Action 会 500/200-noop）。请检查 ScriptCat 的 GM_cookie 授权弹窗与脚本 @connect 域名`);
+                    } else if (!diag && !RewardsAuto.state.cookieDiagLogged) {
+                        RewardsAuto.state.cookieDiagLogged = true;
+                        Utils.log("🩺", `cookie 链可用: ${RewardsAuto.state.cookieDiag.count} 条`);
+                    }
+                    resolve(cookie);
+                };
+                const timer = setTimeout(() => report("", { form: "timeout", error: `${timeoutMs}ms 无回调` }), timeoutMs);
                 try {
-                    if (typeof GM_cookie !== "function") return finish("");
-                    const timer = setTimeout(() => finish(""), timeoutMs);
-                    GM_cookie("list", { url }, (cookies) => {
-                        if (done) return;
-                        clearTimeout(timer);
-                        finish(Array.isArray(cookies) && cookies.length > 0
-                            ? cookies.map(c => `${c.name}=${c.value}`).join("; ")
-                            : "");
-                    });
-                } catch (_) { finish(""); }
+                    if (typeof GM_cookie === "function") {
+                        GM_cookie("list", { url }, (cookies, error) => {
+                            if (done) return;
+                            if (error) return report("", { form: "GM_cookie(action)", error: String((error && error.message) || error) });
+                            if (Array.isArray(cookies)) return report(cookies.map(c => `${c.name}=${c.value}`).join("; "));
+                            // 回调形态不对 → 尝试 TM 对象形 GM_cookie.list
+                            try {
+                                if (GM_cookie && typeof GM_cookie.list === "function") {
+                                    GM_cookie.list({ url }, (cookies2, error2) => {
+                                        if (done) return;
+                                        if (error2) return report("", { form: "GM_cookie.list", error: String((error2 && error2.message) || error2) });
+                                        if (Array.isArray(cookies2)) return report(cookies2.map(c => `${c.name}=${c.value}`).join("; "));
+                                        report("", { form: "GM_cookie.list", error: "回调未返回数组" });
+                                    });
+                                    return;
+                                }
+                            } catch (_) { /* 落到错误上报 */ }
+                            report("", { form: "GM_cookie(action)", error: "回调未返回数组" });
+                        });
+                        return;
+                    }
+                    if (typeof GM !== "undefined" && GM && GM.cookie && typeof GM.cookie.list === "function") {
+                        GM.cookie.list({ url }).then((cookies) => {
+                            if (Array.isArray(cookies)) report(cookies.map(c => `${c.name}=${c.value}`).join("; "));
+                            else report("", { form: "GM.cookie.list", error: "返回非数组" });
+                        }).catch((e) => report("", { form: "GM.cookie.list", error: String((e && e.message) || e) }));
+                        return;
+                    }
+                    report("", { form: "unavailable", error: "GM_cookie 不可用" });
+                } catch (e) {
+                    report("", { form: "exception", error: String((e && e.message) || e) });
+                }
             });
         },
 
@@ -2414,6 +2453,11 @@ Notice:
             const EARN = "https://rewards.bing.com/earn";
             const referer = card.url || "https://rewards.bing.com/";
 
+            // v3.7.0 抓包实证（2026-09-15 登录态页面）：action 成功的唯一判据是响应含
+            // `1:true`——缺 cookie 链的请求同样 200，但服务端只重渲染页面、action 不执行
+            // （无 `1:true`）；半截链则 500。此前"任何 2xx 即成功"把这两类假成功当入账，
+            // 是"已上报未到账"空转的直接来源。显式链可用时加 anonymous 关掉 SW 自动附带
+            // 的 SameSite=None 碎片 cookie，避免与显式链合并出重复/半认证头（500 嫌疑）。
             const postEarnAction = async (hash, shape) => {
                 const dpl = this._currentDpl();
                 const headers = {
@@ -2431,8 +2475,10 @@ Notice:
                 };
                 const cookie = await Utils.cookieHeaderFor(EARN);
                 if (cookie) headers.cookie = cookie;
-                await Utils.xhr({
+                const res = await Utils.xhr({
                     method: "POST", url: EARN, headers,
+                    anonymous: !!cookie,
+                    acceptErrorBody: true,
                     data: JSON.stringify(shape === "impression"
                         ? [hash, 11, { offerid: card.offerId, form: card.form || "$undefined" }]
                         : [hash, 11, {
@@ -2441,6 +2487,11 @@ Notice:
                             timezoneOffset: Utils.jsTimezoneOffset(),
                         }]),
                 });
+                if (typeof res === "string" && res.includes("1:true")) return;
+                const detail = typeof res === "string"
+                    ? `2xx 无 1:true（cookie 链缺失特征）: ${res.slice(0, 100)}`
+                    : `HTTP ${res && res.status}: ${String((res && res.body) || "").slice(0, 140)}`;
+                throw new Error(detail);
             };
 
             // 策略1: context 形 + live hash（discoverCards 已用本次 earn flight 覆盖）
@@ -2479,10 +2530,18 @@ Notice:
             //   下线——真实登录页面同样 401、页面已无 RequestVerificationToken，保留只会
             //   为每张失败卡片白白多打 3 个请求。）
 
-            // 策略5: 后台复刻真实点击——GET 卡片目标链接。bingredirect/rnoreward 类卡片
-            // 的真实入账发生在跳转目标页（与每日活动阶梯 3 同源），Server Action 与
-            // legacy 接口全部失败时仍值得一试。
-            if (await TaskManager._visitActivityUrl(card.url, card.offerId)) return true;
+            // 策略5（v3.7.0 重写）：XHR GET 活动链接已证无入账效果——入账只发生在
+            // rewards 页的 Server Action（实测 Child2 无任何 bing 访问即入账），且裸 GET
+            // 曾把"访问成功"谎报为"领取成功"。改为开真实后台标签页走浏览器原生流程
+            //（个别 bingredirect 类卡片可能由 bing 侧结算），10 秒后自动关闭；
+            // 本策略不返回成功，是否入账交由领取后复核与放弃账本判定。
+            if (card.url && /^https?:\/\/[^/]*bing\.com/i.test(card.url)) {
+                try {
+                    const opened = GM_openInTab(card.url, { active: false });
+                    Utils.log("🔵", `已开后台标签页走原生流程(${card.offerId})，10 秒后自动关闭`);
+                    setTimeout(() => { try { if (opened && opened.close) opened.close(); } catch (_) {} }, 10000);
+                } catch (_) { /* 开页失败不影响结果 */ }
+            }
 
             Utils.log("🟡", `卡片领取失败(${card.offerId}): 所有策略均失败`);
             return false;
@@ -3524,19 +3583,27 @@ Notice:
                 anonymous: false,
                 acceptErrorBody: true
             };
-            // 显式 Cookie 头：补齐 SW 跨源子请求不自动携带的 SameSite 登录 cookie
+            // 显式 Cookie 头：补齐 SW 跨源子请求不自动携带的 SameSite 登录 cookie；
+            // 链可用时同时关掉自动附带（v3.7.0，与 claimCard 同理）
             const cookie = await Utils.cookieHeaderFor(reqOptions.url);
-            if (cookie) reqOptions.headers.cookie = cookie;
+            if (cookie) { reqOptions.headers.cookie = cookie; reqOptions.anonymous = true; }
             if (GM_getValue("Config.debugDailySet", false)) {
                 Utils.log("🔵", `Server Action 请求(${shape}): ${JSON.stringify({
                     url: reqOptions.url, headers: reqOptions.headers, data: reqOptions.data,
                     cookies: cookie ? cookie.split("; ").length : 0
                 })}`);
             }
+            // v3.7.0：与 claimCard 同款严格判据——2xx 且含 `1:true` 才算 action 执行；
+            // 缺 cookie 链的 200 是页面重渲染（action 未执行），不得视为上报成功。
+            // 显式链可用时 anonymous 关掉 SW 自动附带的碎片 cookie（防重复/半认证头）。
             try {
                 const res = await Utils.xhr(reqOptions);
-                if (typeof res === "string") return true;
-                Utils.log("🟡", `Server Action ${shape} 失败(${offerId}): HTTP ${res && res.status ? res.status : "?"}: ${String(res && res.body || "").slice(0, 240)}`);
+                if (typeof res === "string" && res.includes("1:true")) return true;
+                if (typeof res === "string") {
+                    Utils.log("🟡", `Server Action ${shape} 未执行(${offerId}): 2xx 无 1:true（cookie 链缺失特征）: ${res.slice(0, 100)}`);
+                } else {
+                    Utils.log("🟡", `Server Action ${shape} 失败(${offerId}): HTTP ${res && res.status ? res.status : "?"}: ${String(res && res.body || "").slice(0, 240)}`);
+                }
                 return false;
             } catch (e) {
                 Utils.log("🟡", `Server Action ${shape} 请求异常(${offerId}): ${e.message}`);

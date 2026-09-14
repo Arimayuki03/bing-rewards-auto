@@ -9,6 +9,7 @@ const scriptPath = path.resolve(__dirname, "..", "微软积分商城签到（全
 function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     const storage = new Map(Object.entries(initialStorage));
     const intervals = { set: [], cleared: [] };
+    const openTabs = [];
     let source = fs.readFileSync(scriptPath, "utf8");
     const entryPattern = /\s*\/\/ ====== 后台模式入口 ======\s*\r?\n\s*init\(\);\s*\r?\n\s*\}\)\(\);/;
     assert.match(source, entryPattern, "test harness could not locate the userscript entry point");
@@ -30,7 +31,8 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
         GM_info: { script: { name: "Rewards Auto Test" } },
         GM_log() {},
         GM_notification() {},
-        GM_openInTab() {},
+        // v3.7.0：记录 GM_openInTab 调用（策略5 真实标签页兜底）供断言
+        GM_openInTab: (url, opts) => { openTabs.push({ url, opts }); return { close() {} }; },
         GM_registerMenuCommand() {},
         GM_setValue(key, value) {
             storage.set(key, value);
@@ -56,7 +58,7 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     context.globalThis = context;
     vm.createContext(context);
     vm.runInContext(source, context, { filename: scriptPath });
-    return { ...context.__userscriptTest, storage, intervals };
+    return { ...context.__userscriptTest, storage, intervals, openTabs };
 }
 
 test("claimCard returns false when all earn-action strategies fail (legacy path retired)", async () => {
@@ -787,7 +789,8 @@ test("_extractDailySetHashes keeps pointProgress-based completion consistent wit
 test("_sendDailySetAction sends dynamic id, router state tree and offer fields", async () => {
     const { TaskManager, RewardsAuto, Utils } = createHarness();
     let req;
-    Utils.xhr = async options => { req = options; return "ok"; };
+    // v3.7.0 判据：2xx 且含 1:true 才算 action 执行
+    Utils.xhr = async options => { req = options; return "0:{\"a\":\"$@1\"}\n1:true\n"; };
 
     const ok = await TaskManager._sendDailySetAction("offer-1", "a".repeat(40), "f".repeat(42), { form: "MA123" });
     assert.equal(ok, true);
@@ -901,7 +904,7 @@ test("doDailySet completes via flight hashes and dynamic action id", async () =>
     };
     API._resolveReportActivityActionId = async () => actionId;
     const posts = [];
-    Utils.xhr = async options => { posts.push(options); return "ok"; };
+    Utils.xhr = async options => { posts.push(options); return "0:{\"a\":\"$@1\"}\n1:true\n"; };
 
     const result = await TaskManager.doDailySet();
 
@@ -1034,7 +1037,7 @@ test("claimCard Server Action targets a rewards page with the resolved action id
     const posts = [];
     Utils.xhr = async options => {
         if (options.method === "POST") posts.push(options);
-        return "ok";
+        return "0:{\"a\":\"$@1\"}\n1:true\n";
     };
 
     // card.url 是 bing.com 目标页 → Server Action 必须改发 earn 页
@@ -1046,8 +1049,8 @@ test("claimCard Server Action targets a rewards page with the resolved action id
     assert.equal(posts[0].headers["accept"], "text/x-component");
 });
 
-test("claimCard falls back to visiting the card url when all report strategies fail", async () => {
-    const { API, Utils } = createHarness();
+test("claimCard opens a real background tab as the last resort and never fakes success", async () => {
+    const { API, Utils, openTabs } = createHarness();
     API._resolveReportActivityActionId = async () => "c".repeat(42);
     API.getRewardsToken = async () => false;
     API.reportActivity = async () => false;
@@ -1055,21 +1058,22 @@ test("claimCard falls back to visiting the card url when all report strategies f
     Utils.xhr = async options => {
         if (options.method === "POST") throw new Error("HTTP 500");
         gets.push(options);
-        // earn 刷新返回空 flight（live hash 重试无候选 → 直接落到 impression/visit）
-        return options.url === "https://rewards.bing.com/earn" ? "<html></html>" : "ok";
+        // earn 刷新返回空 flight（live hash 重试无候选 → 直接落到 impression/tab）
+        return "<html></html>";
     };
 
+    // v3.7.0：XHR GET 活动链接已证无入账效果，改为开真实后台标签页且不算成功
     const ok = await API.claimCard({ offerId: "o1", hash: "h1", url: "https://cn.bing.com/search?q=x&rnoreward=1" });
-    assert.equal(ok, true);
-    // v3.6.11：POST 失败后先刷新 earn 取 live hash，再复刻点击目标页
-    assert.equal(gets.length, 2);
+    assert.equal(ok, false);
+    assert.equal(gets.length, 1); // 唯一 GET 是策略2 的 earn 刷新；策略1/3 POST 均抛错
     assert.equal(gets[0].url, "https://rewards.bing.com/earn");
-    assert.equal(gets[1].url, "https://cn.bing.com/search?q=x&rnoreward=1");
+    assert.equal(openTabs.length, 1, "bing.com 目标页应开真实标签页兜底");
+    assert.equal(openTabs[0].url, "https://cn.bing.com/search?q=x&rnoreward=1");
+    assert.equal(openTabs[0].opts.active, false);
 
-    // 非 bing.com 目标页不做点击复刻，所有策略失败返回 false
+    // 非 bing.com 目标页不开标签页，所有策略失败返回 false
     assert.equal(await API.claimCard({ offerId: "o2", hash: "h2", url: "https://example.com/x" }), false);
-    assert.equal(gets.length, 3); // 又刷新了一次 earn，但不请求 example.com
-    assert.equal(gets[2].url, "https://rewards.bing.com/earn");
+    assert.equal(openTabs.length, 1, "非 bing.com 链接不得开标签页");
 });
 
 // ====== v3.6.2：Server Action 与真实浏览器行为对齐 ======
@@ -1119,11 +1123,12 @@ test("_sendDailySetAction attaches the explicit cookie header when GM_cookie pro
         }
     });
     let req;
-    Utils.xhr = async options => { req = options; return "ok"; };
+    Utils.xhr = async options => { req = options; return "0:{\"a\":\"$@1\"}\n1:true\n"; };
 
     const ok = await TaskManager._sendDailySetAction("offer-1", "a".repeat(40), "f".repeat(42), {});
     assert.equal(ok, true);
     assert.equal(req.headers.cookie, ".MSA.Auth=t");
+    assert.equal(req.anonymous, true, "v3.7.0：显式链可用时关掉自动附带的碎片 cookie");
 });
 
 test("reportActivity attaches the explicit cookie header for the legacy API", async () => {
@@ -1155,7 +1160,7 @@ test("claimCard strategy 1 (earn action) attaches the explicit cookie header", a
     const posts = [];
     Utils.xhr = async options => {
         if (options.method === "POST") posts.push(options);
-        return "ok";
+        return "0:{\"a\":\"$@1\"}\n1:true\n";
     };
 
     const ok = await API.claimCard({ offerId: "o1", hash: "h1" });
@@ -1164,6 +1169,7 @@ test("claimCard strategy 1 (earn action) attaches the explicit cookie header", a
     // 策略1 首选路径成功即返回，不再落到后续策略
     assert.equal(posts.length, 1);
     assert.equal(posts[0].headers.cookie, "_U=u");
+    assert.equal(posts[0].anonymous, true, "v3.7.0：显式链可用时关掉自动附带的碎片 cookie");
 });
 
 test("front-end rewards block fixes the run date before the /dashboard early-return", () => {
@@ -1517,7 +1523,7 @@ test("claimCard posts the browser-captured earn contract (context shape, live ha
     const { API, Utils } = createHarness();
     API._resolveReportActivityActionId = async () => "f".repeat(40);
     Utils.fetchPage = async () => { throw new Error("strategy 1 must not re-fetch"); };
-    Utils.xhr = async o => { posts.push(o); return "0:{}\n1:irrelevant-rsc"; };
+    Utils.xhr = async o => { posts.push(o); return "0:{}\n1:true\n1:irrelevant-rsc"; };
 
     const ok = await API.claimCard({ offerId: "O3", hash: "c".repeat(64), points: 15, url: "https://www.bing.com/search?q=x" });
 
@@ -1541,7 +1547,7 @@ test("claimCard retries once with the fresh earn-flight hash when the first POST
     Utils.xhr = async o => {
         posts.push(o);
         if (posts.length === 1) throw new Error("HTTP 500");
-        return "1:ok";
+        return "1:true";
     };
     Utils.fetchPage = async () => flightHtml(`{"offerId":"O5","hash":"${"e".repeat(64)}","isCompleted":false,"isLocked":false}`);
 
@@ -1635,6 +1641,51 @@ test("discoverCards dedupes the same offerId across sources and keeps the first 
     assert.equal(kept.hash, hashB, "kept hash must be restamped from the current flight");
 });
 
+// ====== v3.7.0：入账唯一判据 1:true + cookie 链诊断（登录态浏览器逆向实证） ======
+
+test("claimCard treats 2xx without 1:true as not-executed (cookie-less SW signature)", async () => {
+    const posts = [];
+    const { API, Utils } = createHarness();
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
+    Utils.fetchPage = async () => "<html></html>";
+    // 200 + RSC 重渲染流（无 1:true）——实测缺 cookie 链时服务端的行为
+    Utils.xhr = async o => { posts.push(o); return "2:\"$Sreact.fragment\"\n5:I[339756,[\"/_next/static/chunks/0accg9rvmunu0.js\"]]"; };
+
+    const ok = await API.claimCard({ offerId: "O1", hash: "c".repeat(64), points: 10 });
+
+    assert.equal(ok, false, "200 without 1:true means the action never ran");
+    assert.ok(posts.length >= 1);
+});
+
+test("claimCard sends explicit cookie chain with anonymous and passes on 1:true", async () => {
+    const posts = [];
+    const { API, Utils } = createHarness({}, {
+        // ScriptCat action 形回调：两张含 httpOnly 的登录 cookie
+        gmCookie: (action, details, cb) => cb([{ name: "_U", value: "u1" }, { name: "ANON", value: "a1" }]),
+    });
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
+    Utils.fetchPage = async () => "<html></html>";
+    Utils.xhr = async o => { posts.push(o); return "0:{\"a\":\"$@1\",\"f\":\"\",\"q\":\"\",\"i\":false}\n1:true\n"; };
+
+    const ok = await API.claimCard({ offerId: "O1", hash: "c".repeat(64), points: 10 });
+
+    assert.equal(ok, true);
+    assert.equal(posts[0].headers.cookie, "_U=u1; ANON=a1");
+    assert.equal(posts[0].anonymous, true, "explicit chain must suppress the partial auto cookie jar");
+});
+
+test("cookieHeaderFor surfaces GM_cookie errors instead of silent empty chain", async () => {
+    const { Utils, RewardsAuto } = createHarness({}, {
+        gmCookie: (action, details, cb) => cb(undefined, { message: "user denied cookie access" }),
+    });
+
+    const chain = await Utils.cookieHeaderFor("https://rewards.bing.com/earn");
+
+    assert.equal(chain, "");
+    assert.equal(RewardsAuto.state.cookieDiag.form, "GM_cookie(action)");
+    assert.match(RewardsAuto.state.cookieDiag.error, /denied/);
+});
+
 // ====== v3.6.12：入账延迟竞态修复 + x-deployment-id 指纹头 ======
 
 test("doRead verification bypasses the round cache and marks readDate optimistically", async () => {
@@ -1666,7 +1717,7 @@ test("server-action posts carry x-deployment-id when a dpl is known", async () =
     });
     API._resolveReportActivityActionId = async () => "f".repeat(40);
     Utils.fetchPage = async () => "<html></html>";
-    Utils.xhr = async o => { posts.push(o); return "1:ok"; };
+    Utils.xhr = async o => { posts.push(o); return "1:true"; };
 
     await API.claimCard({ offerId: "O1", hash: "c".repeat(64), points: 10 });
     await API.claimPendingPoints();
