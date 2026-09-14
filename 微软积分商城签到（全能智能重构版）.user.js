@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.9.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.8.0 双脚本架构：@crontab 使本脚本属 ScriptCat「后台脚本」类别、永不注入页面——这是 21 轮「前台注入未生效」的根因；页面侧功能迁至《微软积分商城签到-页面代理》脚本，共用 @storageName 桥接同源转发通道；v3.7.0 实证入账唯一判据为 Server Action 响应含 1:true、SW 直连因扩展请求身份被浏览器改写而不可修复）
+// @version      4.0.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.0.0 路线定案：卡片/每日活动领取主路径改为 DAPI App 上报 type 101+offerid——Bearer 鉴权、无 cookie/Origin 依赖、SW 直连实测入账，彻底绕开 Next.js Server Action 的扩展身份拒收与页面注入依赖；Server Action 链降为兜底；v3.7.0 入账判据 1:true、v3.9.0 页面代理自扫描保留为二级兜底）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -1857,7 +1857,7 @@ Notice:
             return -1;
         },
 
-        async appActivity(type, offerid) {
+        async appActivity(type, offerid, quiet = false) {
             const region = this._resolveRegion();
             const body = {
                 amount: 1,
@@ -1879,7 +1879,7 @@ Notice:
                     return { points, isDuplicate, balance };
                 }
             } catch (e) {
-                Utils.log("🔴", `App活动失败(${offerid}): ${e.message}`);
+                if (!quiet) Utils.log("🔴", `App活动失败(${offerid}): ${e.message}`);
             }
             return null;
         },
@@ -2444,6 +2444,17 @@ Notice:
         // 200 即上报受理；earn 响应是 RSC 流、不含 `1:true`，是否入账交由调用方的
         // "复核 + 连续 N 轮放弃"机制判定，此处不看响应文本。
         async claimCard(card) {
+            // 策略0（v4.0.0 主路径）：DAPI App 上报 type 101 + offerid——Bearer 鉴权、
+            // 无 cookie/Origin 依赖，SW 直连实测真实入账（2026-09-15：Child3 +10p，
+            // balance 4118→4128）。isDuplicate:true 即已入账幂等确认，同样成功。
+            // 无 Token / 该 offer 非 App 可见（4xx）时返回 null，静默落到下方网页
+            // Server Action 路径兜底。
+            const appRes = await this.appActivity(101, card.offerId, true);
+            if (appRes && (appRes.points > 0 || appRes.isDuplicate)) {
+                Utils.log("📲", `App上报入账(${card.offerId}): +${appRes.points}p${appRes.isDuplicate ? "（已入账，幂等确认）" : ""}`);
+                return true;
+            }
+
             // 新版构建下页面 flight 流不再内嵌可用的 next-action 引用，
             // 优先用 chunk 扫描出的 reportActivity ID，避免误用页面其他 action 的 ID
             const nextAction = await this._resolveReportActivityActionId()
@@ -3177,6 +3188,24 @@ Notice:
                 GM_setValue(processedKey, items.filter(it => it.complete).map(it => ({ date: today, offerId: it.offerId })));
                 GM_setValue("Config.dailySetDone", today);
                 return true;
+            }
+
+            // v4.0.0 阶梯0：DAPI App 上报（type 101 + offerid）先行——SW 直连实测
+            // 入账（与阅读/App签入同族端点，无 Origin 校验问题）；成功项直接出列，
+            // 剩余项才走网页 Server Action 阶梯。
+            if (pendingItems.length > 0 && RewardsAuto.state.token) {
+                const rest = [];
+                for (const it of pendingItems) {
+                    const r = await API.appActivity(101, it.offerId, true);
+                    if (r && (r.points > 0 || r.isDuplicate)) {
+                        Utils.log("📅", `每日活动 App上报: ${it.offerId} +${r.points}p${r.isDuplicate ? "（已入账）" : ""}`);
+                    } else {
+                        rest.push(it);
+                    }
+                    await Utils.randomDelay(2000, 4000);
+                }
+                pendingItems.length = 0;
+                pendingItems.push(...rest);
             }
 
             // 2) 优先：从 flight 流解析每个活动的专属 hash，发送 Server Action 完成（纯后台请求，不打开网页）

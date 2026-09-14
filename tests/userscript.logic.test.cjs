@@ -1730,6 +1730,52 @@ test("cookieHeaderFor surfaces GM_cookie errors instead of silent empty chain", 
 
 // ====== v3.6.12：入账延迟竞态修复 + x-deployment-id 指纹头 ======
 
+// ====== v4.0.0：DAPI App 上报主路径（type 101 + offerid，SW 直连实测入账） ======
+
+test("claimCard primary path: DAPI type 101 credits via SW direct without earn POST", async () => {
+    const posts = [];
+    const { API, RewardsAuto, Utils } = createHarness();
+    RewardsAuto.state.token = "at-mock";
+    Utils.xhr = async o => {
+        posts.push(o);
+        if (o.url.includes("/dapi/me/activities")) {
+            return JSON.stringify({ response: { activity: { p: 10 }, isDuplicate: false, balance: 4128 } });
+        }
+        return "1:true";
+    };
+    const ok = await API.claimCard({ offerId: "Gamification_DailySet_X_Child3", hash: "c".repeat(64), points: 10 });
+    assert.equal(ok, true);
+    assert.equal(posts.length, 1, "DAPI success must not fall through to earn POST");
+    assert.ok(posts[0].url.includes("/dapi/me/activities"));
+    const body = JSON.parse(posts[0].data);
+    assert.equal(body.type, 101);
+    assert.equal(body.attributes.offerid, "Gamification_DailySet_X_Child3");
+});
+
+test("claimCard treats DAPI isDuplicate as already-credited success", async () => {
+    const { API, RewardsAuto, Utils } = createHarness();
+    RewardsAuto.state.token = "at-mock";
+    Utils.xhr = async () => JSON.stringify({ response: { activity: null, isDuplicate: true, balance: 4128 } });
+    assert.equal(await API.claimCard({ offerId: "O1", hash: "h", points: 10 }), true);
+});
+
+test("claimCard falls back to earn Server Action when DAPI rejects the offer", async () => {
+    const posts = [];
+    const { API, RewardsAuto, Utils } = createHarness();
+    RewardsAuto.state.token = "at-mock";
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
+    Utils.fetchPage = async () => "<html></html>";
+    Utils.xhr = async o => {
+        posts.push(o);
+        if (o.url.includes("/dapi/")) throw new Error("HTTP 403");
+        return "0:{}\n1:true\n";
+    };
+    const ok = await API.claimCard({ offerId: "WEB_ONLY", hash: "c".repeat(64), points: 5 });
+    assert.equal(ok, true);
+    assert.ok(posts[0].url.includes("/dapi/"));
+    assert.equal(posts[1].url, "https://rewards.bing.com/earn");
+});
+
 test("doRead verification bypasses the round cache and marks readDate optimistically", async () => {
     const { API, RewardsAuto, TaskManager, Utils } = createHarness();
     RewardsAuto.state.dateNowNum = 20260915;
