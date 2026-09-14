@@ -1604,6 +1604,37 @@ test("discoverCards overlays earn live state: filters done/locked, restamps live
     assert.equal(cards[0].hash, "c".repeat(64));
 });
 
+// ====== v3.6.17：多源同 offerId 去重（hash 随页面轮换，去重键不能含 hash） ======
+
+test("discoverCards dedupes the same offerId across sources and keeps the first url", async () => {
+    const hashA = "a".repeat(64), hashB = "b".repeat(64);
+    const DUP = "WW_Rewards_locked_level2_Sep26w3_offer2";
+    const { API, Utils } = createHarness();
+    // 源1: getuserinfo 先推（带 destinationUrl）
+    API._getUserInfo = async () => ({ dashboard: {
+        morePromotions: [
+            { offerId: DUP, hash: hashA, points: 15, title: "可爱但野性", destinationUrl: "https://www.bing.com/promo" },
+            { offerId: "C1", hash: hashA, points: 10, title: "T1" },
+        ],
+    } });
+    // 源2: earn 页 activityCards 再推同一 offerId（hash 已轮换、无 url）。
+    // 方法1 的结束 lookahead 要求 ] 后跟 , 键 或 $，数组尾补一个后续键才与真实页面同构。
+    const combined = '{"activityCards":['
+        + JSON.stringify({ offerId: DUP, hash: hashB, points: 15, title: "可爱但野性" })
+        + "," + JSON.stringify({ offerId: "C2", hash: hashB, points: 10, title: "T2" })
+        + '],"hasMore":1}';
+    Utils.fetchPage = async () => flightHtml(combined);
+
+    const cards = await API.discoverCards();
+
+    const ids = Array.from(cards, c => c.offerId);
+    assert.equal(ids.filter(id => id === DUP).length, 1, "same offerId from two sources must yield one card");
+    assert.equal(ids.length, 3, "other distinct offers must survive");
+    const kept = cards.find(c => c.offerId === DUP);
+    assert.equal(kept.url, "https://www.bing.com/promo", "first source url must survive the dedupe");
+    assert.equal(kept.hash, hashB, "kept hash must be restamped from the current flight");
+});
+
 // ====== v3.6.12：入账延迟竞态修复 + x-deployment-id 指纹头 ======
 
 test("doRead verification bypasses the round cache and marks readDate optimistically", async () => {

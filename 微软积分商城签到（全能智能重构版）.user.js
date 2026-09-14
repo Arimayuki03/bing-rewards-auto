@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.16
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.16：直连 Server Action 补 sec-fetch-* 三头+earn 动作对齐完整指纹（origin/referer/UA），实测若 ScriptCat 透传则直连可独立工作；含通道、抓包契约卡片链路、阅读复核竞态修复）
+// @version      3.6.17
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.17：卡片按 offerId 去重——多源同卡因 hash 轮换重复入列致二次领取空转、整轮误判部分失败；v3.6.16 直连实测：Server Action POST 仍 500 但策略5 open-link 直连可独立入账；含通道、抓包契约卡片链路、阅读复核竞态修复）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2098,7 +2098,7 @@ Notice:
         // 多层级解析：activityCards → promotionCards → 全局扫描 → HTML data 属性
         async discoverCards(fetchOpts) {
             const cards = [];
-            const seenCardKeys = new Set();
+            const cardsByOfferId = new Map();
             try {
                 const html = await Utils.fetchPage({ url: "https://rewards.bing.com/earn" }, fetchOpts);
                 if (!html) { Utils.log("🔴", "earn 页面返回空"); return null; }
@@ -2111,9 +2111,16 @@ Notice:
 
                 const pushCard = (card) => {
                     if (!card || !card.offerId || !card.hash || card.points <= 0) return;
-                    const key = `${card.offerId}:${card.hash}`;
-                    if (seenCardKeys.has(key)) return;
-                    seenCardKeys.add(key);
+                    const dup = cardsByOfferId.get(card.offerId);
+                    if (dup) {
+                        // 去重键不能含 hash：hash 随页面轮换，getuserinfo 与 flyout 回退
+                        // 会把同一 offer 各推一次（v3.6.16 轮 02:18 实测——二次领取因
+                        // flyout 源无 url 空转失败，把整轮误判"部分失败"）。首条缺 url
+                        // 时回填；上报 hash 由后续 live 合并步骤统一重盖，去重不影响正确性。
+                        if (!dup.url && card.url) dup.url = card.url;
+                        return;
+                    }
+                    cardsByOfferId.set(card.offerId, card);
                     cards.push(card);
                 };
 
