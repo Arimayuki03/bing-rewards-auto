@@ -21,6 +21,10 @@
 (function() {
     'use strict';
 
+    // 注入信标：F12 控制台第一行 = 脚本已注入；第二行 = 共享存储可写。
+    // 只有一行都没有 = ScriptCat 未注入本脚本（查弹窗分组与启用开关）。
+    try { console.log("[页面代理] v3.8.0 已注入", location.href); } catch (_) {}
+
     // ====== OAuth 授权码自动捕获（v3.8.0 自后台脚本迁入：后台脚本不注入页面，原为死代码） ======
     // 授权码自动捕获
     if (location.hostname === "login.live.com" && location.pathname === "/oauth20_desktop.srf") {
@@ -167,6 +171,7 @@
         // 后台据此区分"代理页从未被注入（ScriptCat 前台注入开关/权限问题）"
         // 与"注入了但执行器全缺（mode:none）"——连续多轮零心跳时后者不该出现。
         try { GM_setValue("BingRewards_injected", { ts: Date.now(), url: (location.href || "").slice(0, 80) }); } catch (_) {}
+        try { console.log("[页面代理] 注入标记+心跳已写入共享存储 BingRewardsAuto_Shared"); } catch (_) {}
         const ex = pageProxyExecutor();
         const beat = () => { try { GM_setValue("BingRewards_alive", { ts: Date.now(), mode: ex ? ex.mode : "none" }); } catch (_) {} };
         beat();
