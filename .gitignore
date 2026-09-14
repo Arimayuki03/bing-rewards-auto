@@ -8,3 +8,6 @@
 # 依赖与日志
 node_modules/
 *.log
+
+# ScriptCat 全量备份导出（含各脚本 storage.json 真实凭证，严禁入库）
+/*.zip
