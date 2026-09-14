@@ -1644,4 +1644,10 @@ test("server-action posts carry x-deployment-id when a dpl is known", async () =
     assert.equal(posts[0].headers["x-deployment-id"], "20260912-2");
     assert.equal(posts[1].url, "https://rewards.bing.com/dashboard");
     assert.equal(posts[1].headers["x-deployment-id"], "20260912-2");
+    // v3.6.16：直连补齐浏览器指纹头（sec-fetch-*），earn 动作对齐 origin/referer/UA
+    assert.equal(posts[0].headers["sec-fetch-site"], "same-origin");
+    assert.equal(posts[0].headers["sec-fetch-mode"], "cors");
+    assert.equal(posts[0].headers["sec-fetch-dest"], "empty");
+    assert.equal(posts[0].headers.origin, "https://rewards.bing.com");
+    assert.ok(posts[0].headers["user-agent"]);
 });

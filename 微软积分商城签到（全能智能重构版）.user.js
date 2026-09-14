@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.15
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.15：诊断菜单移至 rewards 页面上下文注册——后台注册会造成"注入正常"假阳性（v3.6.14 实测）；能否在页面脚本菜单看到"🔗 通道诊断（本页）"即前台注入判据。含同源转发通道、卡片链路按登录态抓包重写、阅读复核竞态修复）
+// @version      3.6.16
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.16：直连 Server Action 补 sec-fetch-* 三头+earn 动作对齐完整指纹（origin/referer/UA），实测若 ScriptCat 透传则直连可独立工作；含通道、抓包契约卡片链路、阅读复核竞态修复）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2375,7 +2375,10 @@ Notice:
                 "content-type": "text/plain;charset=UTF-8",
                 "next-action": actionId,
                 "next-router-state-tree": Utils.routerStateTree(DASH),
-                ...(dpl ? { "x-deployment-id": dpl } : {})
+                ...(dpl ? { "x-deployment-id": dpl } : {}),
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
             };
             const cookie = await Utils.cookieHeaderFor(DASH);
             if (cookie) headers.cookie = cookie;
@@ -2411,7 +2414,13 @@ Notice:
                     "content-type": "text/plain;charset=UTF-8",
                     "next-action": nextAction,
                     "next-router-state-tree": Utils.routerStateTree(EARN),
-                    ...(dpl ? { "x-deployment-id": dpl } : {})
+                    "origin": "https://rewards.bing.com",
+                    "referer": EARN,
+                    "user-agent": RewardsAuto.ua.pc,
+                    ...(dpl ? { "x-deployment-id": dpl } : {}),
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-dest": "empty",
                 };
                 const cookie = await Utils.cookieHeaderFor(EARN);
                 if (cookie) headers.cookie = cookie;
@@ -3496,7 +3505,13 @@ Notice:
                     "origin": "https://rewards.bing.com",
                     "referer": "https://rewards.bing.com/dashboard",
                     "user-agent": RewardsAuto.ua.pc,
-                    ...(dpl ? { "x-deployment-id": dpl } : {})
+                    ...(dpl ? { "x-deployment-id": dpl } : {}),
+                    // v3.6.16：直连最后一块指纹拼图——浏览器对 Server Action 必带
+                    // sec-fetch-*（同源 CORS 语义），服务端可能校验。ScriptCat 若透传
+                    // 则直连即可工作；若剥掉也无害（通道路径浏览器自动带）。
+                    "sec-fetch-site": "same-origin",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-dest": "empty",
                 },
                 data: body,
                 anonymous: false,
