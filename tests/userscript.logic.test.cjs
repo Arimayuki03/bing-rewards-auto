@@ -311,19 +311,25 @@ test("non-GET redirects resolve the Location string as before", async () => {
     assert.equal(calls.length, 1);
 });
 
-test("renewToken clears the one-time authorization code after success", async () => {
-    const { API, storage } = createHarness({
+test("renewToken preserves an unused auth code on refresh, clears it when the code path consumes it", async () => {
+    // v3.6.9 语义变更：refresh 成功路径根本没用到授权码，不得清掉用户刚粘贴的新凭证
+    const h1 = createHarness({
         "Config.token": "refresh-value",
         "Config.tokenTime": 0,
         "Config.code": "stale-one-time-code",
     });
-    API.getToken = async () => true;
+    h1.API.getToken = async () => true;
+    assert.equal(await h1.API.renewToken(), true);
+    assert.equal(h1.storage.get("Config.code"), "stale-one-time-code");
+    assert.equal(h1.storage.get("Config.token"), "refresh-value");
 
-    const result = await API.renewToken();
-
-    assert.equal(result, true);
-    assert.equal(storage.get("Config.code"), "");
-    assert.equal(storage.get("Config.token"), "refresh-value");
+    // 换取路径：授权码被真正消费，成功后清理明文残留
+    const h2 = createHarness({
+        "Config.code": "https://login.live.com/oauth20_desktop.srf?code=CONSUMED-CODE-VALUE",
+    });
+    h2.API.getToken = async () => true;
+    assert.equal(await h2.API.renewToken(), true);
+    assert.equal(h2.storage.get("Config.code"), "");
 });
 
 test("doPromos keeps promosDate pending when a claimed card is unconfirmed", async () => {
@@ -1354,8 +1360,10 @@ test("www.bing.com requests are never routed through the page channel", async ()
 
 test("front-end wires the proxy and gives bgprobe tabs a DOM-processing-free mode", () => {
     const source = fs.readFileSync(scriptPath, "utf8");
-    // 页面侧：监听请求 + 页面 fetch 带真实 cookie（credentials:include）
-    assert.match(source, /const setupPageProxy = \(\) => \{[\s\S]*?GM_addValueChangeListener\("BingRewards_req"[\s\S]*?credentials: "include"/);
+    // 页面侧：执行器带真实 cookie（fetch credentials:include / xhr withCredentials 已在
+    // v3.6.9 执行器测试中断言），监听器把请求交给执行器执行并回包
+    assert.match(source, /const pageProxyExecutor = \(\) => \{[\s\S]*?credentials: "include"/);
+    assert.match(source, /GM_addValueChangeListener\("BingRewards_req"[\s\S]{0,1200}?await ex\.exec\(req\)/);
     // 通道挂在 rewards.bing.com 块最前，先于 dashboard 分支
     const rewards = source.indexOf('if (location.hostname === "rewards.bing.com") {');
     const dash = source.indexOf('if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {');
@@ -1368,4 +1376,56 @@ test("background detection uses hostname, not just typeof document (sandbox has 
     const source = fs.readFileSync(scriptPath, "utf8");
     const fixed = '!/(^|\\.)bing\\.com$/.test(location.hostname || "");';
     assert.equal(source.split(fixed).length - 1, 2);
+});
+
+// ====== v3.6.9：转发执行器多级回退 / 心跳带 mode / 授权码保留 ======
+
+test("a mode:none heartbeat disables the channel instead of per-request timeouts", async () => {
+    const calls = [];
+    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
+    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now(), mode: "none" } }, { gmXhr });
+
+    const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "d" });
+
+    assert.equal(body, "SW-OK");
+    assert.equal(calls.length, 1);
+    assert.equal(storage.get("BingRewards_req"), undefined, "no request may be forwarded to a dead executor");
+});
+
+test("non-fetch executor modes (xhr/uwfetch) still route through the page channel", async () => {
+    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now(), mode: "xhr" } });
+    Utils.getRandomUUID = () => "req-fixed-0005";
+    storage.set("BingRewards_resp", { id: "req-fixed-0005", ok: true, status: 200, text: "RSC:XHR", headers: "" });
+
+    const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "d" });
+
+    assert.equal(body, "RSC:XHR");
+});
+
+test("page proxy executor falls back fetch→uw.fetch→XHR→uw.XHR and always heartbeats", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    assert.match(source, /const pageProxyExecutor = \(\) => \{[\s\S]*?typeof uw\.fetch === "function"[\s\S]*?typeof XMLHttpRequest === "function"[\s\S]*?typeof uw\.XMLHttpRequest === "function"[\s\S]*?return null;/);
+    // 即使没有任何执行器也必须心跳上报 mode:"none"（后台据此立即禁用，不再干等 25s）
+    assert.match(source, /mode: ex \? ex\.mode : "none"/);
+    // XHR 通道带 cookie 的关键配置
+    assert.match(source, /x\.withCredentials = true/);
+});
+
+test("renewToken keeps an unused auth code on refresh success and logs it", async () => {
+    const oldTime = Date.now() - 47 * 86400000;
+    const savedCode = "https://login.live.com/oauth20_desktop.srf?code=FRESH-CODE";
+    const { API, Utils, storage } = createHarness({
+        "Config.token": "old-refresh",
+        "Config.tokenTime": oldTime,
+        "Config.code": savedCode,
+    });
+    Utils.xhr = async () => JSON.stringify({ refresh_token: "new-refresh", access_token: "access" });
+
+    const ok = await API.renewToken();
+
+    assert.equal(ok, true);
+    assert.equal(storage.get("Config.token"), "new-refresh");
+    assert.ok(storage.get("Config.tokenTime") > oldTime);
+    // refresh 路径没用到授权码：绝不能把用户刚粘贴的新凭证清掉
+    assert.equal(storage.get("Config.code"), savedCode);
 });

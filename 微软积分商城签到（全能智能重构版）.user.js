@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.8
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.8：rewards.bing.com 请求优先经前台标签页同源转发（真实登录cookie，治 Server Action 500/签入 401），无前台时自动开隐藏代理页；修复 crontab sandbox 被误判为前台）
+// @version      3.6.9
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.9：同源转发通道执行器加固 fetch→unsafeWindow.fetch→XHR→unsafeWindow.XHR 逐级回退并随心跳上报模式，代理页失联原因可直接从日志读出；refresh 成功不再误清用户新粘贴的授权码+补"Token续期成功"日志；新菜单"强制用授权码换取新Token"）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -461,8 +461,10 @@ Notice:
         _pageChannelAlive() {
             try {
                 const a = GM_getValue("BingRewards_alive", null);
-                // 心跳每 20 秒一次，45 秒容差（>2 个周期）判定页面在线
-                return !!(a && typeof a.ts === "number" && Date.now() - a.ts < 45000);
+                // 心跳每 20 秒一次，45 秒容差（>2 个周期）判定页面在线；
+                // v3.6.9：页面若明确报告无任何可用执行器（mode:"none"），视同不可用
+                if (!(a && typeof a.ts === "number" && Date.now() - a.ts < 45000)) return false;
+                return a.mode !== "none";
             } catch (_) { return false; }
         },
 
@@ -487,8 +489,15 @@ Notice:
                 await Utils.delay(1000);
                 if (this._pageChannelAlive()) return true;
             }
-            RewardsAuto._pageChannelOff = true; // 代理页未响应（被重定向到登录/加载失败）
-            Utils.log("🟡", "后台代理标签页未就绪，本轮回退直连请求");
+            RewardsAuto._pageChannelOff = true; // 代理页未响应（被重定向到登录/未注入/无执行器）
+            let why = "代理页无心跳：可能未注入脚本或被重定向到登录页";
+            try {
+                const a = GM_getValue("BingRewards_alive", null);
+                if (a && typeof a.ts === "number") {
+                    why = `心跳 ${Math.max(0, Math.round((Date.now() - a.ts) / 1000))} 秒前、mode=${a.mode || "?"}`;
+                }
+            } catch (_) {}
+            Utils.log("🟡", `后台代理标签页未就绪（${why}），本轮回退直连请求`);
             return false;
         },
 
@@ -1242,8 +1251,10 @@ Notice:
                         grant_type: "refresh_token"
                     };
                     if (await this.getToken(params)) {
-                        // 授权码是一次性的，换取成功后立即清理，避免明文长期残留在存储中
-                        GM_setValue("Config.code", "");
+                        // v3.6.9：refresh 成功时不再清空 Config.code——本轮根本没用到授权码，
+                        // 清掉只会把用户刚手动粘贴的新凭证丢掉（"更新了授权码却还是被清"）。
+                        // 授权码仅在真正完成换取后清理（见下方换取路径）。
+                        Utils.log("🟢", "Token续期成功");
                         return true;
                     }
                     // 续期失败，清除 token，下轮改用授权码
@@ -3835,16 +3846,73 @@ Notice:
         }
     };
 
-    // ====== 前台同源转发通道 · 页面侧（v3.6.8）======
-    // 挂 20 秒心跳并监听 BingRewards_req：在页面上下文 fetch 执行后台转来的
-    // rewards.bing.com 同源 GET/POST（浏览器自动附带全量真实登录 cookie），
-    // 结果按 {id,ok,status,text,...} 写回 BingRewards_resp。任何异常不应答，
+    // ====== 前台同源转发通道 · 页面侧（v3.6.8；v3.6.9 执行器加固）======
+    // 挂 20 秒心跳并监听 BingRewards_req：在页面上下文发起 rewards.bing.com
+    // 同源 GET/POST（浏览器自动附带全量真实登录 cookie），结果按
+    // {id,ok,status,text,...} 写回 BingRewards_resp。任何异常不应答，
     // 后台将回退直连——转发通道只能改善、绝不能恶化既有任务路径。
+    //
+    // v3.6.9 根因修复：ScriptCat 内容脚本沙箱可能不暴露 fetch（22:12 轮
+    // "后台代理标签页未就绪"即因此静默失联）。执行器逐级回退：
+    // fetch → unsafeWindow.fetch → XMLHttpRequest → unsafeWindow.XMLHttpRequest；
+    // 全部不可用时也照常上报 mode:"none" 心跳，让后台立即禁用通道而非干等 25 秒。
+    const pageProxyExecutor = () => {
+        const fetchExec = (f) => async (req) => {
+            const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
+            const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, 20000) : null;
+            try {
+                const res = await f(req.url, {
+                    method: req.method,
+                    headers: req.headers && Object.keys(req.headers).length ? req.headers : undefined,
+                    body: req.method === "POST" ? req.data : undefined,
+                    credentials: "include",
+                    redirect: "follow",
+                    signal: ctrl ? ctrl.signal : undefined,
+                });
+                const text = await res.text();
+                return {
+                    status: res.status, text: text.slice(0, 500000),
+                    finalUrl: res.url || req.url,
+                    headers: Array.from(res.headers || []).map(([k, v]) => `${k}: ${v}`).join("\r\n"),
+                };
+            } finally { if (timer) clearTimeout(timer); }
+        };
+        const xhrExec = (Ctor) => (req) => new Promise((resolve, reject) => {
+            try {
+                const x = new Ctor();
+                x.open(req.method || "GET", req.url, true);
+                x.withCredentials = true; // 同源请求附带全量登录 cookie 的关键
+                x.timeout = 20000;
+                for (const [k, v] of Object.entries(req.headers || {})) {
+                    // cookie/origin/referer 等禁用头浏览器会自行接管，个别环境抛错，逐个 try
+                    try { x.setRequestHeader(k, String(v)); } catch (_) {}
+                }
+                x.onload = () => resolve({
+                    status: x.status, text: String(x.responseText || "").slice(0, 500000),
+                    finalUrl: x.responseURL || req.url, headers: x.getAllResponseHeaders() || "",
+                });
+                x.onerror = () => reject(new Error("XHR 网络错误"));
+                x.ontimeout = () => reject(new Error("XHR 超时"));
+                x.send(req.method === "POST" ? req.data : undefined);
+            } catch (e) { reject(e); }
+        });
+        if (typeof fetch === "function") return { mode: "fetch", exec: fetchExec((...a) => fetch(...a)) };
+        let uw = null;
+        try { uw = (typeof unsafeWindow !== "undefined" && unsafeWindow) ? unsafeWindow : null; } catch (_) {}
+        if (uw && typeof uw.fetch === "function") return { mode: "uwfetch", exec: fetchExec((...a) => uw.fetch(...a)) };
+        if (typeof XMLHttpRequest === "function") return { mode: "xhr", exec: xhrExec(XMLHttpRequest) };
+        if (uw && typeof uw.XMLHttpRequest === "function") return { mode: "uwxhr", exec: xhrExec(uw.XMLHttpRequest) };
+        return null;
+    };
     const setupPageProxy = () => {
-        if (typeof fetch === "undefined") return;
-        const beat = () => { try { GM_setValue("BingRewards_alive", { ts: Date.now() }); } catch (_) {} };
+        const ex = pageProxyExecutor();
+        const beat = () => { try { GM_setValue("BingRewards_alive", { ts: Date.now(), mode: ex ? ex.mode : "none" }); } catch (_) {} };
         beat();
-        setInterval(beat, 20000);
+        try { setInterval(beat, 20000); } catch (_) {}
+        if (!ex) {
+            try { Utils.log("🔗", "转发通道不可用：页面沙箱内 fetch/XHR 均不存在"); } catch (_) {}
+            return;
+        }
         GM_addValueChangeListener("BingRewards_req", async (name, oldV, req) => {
             try {
                 if (!req || !req.id || req.answered) return;
@@ -3853,24 +3921,8 @@ Notice:
                 req.answered = true;
                 try { GM_setValue(name, req); } catch (_) {} // 认领标记，多标签页时尽量只执行一次
                 try {
-                    const ctrl = typeof AbortController !== "undefined" ? new AbortController() : null;
-                    const timer = ctrl ? setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, 20000) : null;
-                    const res = await fetch(req.url, {
-                        method: req.method,
-                        headers: req.headers && Object.keys(req.headers).length ? req.headers : undefined,
-                        body: req.method === "POST" ? req.data : undefined,
-                        credentials: "include",
-                        redirect: "follow",
-                        signal: ctrl ? ctrl.signal : undefined,
-                    });
-                    if (timer) clearTimeout(timer);
-                    const text = await res.text();
-                    GM_setValue("BingRewards_resp", {
-                        id: req.id, ok: true, status: res.status,
-                        text: text.slice(0, 500000),
-                        finalUrl: res.url || req.url,
-                        headers: Array.from(res.headers || []).map(([k, v]) => `${k}: ${v}`).join("\r\n"),
-                    });
+                    const r = await ex.exec(req);
+                    GM_setValue("BingRewards_resp", { id: req.id, ok: true, status: r.status, text: r.text, finalUrl: r.finalUrl, headers: r.headers });
                 } catch (e) {
                     GM_setValue("BingRewards_resp", { id: req.id, ok: false, err: String((e && e.message) || e).slice(0, 200) });
                 }
@@ -4143,6 +4195,17 @@ Notice:
     });
 
     GM_registerMenuCommand("🚀 立即运行", () => TaskManager.runAll());
+
+    // v3.6.9：refresh_token 仍活着时脚本永远不会主动用授权码换新 Token（设计上避免
+    // 反复打扰授权）；想用刚粘贴的授权码彻底重建登录态，点这个清除旧 Token 即可。
+    GM_registerMenuCommand("🔁 强制用授权码换取新Token", () => {
+        if (!GM_getValue("Config.code", "")) {
+            alert("未检测到已保存的授权码。请先「🔑 手动授权」完成授权，再用「📋 粘贴授权码」保存跳转后的完整URL。");
+            return;
+        }
+        GM_setValue("Config.token", false);
+        Utils.log("🟡", "已清除旧 Token，下一轮将使用粘贴的授权码重新换取（也可点「🚀 立即运行」马上执行）");
+    });
 
     // 通知接口配置菜单
     GM_registerMenuCommand("🔔 配置通知接口", () => {
