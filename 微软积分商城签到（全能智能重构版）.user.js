@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.8.0
+// @version      3.9.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.8.0 双脚本架构：@crontab 使本脚本属 ScriptCat「后台脚本」类别、永不注入页面——这是 21 轮「前台注入未生效」的根因；页面侧功能迁至《微软积分商城签到-页面代理》脚本，共用 @storageName 桥接同源转发通道；v3.7.0 实证入账唯一判据为 Server Action 响应含 1:true、SW 直连因扩展请求身份被浏览器改写而不可修复）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -471,7 +471,10 @@ Notice:
             if (RewardsAuto._pageChannelOff || RewardsAuto._pageRescueUsed) return false;
             RewardsAuto._pageRescueUsed = true;
             try {
-                const handle = GM_openInTab("https://rewards.bing.com/dashboard?bgprobe=1", { active: false, insert: false });
+                // v3.9.0：claimnow=1 让页面代理脚本（若注入成功）强制执行一轮桥无关自扫描
+                // 领取——即使 @storageName 共享存储不生效、req/resp 桥不可用，卡片也能经
+                // 页面上下文入账，由下一轮 discoverCards/复核验证到账。
+                const handle = GM_openInTab("https://rewards.bing.com/dashboard?bgprobe=1&claimnow=1", { active: false, insert: false });
                 if (handle && typeof handle === "object") RewardsAuto._pageTabHandle = handle;
             } catch (_) {}
             if (!RewardsAuto._pageTabHandle) {

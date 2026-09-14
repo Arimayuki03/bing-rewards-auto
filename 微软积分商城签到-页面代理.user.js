@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到-页面代理（前台通道）
 // @namespace    local.bing-rewards-auto
-// @version      3.8.0
+// @version      3.9.0
 // @description  《微软积分商城签到（全能智能重构版）》的页面侧组件：①同源转发通道执行器（页面上下文 fetch 携带真实登录 cookie 与正确 Origin，是 Server Action 唯一可用的执行环境）②OAuth 授权码自动捕获 ③打卡/每日活动 DOM 处理。后台脚本因 @crontab 属于「后台脚本」类别（ScriptCat 规则：不注入任何页面），页面功能必须由本脚本承载。与后台脚本共用 @storageName 通信（BingRewards_req/resp/alive 协议）。
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -23,7 +23,7 @@
 
     // 注入信标：F12 控制台第一行 = 脚本已注入；第二行 = 共享存储可写。
     // 只有一行都没有 = ScriptCat 未注入本脚本（查弹窗分组与启用开关）。
-    try { console.log("[页面代理] v3.8.0 已注入", location.href); } catch (_) {}
+    try { console.log("[页面代理] v3.9.0 已注入", location.href); } catch (_) {}
 
     // ====== OAuth 授权码自动捕获（v3.8.0 自后台脚本迁入：后台脚本不注入页面，原为死代码） ======
     // 授权码自动捕获
@@ -171,7 +171,10 @@
         // 后台据此区分"代理页从未被注入（ScriptCat 前台注入开关/权限问题）"
         // 与"注入了但执行器全缺（mode:none）"——连续多轮零心跳时后者不该出现。
         try { GM_setValue("BingRewards_injected", { ts: Date.now(), url: (location.href || "").slice(0, 80) }); } catch (_) {}
-        try { console.log("[页面代理] 注入标记+心跳已写入共享存储 BingRewardsAuto_Shared"); } catch (_) {}
+        try {
+            console.log("[页面代理] B→A 注入标记已写入; A→B 共享存储可读:",
+                !!GM_getValue("Config.token", false), "(true=桥通, false=桥未通但自扫描领取不受影响)");
+        } catch (_) {}
         const ex = pageProxyExecutor();
         const beat = () => { try { GM_setValue("BingRewards_alive", { ts: Date.now(), mode: ex ? ex.mode : "none" }); } catch (_) {} };
         beat();
@@ -196,8 +199,118 @@
             } catch (_) { /* 转发异常不应答，后台超时后自行回退 */ }
         });
     };
+
+    // ====== v3.9.0 桥无关自扫描领取 ======
+    // v3.8.0 现场：页面代理已在「当前页运行脚本 1/1」，但后台读不到它写的注入标记/心跳
+    // ——@storageName 跨脚本共享未生效，req/resp 桥不可依赖。但领取动作只需要「页面上下文」
+    // 这一个条件（抓包实证：页面内 fetch 带真实 cookie+正确 Origin → 200+1:true 入账），
+    // 不需要后台驱动：B 自己抓取 earn/dashboard 的 flight、解析待领 offer、页面内 POST
+    // reportActivity 与欢迎积分领取。后台下一轮 discoverCards/复核自然验证到账——
+    // 存储桥通与不通，这条路都成立。
+    const FALLBACK_REPORT_ACTION = "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce"; // 2026-09-15 dpl=20260912-2
+    const FALLBACK_CLAIM_ACTION = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d";  // 2026-09-14 抓包
+    const sweepLog = (...a) => { try { console.log("[页面代理]", ...a); } catch (_) {} };
+    const sweepConcatFlight = (html) => {
+        let c = "";
+        for (const m of String(html).matchAll(/self\.__next_f\.push\(\[1,\s*"((?:[^"\\]|\\.)*)"\]\)/g)) {
+            try { c += JSON.parse('"' + m[1] + '"'); } catch (_) {}
+        }
+        return c;
+    };
+    const sweepExtractOffers = (combined) => {
+        const out = [];
+        const seen = new Set();
+        const re = /"offerId":"([^"]+)"/g;
+        let m;
+        while ((m = re.exec(combined)) !== null) {
+            const id = m[1];
+            if (!id || seen.has(id)) continue;
+            seen.add(id);
+            const win = combined.slice(Math.max(0, m.index - 700), m.index + 700);
+            const hm = win.match(/"hash":"([a-f0-9]{64})"/);
+            if (!hm) continue;
+            if (/"isCompleted":true/.test(win) || /"isLocked":true/.test(win)) continue;
+            const pm = win.match(/"points":(\d+)/);
+            const points = pm ? Number(pm[1]) : 0;
+            if (points <= 0) continue;
+            out.push({ offerId: id, hash: hm[1], points });
+        }
+        return out;
+    };
+    const runClaimSweep = async () => {
+        const tree = encodeURIComponent('["",{"children":["(nav)",{"children":["dashboard",{"children":["__PAGE__",{},null,null,4096]},null,null,4096]},null,null,4096]},null,null,4112]');
+        const fetchText = async (url) => {
+            try {
+                const r = await fetch(url, { credentials: "include", redirect: "follow" });
+                return { status: r.status, text: await r.text() };
+            } catch (_) { return { status: 0, text: "" }; }
+        };
+        const earn = await fetchText("https://rewards.bing.com/earn");
+        const dash = await fetchText("https://rewards.bing.com/dashboard");
+        if (earn.status !== 200 && dash.status !== 200) { sweepLog("扫描跳过：页面抓取失败", earn.status, dash.status); return; }
+        const htmlAll = earn.text + dash.text;
+        const combined = sweepConcatFlight(earn.text) + sweepConcatFlight(dash.text);
+        const dpl = (htmlAll.match(/dpl=([0-9][0-9A-Za-z.\-]*)/) || [])[1] || "";
+        // reportActivity action id：扫描构建 chunk 定位 createServerReference(...,"reportActivity")
+        let actionId = "";
+        try {
+            const chunkUrls = [...new Set([...htmlAll.matchAll(/\/_next\/static\/chunks\/[^\s"'<>?]+\.js/g).map(x => x[0])])].slice(0, 16);
+            for (const cu of chunkUrls) {
+                const js = await fetchText("https://rewards.bing.com" + cu + (dpl ? "?dpl=" + dpl : ""));
+                const am = js.text.match(/createServerReference\("([a-f0-9]{40})"[^)]*,"reportActivity"\)/);
+                if (am) { actionId = am[1]; break; }
+            }
+        } catch (_) {}
+        if (!actionId) actionId = FALLBACK_REPORT_ACTION;
+        const headers = (nextAction) => ({
+            "accept": "text/x-component",
+            "content-type": "text/plain;charset=UTF-8",
+            "next-action": nextAction,
+            "next-router-state-tree": tree,
+            ...(dpl ? { "x-deployment-id": dpl } : {}),
+        });
+        const offers = sweepExtractOffers(combined);
+        sweepLog(`扫描开始: ${offers.length} 个待领取 offer, action=${actionId.slice(0, 12)}…`);
+        let okN = 0;
+        for (const o of offers) {
+            try {
+                const body = JSON.stringify([o.hash, 11, {
+                    offerid: o.offerId, isPromotional: "$undefined",
+                    timezoneOffset: String(new Date().getTimezoneOffset()),
+                }]);
+                const r = await fetch("https://rewards.bing.com/earn", { method: "POST", headers: headers(actionId), body, credentials: "include" });
+                const t = await r.text();
+                const ok = r.status === 200 && t.includes("1:true");
+                if (ok) okN++;
+                sweepLog(`领取${ok ? " ✅" : " ❌"} ${o.offerId} +${o.points}p HTTP ${r.status}${ok ? "" : " " + t.slice(0, 80)}`);
+            } catch (e) { sweepLog("领取异常", o.offerId, e && e.message); }
+            await new Promise(r => setTimeout(r, 2500 + Math.random() * 2500));
+        }
+        // 欢迎页「可领取」积分：POST dashboard 空参数数组
+        try {
+            const ids = [...new Set([...String(dash.text + combined).matchAll(/\$ACTION_ID_([a-f0-9]{40})/g)].map(x => x[1]))];
+            const claimId = ids.length === 1 ? ids[0] : FALLBACK_CLAIM_ACTION;
+            const r = await fetch("https://rewards.bing.com/dashboard", { method: "POST", headers: headers(claimId), body: "[]", credentials: "include" });
+            const t = await r.text();
+            sweepLog(`欢迎积分领取 HTTP ${r.status}`, (r.status === 200 && t.includes("1:true")) ? "✅" : "❌/无待领");
+        } catch (e) { sweepLog("欢迎积分领取异常", e && e.message); }
+        sweepLog(`扫描完成: ${okN}/${offers.length} 受理成功（到账以后台下一轮复核为准）`);
+    };
+    const maybeSweep = () => {
+        // 后台救援页 ?claimnow=1 强制执行；用户正常浏览 dashboard/earn 时 15 分钟节流一次
+        const force = /claimnow=1/.test(location.search);
+        if (!force && location.pathname !== "/dashboard" && location.pathname !== "/earn") return;
+        try {
+            const last = Number(localStorage.getItem("bw_sweep_last") || 0);
+            if (!force && Date.now() - last < 15 * 60 * 1000) return;
+            localStorage.setItem("bw_sweep_last", String(Date.now()));
+        } catch (_) {}
+        setTimeout(() => { runClaimSweep().catch(e => sweepLog("扫描异常:", e && e.message || e)); }, force ? 3000 : 8000);
+    };
+
     if (location.hostname === "rewards.bing.com") {
         setupPageProxy();
+        maybeSweep();
         // v3.6.15：诊断菜单只在此（页面上下文）注册——后台沙箱里注册的菜单会让
         // 用户误以为前台注入正常（v3.6.14 实测假阳性）。能否在 rewards 页面的
         // 脚本菜单里看到它，就是"前台注入是否生效"的一锤定音判据。

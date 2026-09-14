@@ -1194,6 +1194,20 @@ test("v3.8.0 split: page-proxy script carries the front-end channel and shares s
     assert.match(source, /通道诊断（本页）/);
 });
 
+test("v3.9.0 bridge-free claiming: SW opens claimnow tab and page proxy sweeps pending offers", () => {
+    const bg = fs.readFileSync(scriptPath, "utf8");
+    assert.match(bg, /bgprobe=1&claimnow=1/, "救援页 URL 必须带 claimnow 触发扫描");
+    const pg = fs.readFileSync(pageProxyPath, "utf8");
+    assert.match(pg, /const runClaimSweep = async \(\) =>/);
+    assert.match(pg, /const maybeSweep = \(\) =>/);
+    assert.match(pg, /setupPageProxy\(\);[\s\S]{0,40}maybeSweep\(\);/, "rewards 块内必须接线扫描");
+    assert.match(pg, /bw_sweep_last/, "localStorage 节流独立于扩展存储桥");
+    assert.match(pg, /claimnow=1/);
+    assert.match(pg, /"1:true"/, "扫描领取使用与后台一致的严格判据");
+    // flight 正则必须与后台解析器同构（双反斜杠字符类）
+    assert.ok(pg.includes('((?:[^"' + String.fromCharCode(92, 92) + ']|' + String.fromCharCode(92, 92) + '.)*)'));
+});
+
 test("v3.8.0 split: background script keeps the SW side and drops dead page code", () => {
     const source = fs.readFileSync(scriptPath, "utf8");
     assert.match(source, /@crontab/, "后台脚本保留 @crontab 定时能力");
