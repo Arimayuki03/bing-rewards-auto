@@ -59,20 +59,18 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     return { ...context.__userscriptTest, storage, intervals };
 }
 
-test("claimCard preserves a false reportActivity result", async () => {
+test("claimCard returns false when all earn-action strategies fail (legacy path retired)", async () => {
     const { API, Utils } = createHarness();
-    API.getRewardsToken = async () => false;
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
     Utils.xhr = async () => { throw new Error("server action failed"); };
-    let reports = 0;
-    API.reportActivity = async () => {
-        reports++;
-        return false;
-    };
+    Utils.fetchPage = async () => ""; // live hash 重试也拿不到 → 短路到放弃
+    let legacyCalls = 0;
+    API.reportActivity = async () => { legacyCalls++; return false; };
 
     const result = await API.claimCard({ offerId: "offer", hash: "hash" });
 
     assert.equal(result, false);
-    assert.equal(reports, 2);
+    assert.equal(legacyCalls, 0, "v3.6.11: dead legacy reportactivity must no longer be called");
 });
 
 test("token exchange uses POST body instead of exposing secrets in the URL", async () => {
@@ -1055,17 +1053,21 @@ test("claimCard falls back to visiting the card url when all report strategies f
     Utils.xhr = async options => {
         if (options.method === "POST") throw new Error("HTTP 500");
         gets.push(options);
-        return "ok";
+        // earn 刷新返回空 flight（live hash 重试无候选 → 直接落到 impression/visit）
+        return options.url === "https://rewards.bing.com/earn" ? "<html></html>" : "ok";
     };
 
     const ok = await API.claimCard({ offerId: "o1", hash: "h1", url: "https://cn.bing.com/search?q=x&rnoreward=1" });
     assert.equal(ok, true);
-    assert.equal(gets.length, 1);
-    assert.equal(gets[0].url, "https://cn.bing.com/search?q=x&rnoreward=1");
+    // v3.6.11：POST 失败后先刷新 earn 取 live hash，再复刻点击目标页
+    assert.equal(gets.length, 2);
+    assert.equal(gets[0].url, "https://rewards.bing.com/earn");
+    assert.equal(gets[1].url, "https://cn.bing.com/search?q=x&rnoreward=1");
 
     // 非 bing.com 目标页不做点击复刻，所有策略失败返回 false
     assert.equal(await API.claimCard({ offerId: "o2", hash: "h2", url: "https://example.com/x" }), false);
-    assert.equal(gets.length, 1);
+    assert.equal(gets.length, 3); // 又刷新了一次 earn，但不请求 example.com
+    assert.equal(gets[2].url, "https://rewards.bing.com/earn");
 });
 
 // ====== v3.6.2：Server Action 与真实浏览器行为对齐 ======
@@ -1139,7 +1141,7 @@ test("reportActivity attaches the explicit cookie header for the legacy API", as
 
 // ====== v3.6.6：审查修复（策略1 Cookie 头 / 前台日期基准 / 运行锁心跳）======
 
-test("claimCard strategy 1 attaches the explicit cookie header", async () => {
+test("claimCard strategy 1 (earn action) attaches the explicit cookie header", async () => {
     const { API, Utils } = createHarness({}, {
         gmCookie(...args) {
             const callback = args.find(a => typeof a === "function");
@@ -1461,4 +1463,114 @@ test("renewToken keeps an unused auth code on refresh success and logs it", asyn
     assert.ok(storage.get("Config.tokenTime") > oldTime);
     // refresh 路径没用到授权码：绝不能把用户刚粘贴的新凭证清掉
     assert.equal(storage.get("Config.code"), savedCode);
+});
+
+// ====== v3.6.11：登录态抓包重写的卡片链路与欢迎页领取 ======
+// 复用文件前部已有的 flightHtml(...payloads) helper 构造 __next_f 测试页
+
+test("parseEarnLiveOffers reads live hash/completion/lock per offer", () => {
+    const { Utils } = createHarness();
+    const combined = [
+        { offerId: "O1", hash: "a".repeat(64), isCompleted: true },
+        { offerId: "O2", hash: "b".repeat(64), isLocked: true, unlockCriteria: "rewardsApp" },
+        { offerId: "O3", hash: "c".repeat(64) },
+    ].map(o => JSON.stringify(o)).join(",");
+    const live = Utils.parseEarnLiveOffers(combined);
+    assert.equal(live.O1.isCompleted, true);
+    assert.equal(live.O2.isLocked, true);
+    assert.equal(live.O2.unlockCriteria, "rewardsApp");
+    assert.equal(live.O3.hash, "c".repeat(64));
+    assert.equal(live.O3.isCompleted, false);
+});
+
+test("claimCard posts the browser-captured earn contract (context shape, live hash)", async () => {
+    const posts = [];
+    const { API, Utils } = createHarness();
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
+    Utils.fetchPage = async () => { throw new Error("strategy 1 must not re-fetch"); };
+    Utils.xhr = async o => { posts.push(o); return "0:{}\n1:irrelevant-rsc"; };
+
+    const ok = await API.claimCard({ offerId: "O3", hash: "c".repeat(64), points: 15, url: "https://www.bing.com/search?q=x" });
+
+    assert.equal(ok, true);
+    assert.equal(posts.length, 1);
+    assert.equal(posts[0].url, "https://rewards.bing.com/earn");
+    assert.equal(posts[0].method, "POST");
+    assert.equal(posts[0].headers["next-action"], "f".repeat(40));
+    const body = JSON.parse(posts[0].data);
+    assert.equal(body[0], "c".repeat(64));
+    assert.equal(body[1], 11);
+    assert.equal(body[2].offerid, "O3");
+    assert.ok("timezoneOffset" in body[2] && "isPromotional" in body[2]);
+    assert.equal("form" in body[2], false, "context shape must not carry the impression form field");
+});
+
+test("claimCard retries once with the fresh earn-flight hash when the first POST fails", async () => {
+    const posts = [];
+    const { API, Utils } = createHarness();
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
+    Utils.xhr = async o => {
+        posts.push(o);
+        if (posts.length === 1) throw new Error("HTTP 500");
+        return "1:ok";
+    };
+    Utils.fetchPage = async () => flightHtml(`{"offerId":"O5","hash":"${"e".repeat(64)}","isCompleted":false,"isLocked":false}`);
+
+    const ok = await API.claimCard({ offerId: "O5", hash: "stalehash", points: 15 });
+
+    assert.equal(ok, true);
+    assert.equal(posts.length, 2);
+    assert.equal(JSON.parse(posts[1].data)[0], "e".repeat(64), "second attempt must use the fresh live hash");
+});
+
+test("claimCard abandons without extra posts when the live offer is locked (app-only)", async () => {
+    const posts = [];
+    const { API, Utils } = createHarness();
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
+    Utils.xhr = async o => { posts.push(o); throw new Error("HTTP 500"); };
+    Utils.fetchPage = async () => flightHtml(`{"offerId":"O9","hash":"${"d".repeat(64)}","isCompleted":false,"isLocked":true,"unlockCriteria":"rewardsApp"}`);
+
+    const ok = await API.claimCard({ offerId: "O9", hash: "stale", points: 10 });
+
+    assert.equal(ok, false);
+    assert.equal(posts.length, 1, "locked offers must short-circuit after the single failed attempt");
+});
+
+test("claimPendingPoints posts empty args to dashboard with dynamic/fallback action id", async () => {
+    const posts = [];
+    const { API, Utils } = createHarness();
+    const dyn = "1".repeat(40);
+    Utils.fetchPage = async () => `<html>foo $ACTION_ID_${dyn} bar</html>`;
+    Utils.xhr = async o => { posts.push(o); return '0:{"a":"$@1"}\n1:true\n'; };
+
+    const ok = await API.claimPendingPoints();
+
+    assert.equal(ok, true);
+    assert.equal(posts[0].url, "https://rewards.bing.com/dashboard");
+    assert.equal(posts[0].method, "POST");
+    assert.equal(posts[0].data, "[]");
+    assert.equal(posts[0].headers["next-action"], dyn);
+
+    // 页面没有唯一 $ACTION_ID 候选 → 抓包兜底 id
+    Utils.fetchPage = async () => "<html>none</html>";
+    await API.claimPendingPoints();
+    assert.equal(posts[1].headers["next-action"], "00491296f1d668ad46b65342c95cb9d72a62c1fa9d");
+});
+
+test("discoverCards overlays earn live state: filters done/locked, restamps live hash", async () => {
+    const offers = [
+        { offerId: "DONE1", hash: "a".repeat(64), points: 10, title: "T1", isCompleted: true },
+        { offerId: "LOCK1", hash: "b".repeat(64), points: 10, title: "T2", isCompleted: false, isLocked: true, unlockCriteria: "rewardsApp" },
+        { offerId: "OPEN1", hash: "c".repeat(64), points: 15, title: "T3", isCompleted: false },
+    ];
+    const combined = '{"activityCards":[' + offers.map(o => JSON.stringify(o)).join(",") + ']}';
+    const { API, Utils } = createHarness();
+    API._getUserInfo = async () => null;
+    Utils.fetchPage = async () => flightHtml(combined);
+
+    const cards = await API.discoverCards();
+
+    // Array.from 在宿主 realm 收集（vm realm 的 map 结果跨 realm 原型比较会失败）
+    assert.deepEqual(Array.from(cards, c => c.offerId), ["OPEN1"]);
+    assert.equal(cards[0].hash, "c".repeat(64));
 });

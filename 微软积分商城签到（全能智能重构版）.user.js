@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.10
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.10：登录态页面实测坐实——同源真实cookie下每日活动Server Action返回200、通道方向正确；legacy签入接口已下线，解除其401对阅读任务的连坐与误导告警。含v3.6.9：转发执行器多级回退+心跳带mode、授权码不再误清、强制换Token菜单）
+// @version      3.6.11
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.11：按登录态真实抓包重写卡片链路——日常任务卡走 earn 同源 context 形+本次页面轮换hash（浏览器点击同款契约）、欢迎页"可领取"积分后台自动领取、isLocked/App-only卡片直接跳过。含v3.6.10 解除legacy签入连坐、v3.6.9 通道执行器多级回退）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -622,6 +622,29 @@ Notice:
                 Utils.log("🟢", `动态 next-action${label}: ${naMatch[1].slice(0, 12)}…`);
             }
             return naMatch ? naMatch[1] : null;
+        },
+
+        // 解析 earn flight 流中的可领取 offer 实时状态（2026-09-14 登录态抓包实证）：
+        // offerId → {hash, isCompleted, isLocked, unlockCriteria}。卡片上报的 hash 必须
+        // 用本次页面加载 flight 里的轮换值（服务端拒收与当次加载不一致的旧 hash）；
+        // isCompleted=true 即已入账，isLocked=true（如 unlockCriteria:"rewardsApp"，
+        // UI 显示"仅限积分商城应用"）表示网页端无领取资格。
+        parseEarnLiveOffers(combined) {
+            const map = {};
+            if (!combined) return map;
+            try {
+                for (const obj of this.extractFlightObjects(combined, '"offerId"')) {
+                    const id = obj && typeof obj.offerId === "string" ? obj.offerId : "";
+                    if (!id || map[id]) continue;
+                    map[id] = {
+                        hash: typeof obj.hash === "string" ? obj.hash : "",
+                        isCompleted: obj.isCompleted === true || obj.complete === true,
+                        isLocked: obj.isLocked === true,
+                        unlockCriteria: typeof obj.unlockCriteria === "string" ? obj.unlockCriteria : "",
+                    };
+                }
+            } catch (_) {}
+            return map;
         },
 
         // ====== RSC flight 流解析（2026-09 改版后 offer 数据存于 self.__next_f 分片） ======
@@ -2261,6 +2284,27 @@ Notice:
                     }
                 }
 
+                // ---- earn flight live 状态合并（2026-09-14 登录态抓包实证）----
+                // 卡片上报 hash 必须用本次 /earn 加载的轮换 hash（真实点击抓包：服务端
+                // 按当次 flight 值校验）；isCompleted/isLocked 是网页侧权威状态与资格
+                // 标记——据此过滤"已入账"和"仅限积分商城应用"卡片，不再空转重试。
+                try {
+                    const live = Utils.parseEarnLiveOffers(Utils.concatFlightChunks(html));
+                    if (Object.keys(live).length > 0) {
+                        const kept = [];
+                        for (const c of cards) {
+                            const o = live[c.offerId];
+                            if (!o) { kept.push(c); continue; } // earn 墙未见该 offer → 保留原样
+                            if (o.isCompleted) { Utils.log("🔵", `卡片已入账（earn live 状态）: ${c.offerId}`); continue; }
+                            if (o.isLocked) { Utils.log("🔒", `卡片锁定（${o.unlockCriteria || "?"}），网页端不可领取: ${c.offerId}`); continue; }
+                            if (o.hash) c.hash = o.hash;
+                            kept.push(c);
+                        }
+                        cards.length = 0;
+                        cards.push(...kept);
+                    }
+                } catch (_) { /* live 合并失败不影响原有解析结果 */ }
+
                 if (cards.length === 0) {
                     // 输出前 500 字符供调试
                     const snippet = clean.slice(0, 500).replace(/[\r\n]+/g, ' ');
@@ -2273,105 +2317,116 @@ Notice:
             return cards;
         },
 
-        // 领取卡片奖励（多种策略尝试，兼容所有卡片类型）
+        // 欢迎页“可领取 N”积分的真实领取（2026-09-14 登录态抓包实证：+6 分到账）：
+        // POST https://rewards.bing.com/dashboard，body 为空参数数组 []，
+        // next-action 为 claim 专用 ID（独立于 reportActivity，随部署轮换，且仅在
+        // 页面存在可领取项时随 flight 下发 "$ACTION_ID_xxx"）。成功响应包含 `1:true`。
+        // 解析顺序：页面 $ACTION_ID_ 唯一候选 → Config.claimActionId 覆盖值 → 抓包兜底值。
+        async claimPendingPoints() {
+            const DASH = "https://rewards.bing.com/dashboard";
+            let actionId = String(GM_getValue("Config.claimActionId", "") || "");
+            if (!/^[a-f0-9]{40}$/.test(actionId)) {
+                actionId = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d"; // 2026-09-14 dpl=20260912-2 抓包
+            }
+            try {
+                const html = await Utils.fetchPage({ url: DASH, headers: { "user-agent": RewardsAuto.ua.pc } }, { fresh: true });
+                if (html) {
+                    const ids = new Set(
+                        (String(html).match(/\$ACTION_ID_([a-f0-9]{40})/g) || [])
+                            .concat((Utils.concatFlightChunks(html).match(/\$ACTION_ID_([a-f0-9]{40})/g) || []))
+                            .map(s => s.slice(11)));
+                    if (ids.size === 1) actionId = [...ids][0];
+                }
+            } catch (_) { /* 拿不到就用配置/兜底值 */ }
+            const headers = {
+                "accept": "text/x-component",
+                "content-type": "text/plain;charset=UTF-8",
+                "next-action": actionId,
+                "next-router-state-tree": Utils.routerStateTree(DASH),
+            };
+            const cookie = await Utils.cookieHeaderFor(DASH);
+            if (cookie) headers.cookie = cookie;
+            try {
+                const res = await Utils.xhr({ method: "POST", url: DASH, headers, data: "[]" });
+                if (typeof res === "string" && res.includes("1:true")) return true;
+                Utils.log("🟡", `欢迎积分领取响应形态异常: ${String(typeof res === "string" ? res : (res && res.status) || "?").slice(0, 80)}`);
+                return false;
+            } catch (e) {
+                Utils.log("🟡", `欢迎积分领取失败（action id 可能已轮换，可更新 Config.claimActionId）: ${e.message}`);
+                return false;
+            }
+        },
+
+        // 领取卡片奖励（2026-09-14 登录态抓包重写）
+        // 浏览器点击日常任务卡的真实契约：POST https://rewards.bing.com/earn（卡片墙
+        // 所在页自身），context 形状 body [本次earnFlightHash, 11,
+        // {offerid, isPromotional, timezoneOffset}]，next-action=reportActivity 动态 ID。
+        // 200 即上报受理；earn 响应是 RSC 流、不含 `1:true`，是否入账交由调用方的
+        // "复核 + 连续 N 轮放弃"机制判定，此处不看响应文本。
         async claimCard(card) {
             // 新版构建下页面 flight 流不再内嵌可用的 next-action 引用，
             // 优先用 chunk 扫描出的 reportActivity ID，避免误用页面其他 action 的 ID
             const nextAction = await this._resolveReportActivityActionId()
                 || RewardsAuto._nextAction || RewardsAuto.fallbackActionId;
-            const url = card.url || "https://rewards.bing.com/earn";
+            const EARN = "https://rewards.bing.com/earn";
             const referer = card.url || "https://rewards.bing.com/";
-            // Server Action 只能发往 rewards 站点页面；card.url 若是 bing.com 目标页则改发 earn
-            const actionUrl = /^https?:\/\/rewards\.bing\.com\/(earn|dashboard)\/?$/i.test(url)
-                ? url : "https://rewards.bing.com/earn";
 
-            // 策略1: reportactivity + RequestVerificationToken（最稳定，失败后强制刷新 token 重试一次）
-            const postReportActivity = async (token) => {
-                // 显式 Cookie 头：与 API.reportActivity / Server Action 同根因（v3.6.5），
-                // SW 子请求不自动携带 SameSite 登录 cookie，缺失时该端点 401/500，
-                // 首选策略每次白打一次请求才落到后续策略
+            const postEarnAction = async (hash, shape) => {
                 const headers = {
-                    "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
-                    "user-agent": RewardsAuto.ua.pc,
-                    "referer": referer,
-                    "origin": "https://rewards.bing.com",
-                    "x-requested-with": "XMLHttpRequest"
-                };
-                const cookie = await Utils.cookieHeaderFor("https://rewards.bing.com/api/reportactivity");
-                if (cookie) headers.cookie = cookie;
-                return await Utils.xhr({
-                    method: "POST",
-                    url: "https://rewards.bing.com/api/reportactivity?X-Requested-With=XMLHttpRequest",
-                    headers,
-                    data: new URLSearchParams({
-                        id: card.offerId,
-                        hash: card.hash,
-                        timeZone: Utils.getTimezoneOffset(),
-                        activityAmount: 1,
-                        dbs: 0,
-                        form: "",
-                        type: "",
-                        __RequestVerificationToken: token
-                    }).toString()
-                });
-            };
-            try {
-                let token = await this.getRewardsToken();
-                if (token) {
-                    try {
-                        await postReportActivity(token);
-                        return true;
-                    } catch (_) {
-                        // token 可能已失效，强制刷新后重试一次
-                        token = await this.getRewardsToken(true);
-                        if (token) {
-                            await postReportActivity(token);
-                            return true;
-                        }
-                    }
-                }
-            } catch (e1) {
-                Utils.log("🟡", `reportactivity+token 失败: ${card.offerId}`);
-            }
-
-            // 策略2: Server Action（原始 hash）——payload 形状与真实浏览器一致：{offerid, form}
-            try {
-                const actionHeaders = {
                     "accept": "text/x-component",
                     "content-type": "text/plain;charset=UTF-8",
                     "next-action": nextAction,
-                    "next-router-state-tree": Utils.routerStateTree(actionUrl),
-                    "origin": "https://rewards.bing.com",
-                    "user-agent": RewardsAuto.ua.pc,
-                    referer
+                    "next-router-state-tree": Utils.routerStateTree(EARN),
                 };
-                const cookie = await Utils.cookieHeaderFor(actionUrl);
-                if (cookie) actionHeaders.cookie = cookie;
+                const cookie = await Utils.cookieHeaderFor(EARN);
+                if (cookie) headers.cookie = cookie;
                 await Utils.xhr({
-                    method: "POST", url: actionUrl,
-                    headers: actionHeaders,
-                    data: JSON.stringify([card.hash, 11, { offerid: card.offerId, form: card.form || "$undefined" }])
+                    method: "POST", url: EARN, headers,
+                    data: JSON.stringify(shape === "impression"
+                        ? [hash, 11, { offerid: card.offerId, form: card.form || "$undefined" }]
+                        : [hash, 11, {
+                            offerid: card.offerId,
+                            isPromotional: "$undefined",
+                            timezoneOffset: Utils.jsTimezoneOffset(),
+                        }]),
                 });
-                return true;
+            };
+
+            // 策略1: context 形 + live hash（discoverCards 已用本次 earn flight 覆盖）
+            if (card.hash) {
+                try { await postEarnAction(card.hash); return true; }
+                catch (e) { Utils.log("🟡", `Earn 同源上报失败(${card.offerId}): ${e.message}`); }
+            }
+
+            // 策略2: 强制刷新 earn 页再取一次 live hash——卡片来自 getuserinfo 静态源
+            // 或 discoverCards 合并未命中时，旧 hash 大概率正是失败原因（服务端按当次
+            // 页面加载校验）。顺带用权威 live 状态短路：已入账返回成功，锁定直接放弃。
+            try {
+                const html = await Utils.fetchPage({ url: EARN }, { fresh: true });
+                const live = Utils.parseEarnLiveOffers(Utils.concatFlightChunks(html || ""));
+                const o = live && live[card.offerId];
+                if (o && o.isCompleted) return true;
+                if (o && o.isLocked) {
+                    Utils.log("🔒", `卡片锁定（${o.unlockCriteria || "?"}），网页端不可领取: ${card.offerId}`);
+                    return false;
+                }
+                if (o && o.hash && o.hash !== card.hash) {
+                    await postEarnAction(o.hash);
+                    return true;
+                }
             } catch (e2) {
-                Utils.log("🟡", `Server Action 失败: ${card.offerId}`);
+                Utils.log("🟡", `Live hash 重试失败(${card.offerId}): ${e2.message}`);
             }
 
-            // 策略3: reportActivity（原始 hash）
-            try {
-                const reported = await this.reportActivity(card.offerId, card.hash, referer);
-                if (reported !== false) return true;
-            } catch (e3) {
-                Utils.log("🟡", `reportActivity 失败: ${card.offerId}`);
+            // 策略3: impression 形（改版前旧 payload，兼容仍引用旧构建的区域）
+            if (card.hash) {
+                try { await postEarnAction(card.hash, "impression"); return true; }
+                catch (e3) { Utils.log("🟡", `Server Action(impression) 失败: ${card.offerId}`); }
             }
 
-            // 策略4: reportActivity（hash "1"）
-            try {
-                const reported = await this.reportActivity(card.offerId, "1", referer);
-                if (reported !== false) return true;
-            } catch (e4) {
-                Utils.log("🟡", `reportActivity(1) 失败: ${card.offerId}`);
-            }
+            // （原 legacy /api/reportactivity 策略删除：2026-09-14 实测该端点已被服务端
+            //   下线——真实登录页面同样 401、页面已无 RequestVerificationToken，保留只会
+            //   为每张失败卡片白白多打 3 个请求。）
 
             // 策略5: 后台复刻真实点击——GET 卡片目标链接。bingredirect/rnoreward 类卡片
             // 的真实入账发生在跳转目标页（与每日活动阶梯 3 同源），Server Action 与
@@ -3462,8 +3517,13 @@ Notice:
 
                 const amount = parseInt(claimableMatch[1].replace(/,/g, '')) || 0;
                 if (amount > 0) {
-                    // 仅检测提醒，不再弹窗打开 dashboard（避免干扰前台）；打开 dashboard 时前台处理器会自动领取
-                    Utils.log("🎁", `检测到 ${amount} 积分待领取（打开 dashboard 时将自动领取）`);
+                    // v3.6.11：不再只提醒，直接走实测契约领取（同源转发通道/直连均可用）
+                    const ok = await API.claimPendingPoints();
+                    if (ok) {
+                        Utils.log("🎁", `已领取 ${amount} 待领取积分`, true);
+                    } else {
+                        Utils.log("🟡", `${amount} 积分领取失败（打开 dashboard 时前台仍会自动领取）`);
+                    }
                 } else {
                     Utils.log("✅", "可领取积分为 0");
                 }
