@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.11
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.11：按登录态真实抓包重写卡片链路——日常任务卡走 earn 同源 context 形+本次页面轮换hash（浏览器点击同款契约）、欢迎页"可领取"积分后台自动领取、isLocked/App-only卡片直接跳过。含v3.6.10 解除legacy签入连坐、v3.6.9 通道执行器多级回退）
+// @version      3.6.12
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.12：修复阅读/每日活动"入账延迟+轮内缓存"导致的完成误报——复核强制绕缓存+延迟+乐观标记；Server Action 直连补 x-deployment-id 指纹头；代理页未挂载时每日一次通知引导手动开页。含v3.6.11 卡片链路按登录态抓包重写）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -498,6 +498,19 @@ Notice:
                 }
             } catch (_) {}
             Utils.log("🟡", `后台代理标签页未就绪（${why}），本轮回退直连请求`);
+            // v3.6.12：每日至多一次浏览器通知，引导手动开页接通通道（代理页注入
+            // 失败时用户侧唯一可靠的替代是让任意 rewards 页面保持打开）
+            try {
+                const todayNum = Utils.getTodayNum();
+                if (GM_getValue("Config.proxyHintDate", 0) !== todayNum && GM_getValue("Notice.bro", true)) {
+                    GM_setValue("Config.proxyHintDate", todayNum);
+                    GM_notification({
+                        title: "🔗 同源转发通道未接通",
+                        text: "后台代理页未挂载，上报/领取正以直连运行（可能失败）。在浏览器打开任意 rewards.bing.com 页面并保持，即可接通（今日仅提醒一次）。",
+                        timeout: 15000
+                    });
+                }
+            } catch (_) {}
             return false;
         },
 
@@ -2317,6 +2330,19 @@ Notice:
             return cards;
         },
 
+        // 当前部署 ID（dpl）：真实浏览器的所有 Server Action 请求都携带
+        // x-deployment-id 头（2026-09-15 抓包实证）。直连路径此前缺这个头，
+        // 而 00:38 轮证明"带全量登录 cookie 的直连 POST 仍 500"——指纹自洽度
+        // 每补一分是一分。取值来自 _resolveReportActivityActionId 扫描 chunk
+        // 时持久化的 Config.reportAction.dpl。
+        _currentDpl() {
+            try {
+                const saved = GM_getValue("Config.reportAction", null);
+                if (saved && typeof saved.dpl === "string" && saved.dpl) return saved.dpl;
+            } catch (_) {}
+            return "";
+        },
+
         // 欢迎页“可领取 N”积分的真实领取（2026-09-14 登录态抓包实证：+6 分到账）：
         // POST https://rewards.bing.com/dashboard，body 为空参数数组 []，
         // next-action 为 claim 专用 ID（独立于 reportActivity，随部署轮换，且仅在
@@ -2338,11 +2364,13 @@ Notice:
                     if (ids.size === 1) actionId = [...ids][0];
                 }
             } catch (_) { /* 拿不到就用配置/兜底值 */ }
+            const dpl = this._currentDpl();
             const headers = {
                 "accept": "text/x-component",
                 "content-type": "text/plain;charset=UTF-8",
                 "next-action": actionId,
                 "next-router-state-tree": Utils.routerStateTree(DASH),
+                ...(dpl ? { "x-deployment-id": dpl } : {})
             };
             const cookie = await Utils.cookieHeaderFor(DASH);
             if (cookie) headers.cookie = cookie;
@@ -2372,11 +2400,13 @@ Notice:
             const referer = card.url || "https://rewards.bing.com/";
 
             const postEarnAction = async (hash, shape) => {
+                const dpl = this._currentDpl();
                 const headers = {
                     "accept": "text/x-component",
                     "content-type": "text/plain;charset=UTF-8",
                     "next-action": nextAction,
                     "next-router-state-tree": Utils.routerStateTree(EARN),
+                    ...(dpl ? { "x-deployment-id": dpl } : {})
                 };
                 const cookie = await Utils.cookieHeaderFor(EARN);
                 if (cookie) headers.cookie = cookie;
@@ -2803,16 +2833,21 @@ Notice:
                 return false;
             }
 
-            // 二次验证
-            const verify = await API.getReadProgress();
+            // 二次验证（v3.6.12 修复）：此前不带 fresh，复核命中的是轮内缓存的旧进度
+            // （2026-09-15 00:34 实测：10 篇读完立即复核仍 0/30，实为缓存旧值），导致
+            // "已执行但未完成"误报与汇总 ❌。现强制绕过缓存，并等一个入账延迟窗口；
+            // 同时乐观置 readDate——入口处有"readDate 已置则强制复核、不符则重置"守卫，
+            // 早置只会让汇总正确，不会漏做。
+            this.readDate = RewardsAuto.state.dateNowNum;
+            this.save();
+            await Utils.delay(12000);
+            const verify = await API.getReadProgress({ fresh: true });
             if (verify && verify.progress >= verify.max) {
-                this.readDate = RewardsAuto.state.dateNowNum;
-                this.save();
                 Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`, true);
                 return true;
             } else {
                 this.readTimes++;
-                Utils.log("🟡", "阅读已执行但未完成，下次运行继续");
+                Utils.log("🟡", `阅读已执行 ${successCount} 篇，入账确认延迟，下轮自动复核`);
                 return true;
             }
         },
@@ -3101,8 +3136,9 @@ Notice:
                     await Utils.randomDelay(4000, 8000);
                 }
 
-                // 复查完成状态（上报后的状态变化必须绕过缓存）
-                await Utils.randomDelay(4000, 8000);
+                // 复查完成状态（上报后的状态变化必须绕过缓存）；rnoreward 跳转入账
+                // 有数秒延迟（v3.6.12：4-8 秒实测偏短，出现过 0/3 误报后同轮二次扫描又确认成功）
+                await Utils.randomDelay(8000, 15000);
                 const after = await API.getDailySetItems({ fresh: true });
                 if (after && after.length > 0) {
                     const completedIds = new Set(after.filter(it => it.complete).map(it => it.offerId));
@@ -3150,7 +3186,7 @@ Notice:
             if (opened === 0) return false;
 
             // 打开链接只代表已触发操作，仍需以后端状态为准，避免把弹窗失败或页面结构变化误记为完成。
-            await Utils.randomDelay(4000, 8000);
+            await Utils.randomDelay(8000, 15000);
             const afterOpen = await API.getDailySetItems({ fresh: true });
             if (!afterOpen || afterOpen.length === 0) {
                 Utils.log("🟡", "每日活动链接已打开，但无法复查完成状态");
@@ -3443,6 +3479,7 @@ Notice:
                     }
                     : { offerid: offerId, form: offer.form || "$undefined" }
             ]);
+            const dpl = API._currentDpl();
             const reqOptions = {
                 method: "POST",
                 url: "https://rewards.bing.com/dashboard",
@@ -3453,7 +3490,8 @@ Notice:
                     "next-router-state-tree": Utils.routerStateTree("https://rewards.bing.com/dashboard"),
                     "origin": "https://rewards.bing.com",
                     "referer": "https://rewards.bing.com/dashboard",
-                    "user-agent": RewardsAuto.ua.pc
+                    "user-agent": RewardsAuto.ua.pc,
+                    ...(dpl ? { "x-deployment-id": dpl } : {})
                 },
                 data: body,
                 anonymous: false,

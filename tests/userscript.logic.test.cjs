@@ -235,7 +235,9 @@ test("a partial reading batch waits for the next run instead of immediate retry"
 
     assert.equal(result, true);
     assert.equal(reads, 10);
-    assert.equal(TaskManager.readDate, 0);
+    // v3.6.12：入账延迟下乐观标记今日已完成；下一轮入口会用 fresh 进度强制复核，
+    // 未满则重置并继续——既避免汇总 ❌ 误报，也不会漏做阅读
+    assert.equal(TaskManager.readDate, 20260731);
 });
 
 test("pending daily activities without an actionable URL stay incomplete", async () => {
@@ -1573,4 +1575,46 @@ test("discoverCards overlays earn live state: filters done/locked, restamps live
     // Array.from 在宿主 realm 收集（vm realm 的 map 结果跨 realm 原型比较会失败）
     assert.deepEqual(Array.from(cards, c => c.offerId), ["OPEN1"]);
     assert.equal(cards[0].hash, "c".repeat(64));
+});
+
+// ====== v3.6.12：入账延迟竞态修复 + x-deployment-id 指纹头 ======
+
+test("doRead verification bypasses the round cache and marks readDate optimistically", async () => {
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260915;
+    TaskManager.readDate = 0;
+    const calls = [];
+    API.getReadProgress = async opts => {
+        calls.push(opts);
+        return calls.length === 1 ? { progress: 0, max: 30 } : { progress: 30, max: 30 };
+    };
+    API.doRead = async () => ({ points: 3, isDuplicate: false });
+    Utils.randomDelay = async () => {};
+    Utils.delay = async () => {};
+
+    const ok = await TaskManager.doRead();
+
+    assert.equal(ok, true);
+    assert.equal(TaskManager.readDate, 20260915, "readDate must be set once the batch executed");
+    assert.equal(calls.length, 2);
+    // vm realm 对象跨 realm 深比较会失败，逐字段断言
+    assert.ok(calls[1] && calls[1].fresh === true, "post-batch verification must bypass the round cache");
+});
+
+test("server-action posts carry x-deployment-id when a dpl is known", async () => {
+    const posts = [];
+    const { API, Utils } = createHarness({
+        "Config.reportAction": { dpl: "20260912-2", id: "f".repeat(40) },
+    });
+    API._resolveReportActivityActionId = async () => "f".repeat(40);
+    Utils.fetchPage = async () => "<html></html>";
+    Utils.xhr = async o => { posts.push(o); return "1:ok"; };
+
+    await API.claimCard({ offerId: "O1", hash: "c".repeat(64), points: 10 });
+    await API.claimPendingPoints();
+
+    assert.equal(posts[0].url, "https://rewards.bing.com/earn");
+    assert.equal(posts[0].headers["x-deployment-id"], "20260912-2");
+    assert.equal(posts[1].url, "https://rewards.bing.com/dashboard");
+    assert.equal(posts[1].headers["x-deployment-id"], "20260912-2");
 });
