@@ -1411,6 +1411,39 @@ test("page proxy executor falls back fetch→uw.fetch→XHR→uw.XHR and always 
     assert.match(source, /x\.withCredentials = true/);
 });
 
+// ====== v3.6.10：解除已死 legacy 签入接口对阅读的连坐 ======
+
+test("sign 401 (dead legacy endpoint) no longer skips the read task", async () => {
+    const d = new Date();
+    const today = Number(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`);
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness({
+        // read 日期未完成 → 非空闲轮；其余今日已完成，缩短 runAll 实际路径
+        "Config.tasks": { sign: today, promos: today, search: today, streakDays: 0 },
+        "Config.dailySetDone": today,
+        "Config.punchCardBgDone": today,
+    });
+    let readRan = 0;
+    Utils.randomDelay = async () => {};
+    API.getBalance = async () => 100;
+    API.checkRegion = async () => true;
+    API.renewToken = async () => true;
+    API.discoverCards = async () => [];
+    API.getRewardsInfo = async () => null;
+    TaskManager.doSign = async () => { RewardsAuto.state.pc401 = true; return true; };
+    TaskManager.doRead = async () => { readRan++; return true; };
+    TaskManager.doPromos = async () => true;
+    TaskManager.doSearch = async () => true;
+    TaskManager.doStreak = async () => true;
+    TaskManager.doDailySet = async () => true;
+    TaskManager.doPunchCard = async () => true;
+    TaskManager.doClaimPoints = async () => true;
+
+    await TaskManager.runAll();
+
+    assert.ok(readRan > 0, "read must run even after signPC 401s");
+    assert.equal(RewardsAuto.state.pc401, true, "flag still recorded for diagnostics");
+});
+
 test("renewToken keeps an unused auth code on refresh success and logs it", async () => {
     const oldTime = Date.now() - 47 * 86400000;
     const savedCode = "https://login.live.com/oauth20_desktop.srf?code=FRESH-CODE";

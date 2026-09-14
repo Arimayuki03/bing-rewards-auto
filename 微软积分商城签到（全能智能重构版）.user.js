@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.9
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.9：同源转发通道执行器加固 fetch→unsafeWindow.fetch→XHR→unsafeWindow.XHR 逐级回退并随心跳上报模式，代理页失联原因可直接从日志读出；refresh 成功不再误清用户新粘贴的授权码+补"Token续期成功"日志；新菜单"强制用授权码换取新Token"）
+// @version      3.6.10
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.10：登录态页面实测坐实——同源真实cookie下每日活动Server Action返回200、通道方向正确；legacy签入接口已下线，解除其401对阅读任务的连坐与误导告警。含v3.6.9：转发执行器多级回退+心跳带mode、授权码不再误清、强制换Token菜单）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -1761,6 +1761,11 @@ Notice:
         },
 
         async signPC() {
+            // v3.6.10 实测（已登录页面同源对照实验）：legacy reportactivity 接口已被
+            // 服务端下线——真实页面同样 401，且页面源码中已不存在 RequestVerificationToken，
+            // flight 流中亦无 Gamification_DailyCheckIn。保留尝试以兼容区域/改版回滚，
+            // 但其失败不代表积分损失或会话过期（签入实际由 App 静默签入与搜索连签覆盖），
+            // 不得再用于连坐其他任务（见 runAll 中 pc401 的解除）。
             try {
                 const res = await this.reportActivity("Gamification_DailyCheckIn", "1", "https://rewards.bing.com/");
                 if (Utils.isJSON(res)) {
@@ -1769,7 +1774,7 @@ Notice:
                 }
             } catch (e) {
                 if (e.message?.includes("401")) RewardsAuto.state.pc401 = true;
-                Utils.log("🟡", `PC签入失败: ${e.message}`);
+                Utils.log("🔵", `PC签入（legacy，服务端已下线）跳过: ${e.message}`);
             }
             return -1;
         },
@@ -3705,18 +3710,17 @@ Notice:
             if (regionOK && isTokenOK) {
                 await withRetry(() => this.doSign(), "签到");
                 await Utils.randomDelay();
-                if (!RewardsAuto.state.pc401) {
-                    await withRetry(() => this.doRead(), "阅读");
-                    await Utils.randomDelay();
-                } else {
-                    Utils.log("🟡", "PC会话已过期，跳过阅读任务");
-                }
+                // v3.6.10：阅读不再被 pc401 连坐。doRead 走 DAPI（Token）通道，与
+                // PC 网页会话 cookie 无关；而 PC 签入依赖的 legacy reportActivity
+                // 路径已随站点改版下线（已登录页面同源请求同样 401、页面已无
+                // RequestVerificationToken），用它判"会话过期"会误伤每日阅读。
+                await withRetry(() => this.doRead(), "阅读");
+                await Utils.randomDelay();
             } else if (regionOK) {
-                // Token（DAPI）失败但 Cookie 可能仍有效，尝试 PC 签入
+                // Token（DAPI）失败时仍尝试 web 路径（App 静默签入在 doSign 内部）。
+                // v3.6.10：去掉"pc401 → Cookie 已过期请重新登录"的提示——实测 legacy
+                // 签入接口已下线（真实登录页面同样 401），该 401 不再能证明会话状态。
                 await withRetry(() => this.doSign(), "签到");
-                if (RewardsAuto.state.pc401) {
-                    Utils.log("🟡", "Cookie 已过期，请在浏览器登录 bing.com 后重试", true);
-                }
                 await Utils.randomDelay();
             }
 
