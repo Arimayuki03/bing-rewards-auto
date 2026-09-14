@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.6
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.6：claimCard 策略1 补显式 Cookie 头；前台打卡统一日期基准；运行锁改心跳续期，实例意外终止后 20 分钟自动让出）
+// @version      3.6.7
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.7：运行锁加固——心跳失联/持有超90分钟/过期值异常一律接管，跳过时记录持有者诊断，杜绝卡死实例把后台永久锁死）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2480,6 +2480,15 @@ Notice:
     // 后台停摆的最长时间从 60 分钟压缩到 20 分钟。
     const RUN_LOCK_EXPIRE_MS = 20 * 60 * 1000;
     const RUN_LOCK_HEARTBEAT_MS = 5 * 60 * 1000;
+    // v3.6.7 加固：心跳续期只能证明"持有实例还活着"，证明不了"任务还在推进"——
+    // 一个 await 永不返回的卡死轮次（如 SW 挂起/恢复后 promise 悬挂）会把锁无限
+    // 续期，令后台每轮跳过、永久停摆。接管判据因此从"仅看 expire"扩展为三条：
+    //   ① 心跳失联（lastBeat 超过 3 个心跳周期未刷新）→ 持有者已死或计时器冻结；
+    //   ② 总持有时长超过硬上限（90 分钟，约为最慢合法轮次的 3 倍）→ 判定卡死，
+    //      持有者停止续期，后来者允许接管；
+    //   ③ expire 异常超前（> 2 个过期窗口）→ 锁记录损坏/被写坏，视为无效。
+    const RUN_LOCK_STALE_BEAT_MS = 3 * RUN_LOCK_HEARTBEAT_MS;
+    const RUN_LOCK_MAX_HOLD_MS = 90 * 60 * 1000;
 
     const TaskManager = {
         // 任务日期状态
@@ -3432,18 +3441,35 @@ Notice:
         // 跨实例运行锁（尽力而为）：crontab 每 20 分钟触发一次新脚本实例，
         // 而一轮 runAll 可能耗时数分钟到二十分钟。用共享 storage 加锁，
         // 防止两个实例重叠执行造成重复搜索/上报。写入后回读校验降低竞态窗口；
-        // 锁在过期后自动让出，避免实例崩溃导致永久死锁（运行中由 runAll 的
-        // 心跳定期续期，过期窗口只需覆盖"实例死亡后到锁让出"的时间）。
+        // 锁记录含 {token, expire, lastBeat, acquiredAt}，持有者有效性按上述
+        // 三条接管判据综合判定，任何"永久占用"形态（含卡死但仍在心跳）都被兜住。
         _acquireRunLock(expireMs = RUN_LOCK_EXPIRE_MS) {
             try {
                 const key = "Config.runLock";
                 const now = Date.now();
                 const cur = GM_getValue(key, null);
-                if (cur && typeof cur.expire === "number" && cur.expire > now && cur.token) {
-                    return null; // 另一实例持有有效锁
+                if (cur && typeof cur.expire === "number" && cur.token) {
+                    // 旧版本锁记录无 lastBeat/acquiredAt：expire 总在"续期时刻+窗口"
+                    // 写入，据此回推最近一次写入时间；acquiredAt 缺失不参与上限判定。
+                    const beat = typeof cur.lastBeat === "number" ? cur.lastBeat : cur.expire - RUN_LOCK_EXPIRE_MS;
+                    const held = typeof cur.acquiredAt === "number" ? now - cur.acquiredAt : -1;
+                    const expireSane = cur.expire - now <= expireMs * 2;
+                    const alive = cur.expire > now && expireSane &&
+                        now - beat <= RUN_LOCK_STALE_BEAT_MS &&
+                        !(held > RUN_LOCK_MAX_HOLD_MS);
+                    // 无论让出还是接管，都记录持有者画像，供排查"谁在占锁"
+                    const detail = `持有者 ${String(cur.token).slice(0, 8)}…，` +
+                        `心跳 ${Math.max(0, Math.round((now - beat) / 1000))} 秒前，` +
+                        `已持有 ${held >= 0 ? `${Math.max(0, Math.round(held / 60000))} 分钟` : "?"}，` +
+                        `锁剩余 ${Math.max(0, Math.round((cur.expire - now) / 60000))} 分钟${expireSane ? "" : "（过期时间异常）"}`;
+                    if (alive) {
+                        Utils.log("🟡", `运行锁仍有效（${detail}）`);
+                        return null; // 另一实例持有有效锁
+                    }
+                    Utils.log("🟡", `运行锁已失效，直接接管（${detail}）`);
                 }
                 const token = Utils.getRandomUUID();
-                GM_setValue(key, { token, expire: now + expireMs });
+                GM_setValue(key, { token, expire: now + expireMs, lastBeat: now, acquiredAt: now });
                 const after = GM_getValue(key, null);
                 if (after && after.token && after.token !== token) return null; // 被并发实例覆盖，让出
                 return token;
@@ -3461,14 +3487,26 @@ Notice:
             } catch (_) {}
         },
 
-        // 续期运行锁：仅当锁仍归属本实例时延长过期时间（运行中心跳调用；
-        // 实例意外终止后心跳停止，锁在过期窗口内自动让出，不覆盖他人持有的锁）
-        _renewRunLock(token, expireMs = RUN_LOCK_EXPIRE_MS) {
+        // 续期运行锁：仅当锁仍归属本实例时延长过期时间并刷新心跳戳。
+        // 返回 false 表示"本实例不应再持有锁"（被他人接管，或总持有超过
+        // 上限判定卡死），调用方（心跳计时器）据此自停——卡死轮次的心跳
+        // 不会把锁永久续下去；存储读写异常时返回 true，维持无锁运行的宽容语义。
+        _renewRunLock(token) {
             try {
-                if (!token) return;
+                if (!token) return false;
                 const cur = GM_getValue("Config.runLock", null);
-                if (cur && cur.token === token) GM_setValue("Config.runLock", { token, expire: Date.now() + expireMs });
-            } catch (_) {}
+                if (!(cur && cur.token === token)) return false; // 锁已被他人接管，不再触碰
+                const now = Date.now();
+                const acquiredAt = typeof cur.acquiredAt === "number" ? cur.acquiredAt : now;
+                if (now - acquiredAt > RUN_LOCK_MAX_HOLD_MS) {
+                    Utils.log("🟡", `运行锁持有已超 ${Math.round(RUN_LOCK_MAX_HOLD_MS / 60000)} 分钟，判定本轮卡死，停止续期（锁将自动让出）`);
+                    return false;
+                }
+                GM_setValue("Config.runLock", { token, expire: now + RUN_LOCK_EXPIRE_MS, lastBeat: now, acquiredAt });
+                return true;
+            } catch (_) {
+                return true;
+            }
         },
 
         async runAll() {
@@ -3484,8 +3522,14 @@ Notice:
                 return;
             }
             // 运行锁心跳：运行中每 5 分钟续期，长任务（含最大搜索间隔配置）不会被
-            // 误判过期；实例意外终止后心跳停止，锁在 20 分钟窗口内自动让出。
-            this._lockHeartbeat = setInterval(() => this._renewRunLock(runLock), RUN_LOCK_HEARTBEAT_MS);
+            // 误判过期；实例意外终止后心跳停止，锁在心跳失联窗口内被接管。
+            // 续期被拒（锁被接管或总持有达上限）时计时器自停，卡死轮次不再永久锁死后台。
+            this._lockHeartbeat = setInterval(() => {
+                if (!this._renewRunLock(runLock)) {
+                    clearInterval(this._lockHeartbeat);
+                    this._lockHeartbeat = null;
+                }
+            }, RUN_LOCK_HEARTBEAT_MS);
             RewardsAuto.state.startTime = Utils.getTimestamp();
             Utils.log("🚀", "启动全能自动化任务...");
             this.init();

@@ -49,8 +49,8 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
         location: { hostname: "test.invalid", pathname: "/", search: "" },
         prompt() { return null; },
         setTimeout,
-        // runAll 的运行锁心跳通过计时器实现；记录启停供断言使用
-        setInterval: (fn, ms) => { intervals.set.push(ms); return intervals.set.length; },
+        // runAll 的运行锁心跳通过计时器实现；记录回调与周期供断言/手动触发使用
+        setInterval: (fn, ms) => { intervals.set.push({ fn, ms }); return intervals.set.length; },
         clearInterval: (id) => { intervals.cleared.push(id); },
     };
     context.globalThis = context;
@@ -1201,6 +1201,83 @@ test("runAll holds the run lock with a heartbeat and stops it when finished", as
     await TaskManager.runAll();
 
     // 心跳以 5 分钟周期启动，且在 runAll 结束时停止
-    assert.deepEqual(intervals.set, [5 * 60 * 1000]);
+    assert.deepEqual(intervals.set.map(i => i.ms), [5 * 60 * 1000]);
     assert.equal(intervals.cleared.length, 1);
+});
+
+// ====== v3.6.7：运行锁加固（心跳失联 / 持有上限 / 过期值异常 → 自动接管）======
+
+test("run lock takes over from stale heartbeat, exceeded hold ceiling, or corrupt expiry", () => {
+    const { TaskManager, storage } = createHarness();
+    const min = 60 * 1000;
+    const now = Date.now();
+
+    // ① 心跳失联：expire 仍有效，但 lastBeat 已 16 分钟未刷新（> 3 个心跳周期）
+    storage.set("Config.runLock", { token: "t1", expire: now + 15 * min, lastBeat: now - 16 * min, acquiredAt: now - 30 * min });
+    const g1 = TaskManager._acquireRunLock();
+    assert.ok(g1, "stale heartbeat must be taken over");
+    TaskManager._releaseRunLock(g1);
+
+    // ② 持有超上限：心跳新鲜，但 acquiredAt 是 91 分钟前（卡死但仍在心跳的实例）
+    storage.set("Config.runLock", { token: "t2", expire: now + 15 * min, lastBeat: now, acquiredAt: now - 91 * min });
+    const g2 = TaskManager._acquireRunLock();
+    assert.ok(g2, "over-ceiling hold must be taken over");
+    TaskManager._releaseRunLock(g2);
+
+    // ③ 过期时间异常：超大 expire 视同损坏锁
+    storage.set("Config.runLock", { token: "t3", expire: now + 365 * 24 * 60 * min, lastBeat: now, acquiredAt: now });
+    const g3 = TaskManager._acquireRunLock();
+    assert.ok(g3, "corrupt expiry must be taken over");
+    TaskManager._releaseRunLock(g3);
+
+    // 对照：心跳新鲜 + 持有在上限内的活锁必须继续挡住
+    storage.set("Config.runLock", { token: "t4", expire: now + 15 * min, lastBeat: now, acquiredAt: now });
+    assert.equal(TaskManager._acquireRunLock(), null);
+
+    // 对照：临界窗口内（心跳 14 分钟前、持有 40 分钟）仍判为有效，不误抢
+    storage.set("Config.runLock", { token: "t5", expire: now + 15 * min, lastBeat: now - 14 * min, acquiredAt: now - 40 * min });
+    assert.equal(TaskManager._acquireRunLock(), null);
+});
+
+test("renewal stamps heartbeat, declines at hold ceiling, never touches others' lock", () => {
+    const { TaskManager, storage } = createHarness();
+    const token = TaskManager._acquireRunLock();
+    assert.ok(token);
+
+    // 迁移：v3.6.6 旧记录无 lastBeat/acquiredAt，续期时补齐且不拒续
+    storage.set("Config.runLock", { token, expire: Date.now() + 19 * 60 * 1000 });
+    assert.equal(TaskManager._renewRunLock(token), true);
+    const rec = storage.get("Config.runLock");
+    assert.equal(typeof rec.lastBeat, "number");
+    assert.equal(typeof rec.acquiredAt, "number");
+
+    // 达到持有上限：拒绝续期且不改写锁记录（让锁自然过期，别的实例接管）
+    storage.set("Config.runLock", { ...rec, acquiredAt: Date.now() - 91 * 60 * 1000 });
+    const expireBefore = storage.get("Config.runLock").expire;
+    assert.equal(TaskManager._renewRunLock(token), false);
+    assert.equal(storage.get("Config.runLock").expire, expireBefore);
+
+    // 锁已被他人接管：拒绝且绝不覆盖
+    storage.set("Config.runLock", { token: "other", expire: Date.now() + 1000 });
+    assert.equal(TaskManager._renewRunLock(token), false);
+    assert.equal(storage.get("Config.runLock").token, "other");
+});
+
+test("runAll heartbeat timer stops itself once the hold ceiling is reached", async () => {
+    const { API, TaskManager, storage, intervals } = createHarness();
+    API.getBalance = () => new Promise(() => {}); // 挂在 try 内部，保持 runAll 运行中
+
+    const runPromise = TaskManager.runAll(); // 不会 resolve，本用例不等待它
+    assert.equal(intervals.set.length, 1);
+    assert.equal(intervals.cleared.length, 0);
+
+    // 把锁的持有时间拨到上限之外，模拟一次"卡死后到达上限"的心跳时刻
+    const rec = storage.get("Config.runLock");
+    storage.set("Config.runLock", { ...rec, acquiredAt: Date.now() - 91 * 60 * 1000 });
+    intervals.set[0].fn();
+
+    assert.equal(intervals.cleared.length, 1, "heartbeat must stop itself when renewal is declined");
+    assert.equal(storage.get("Config.runLock").expire, rec.expire, "declined renewal must not extend the lock");
+    assert.equal(intervals.set.length, 1);
+    void runPromise;
 });
