@@ -1394,14 +1394,19 @@ test("page leaves an injection marker and the SW timeout message triages the cau
     assert.ok(source.includes("「前台运行/网页脚本」开关与站点权限"));
 });
 
-// ====== v3.6.14：前台可视化诊断菜单 ======
+// ====== v3.6.15：诊断菜单只在页面上下文注册（后台注册是假阳性）======
 
-test("a menu command exposes on-page channel diagnostics for manual verification", () => {
+test("the channel diagnostic menu is registered on rewards pages only, before any early-return", () => {
     const source = fs.readFileSync(scriptPath, "utf8");
-    assert.match(source, /GM_registerMenuCommand\("🔗 通道诊断（本页）"/);
-    // 菜单必须读取注入标记与心跳，并提示"保持一个 rewards 页面打开"
-    assert.match(source, /通道诊断（本页）"[\s\S]{0,1200}?BingRewards_alive/);
-    assert.match(source, /至少保持一个 rewards\.bing\.com 页面打开/);
+    const rewards = source.indexOf('if (location.hostname === "rewards.bing.com") {');
+    const dash = source.indexOf('if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {');
+    assert.ok(rewards > 0 && dash > rewards);
+    // 页面上下文注册（紧跟 setupPageProxy 之后），且全文件仅此一处
+    const block = source.slice(rewards, dash);
+    assert.match(block, /setupPageProxy\(\);[\s\S]{0,200}?GM_registerMenuCommand\("🔗 通道诊断（本页）"/);
+    assert.equal(source.split('GM_registerMenuCommand("🔗 通道诊断（本页）"').length - 1, 1,
+        "background-registered diagnostic gives a false 'injection OK' (v3.6.14 bug)");
+    assert.match(block, /BingRewards_alive/);
 });
 
 // ====== v3.6.9：转发执行器多级回退 / 心跳带 mode / 授权码保留 ======

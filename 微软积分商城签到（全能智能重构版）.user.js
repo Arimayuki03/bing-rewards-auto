@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      3.6.14
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.14：新增"🔗 通道诊断（本页）"菜单——在 rewards 页面一键查看前台注入/执行器/心跳状态；含v3.6.13 注入标记失联分诊、v3.6.12 阅读复核竞态修复、v3.6.11 卡片链路按登录态抓包重写、同源转发通道）
+// @version      3.6.15
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v3.6.15：诊断菜单移至 rewards 页面上下文注册——后台注册会造成"注入正常"假阳性（v3.6.14 实测）；能否在页面脚本菜单看到"🔗 通道诊断（本页）"即前台注入判据。含同源转发通道、卡片链路按登录态抓包重写、阅读复核竞态修复）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -4042,6 +4042,35 @@ Notice:
     };
     if (location.hostname === "rewards.bing.com") {
         setupPageProxy();
+        // v3.6.15：诊断菜单只在此（页面上下文）注册——后台沙箱里注册的菜单会让
+        // 用户误以为前台注入正常（v3.6.14 实测假阳性）。能否在 rewards 页面的
+        // 脚本菜单里看到它，就是"前台注入是否生效"的一锤定音判据。
+        GM_registerMenuCommand("🔗 通道诊断（本页）", () => {
+            try {
+                const now = Date.now();
+                const alive = GM_getValue("BingRewards_alive", null);
+                const inj = GM_getValue("BingRewards_injected", null);
+                const age = ts => (typeof ts === "number" ? `${Math.max(0, Math.round((now - ts) / 1000))} 秒前` : "无");
+                const aliveStr = alive && typeof alive.ts === "number"
+                    ? `${age(alive.ts)}（mode=${alive.mode || "?"}，${now - alive.ts < 45000 ? "在线 ✅" : "已离线"}）`
+                    : "无";
+                const injStr = inj && typeof inj.ts === "number" ? `${age(inj.ts)} @ ${inj.url || "?"}` : "无";
+                const exec = typeof fetch === "function" ? "fetch"
+                    : (typeof XMLHttpRequest === "function" ? "XHR" : "无（将用 unsafeWindow 回退）");
+                alert([
+                    "上下文: rewards 页面（本页诊断）",
+                    "前台脚本注入: ✅ 正常（能看到本菜单即证明）",
+                    `本页可用执行器: ${exec}`,
+                    `最近注入标记: ${injStr}`,
+                    `通道心跳: ${aliveStr}`,
+                    "",
+                    "心跳长期'无/离线'时：保持本页或任意 rewards.bing.com 页面打开，",
+                    "后台每 20 分钟会自动复用它转发上报。",
+                ].join("\n"));
+            } catch (e) {
+                alert("诊断失败: " + (e && e.message || e));
+            }
+        });
         // 前台页面（含 /dashboard）先初始化运行起始日：dashboard 分支会在后台入口
         // init() 之前 return，TaskManager.init() 不会执行；若不在此设置，
         // clickPunchCards 等处理器会以 dateNowNum=0 读写打卡状态键，与其他页面的
@@ -4283,34 +4312,6 @@ Notice:
         if (code?.trim()) {
             GM_setValue("Config.code", code.trim());
             alert("已保存！");
-        }
-    });
-
-    // v3.6.14 前台诊断：在 rewards.bing.com 页面能看到本菜单 = 前台注入正常；
-    // 心跳长期"无/离线"则说明没有任何 rewards 页面保持打开（代理通道无从挂载）。
-    GM_registerMenuCommand("🔗 通道诊断（本页）", () => {
-        try {
-            const now = Date.now();
-            const alive = GM_getValue("BingRewards_alive", null);
-            const inj = GM_getValue("BingRewards_injected", null);
-            const age = ts => (typeof ts === "number" ? `${Math.max(0, Math.round((now - ts) / 1000))} 秒前` : "无");
-            const aliveStr = alive && typeof alive.ts === "number"
-                ? `${age(alive.ts)}（mode=${alive.mode || "?"}，${now - alive.ts < 45000 ? "在线 ✅" : "已离线"}）`
-                : "无";
-            const injStr = inj && typeof inj.ts === "number" ? `${age(inj.ts)} @ ${inj.url || "?"}` : "无";
-            const exec = typeof fetch === "function" ? "fetch"
-                : (typeof XMLHttpRequest === "function" ? "XHR" : "无（沙箱全封，将用 unsafeWindow 回退）");
-            alert([
-                "前台脚本注入: ✅ 正常（能看到本菜单即证明）",
-                `本页可用执行器: ${exec}`,
-                `最近注入标记: ${injStr}`,
-                `通道心跳: ${aliveStr}`,
-                "",
-                "心跳长期'无/离线'时：请在装 ScriptCat 的浏览器里",
-                "至少保持一个 rewards.bing.com 页面打开（后台会自动复用并经它转发上报）。",
-            ].join("\n"));
-        } catch (e) {
-            alert("诊断失败: " + (e && e.message || e));
         }
     });
 
