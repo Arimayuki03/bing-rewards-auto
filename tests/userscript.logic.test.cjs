@@ -5,7 +5,6 @@ const test = require("node:test");
 const vm = require("node:vm");
 
 const scriptPath = path.resolve(__dirname, "..", "微软积分商城签到（全能智能重构版）.user.js");
-const pageProxyPath = path.resolve(__dirname, "..", "微软积分商城签到-页面代理.user.js");
 
 function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     const storage = new Map(Object.entries(initialStorage));
@@ -64,6 +63,7 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
 
 test("claimCard returns false when all earn-action strategies fail (legacy path retired)", async () => {
     const { API, Utils } = createHarness();
+    API.appActivity = async () => null; // 无 Token：App 主路径不可用，静默落网页策略
     API._resolveReportActivityActionId = async () => "f".repeat(40);
     Utils.xhr = async () => { throw new Error("server action failed"); };
     Utils.fetchPage = async () => ""; // live hash 重试也拿不到 → 短路到放弃
@@ -1077,6 +1077,69 @@ test("claimCard opens a real background tab as the last resort and never fakes s
     assert.equal(openTabs.length, 1, "非 bing.com 链接不得开标签页");
 });
 
+// ====== v4.1.0：App 上报 p:0 静默吸收标定（2026-09-16 真实账号实测）======
+
+test("claimCard treats App p:0 non-duplicate response as not-credited and falls through", async () => {
+    // 实测：WW_Rewards_locked_level2_Sep26w3_offer2 不在 App 目录内（cn/my/us/sg 四区域
+    // promotions 均无），DAPI 上报一律 200 + p:0 + isDuplicate:false——服务端静默吸收。
+    // claimCard 不得把它当成功，必须落到网页策略。
+    const { API, Utils } = createHarness();
+    API.appActivity = async () => ({ points: 0, isDuplicate: false, balance: 4260 });
+    API._resolveReportActivityActionId = async () => "c".repeat(42);
+    const posts = [];
+    Utils.xhr = async options => {
+        if (options.method === "POST") posts.push(options);
+        return "0:{\"a\":\"$@1\"}\n1:true\n";
+    };
+
+    const ok = await API.claimCard({ offerId: "WW_locked", hash: "h1" });
+
+    assert.equal(ok, true, "网页 Server Action 兜底承接");
+    assert.equal(posts.length, 1, "p:0 非 duplicate 必须继续走 earn 策略而不是短路");
+});
+
+test("claimCard accepts App report when points are credited or duplicate-confirmed", async () => {
+    const { API, Utils } = createHarness();
+    // 实测：Gamification_DailySet_Child3 App 上报 +10p（balance 4118→4128）
+    let mode = "credited";
+    API.appActivity = async () => mode === "credited"
+        ? { points: 10, isDuplicate: false, balance: 4128 }
+        : { points: 0, isDuplicate: true, balance: 4128 };
+    let posts = 0;
+    Utils.xhr = async () => { posts++; return "1:true\n"; };
+
+    assert.equal(await API.claimCard({ offerId: "Child3", hash: "h1" }), true);
+    assert.equal(posts, 0, "入账成功后不得再发任何网页请求");
+
+    mode = "duplicate";
+    assert.equal(await API.claimCard({ offerId: "Child3", hash: "h1" }), true);
+    assert.equal(posts, 0, "幂等确认同样短路，不发网页请求");
+});
+
+test("doDailySet App ladder keeps p:0 offers pending for the web fallback", async () => {
+    // 实测标定同样约束 doDailySet 阶梯0：p:0 + isDuplicate:false 的每日活动
+    // 不得从待办清单出列（否则 Server Action 阶梯被跳过）。
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260916;
+    Utils.randomDelay = async () => {};
+    RewardsAuto.state.token = "tok";
+    API.getDailySetItems = async () => [
+        { offerId: "Gamification_DailySet_Test_Child1", hash: "h1", points: 10, complete: false, url: "https://cn.bing.com/x" },
+    ];
+    API.appActivity = async () => ({ points: 0, isDuplicate: false, balance: 4260 });
+    const sent = [];
+    TaskManager._extractDailySetHashes = async (pendingItems) => {
+        sent.push(pendingItems.map(it => it.offerId));
+        return []; // 走到链接兜底前即结束，不需要完整链路
+    };
+    TaskManager._extractDailySetUrls = async () => [];
+
+    await TaskManager.doDailySet();
+
+    assert.deepEqual(sent[0], ["Gamification_DailySet_Test_Child1"],
+        "App p:0 非 duplicate 的活动必须留在 pending 清单进入网页阶梯");
+});
+
 // ====== v3.6.2：Server Action 与真实浏览器行为对齐 ======
 
 test("jsTimezoneOffset keeps the raw JS sign for the new server action", () => {
@@ -1173,52 +1236,29 @@ test("claimCard strategy 1 (earn action) attaches the explicit cookie header", a
     assert.equal(posts[0].anonymous, true, "v3.7.0：显式链可用时关掉自动附带的碎片 cookie");
 });
 
-test("page-proxy script fixes the run date and keeps the bgprobe tab passive", () => {
-    const source = fs.readFileSync(pageProxyPath, "utf8");
-    // 前台块自带日期初始化：dashboard 分支在后台任务入口之前 return，
-    // 否则 clickPunchCards 以 dateNowNum=0 读写打卡状态键（与其他页面日期错位）
-    assert.match(source, /RewardsAuto\.state\.dateNowNum = Utils\.getTodayNum\(\);/);
-    assert.match(source, /RewardsAuto\.state\.dateNowStr = Utils\.getTodayStr\(\);/);
-    // 后台救援标签页（?bgprobe=1）只维持转发通道，打卡处理器与 DOM 自动处理都必须早退
-    assert.match(source, /if \(location\.search\.includes\("bgprobe"\)\) return;/);
+// ====== v4.1.0：页面代理脚本与注入标记分诊随转发通道一并退役 ======
+
+test("background script retires the page channel entirely", () => {
+    const source = fs.readFileSync(scriptPath, "utf8");
+    // 救援标签页/共享存储转发协议/注入标记分诊必须全部消失
+    assert.doesNotMatch(source, /ensurePageChannel/);
+    assert.doesNotMatch(source, /pageRequest/);
+    assert.doesNotMatch(source, /_pageRouted/);
+    assert.doesNotMatch(source, /_pageChannelOff|_pageRescueUsed|_pageTabHandle/);
+    assert.doesNotMatch(source, /BingRewards_req|BingRewards_resp|BingRewards_alive|BingRewards_injected/);
+    assert.doesNotMatch(source, /bgprobe|claimnow/);
+    assert.doesNotMatch(source, /Config\.pageProxy/);
+    // 头部架构说明不再指引安装页面代理脚本
+    assert.ok(!source.includes("页面代理脚本未注入"));
 });
 
-test("v3.8.0 split: page-proxy script carries the front-end channel and shares storage", () => {
-    const source = fs.readFileSync(pageProxyPath, "utf8");
-    assert.match(source, /@storageName\s+BingRewardsAuto_Shared/, "必须与后台脚本同存储区，桥接才成立");
-    assert.doesNotMatch(source, /^\/\/ @crontab/m, "页面代理脚本不得带 @crontab 元数据（否则又变回不注入的后台脚本）");
-    assert.match(source, /@match\s+https:\/\/rewards\.bing\.com\/\*/);
-    assert.match(source, /const setupPageProxy = \(\) =>/);
-    assert.match(source, /GM_addValueChangeListener\("BingRewards_req"/);
-    assert.match(source, /GM_setValue\("BingRewards_alive"/);
-    assert.match(source, /通道诊断（本页）/);
-});
-
-test("v3.9.0 bridge-free claiming: SW opens claimnow tab and page proxy sweeps pending offers", () => {
-    const bg = fs.readFileSync(scriptPath, "utf8");
-    assert.match(bg, /bgprobe=1&claimnow=1/, "救援页 URL 必须带 claimnow 触发扫描");
-    const pg = fs.readFileSync(pageProxyPath, "utf8");
-    assert.match(pg, /const runClaimSweep = async \(\) =>/);
-    assert.match(pg, /const maybeSweep = \(\) =>/);
-    assert.match(pg, /setupPageProxy\(\);[\s\S]{0,40}maybeSweep\(\);/, "rewards 块内必须接线扫描");
-    assert.match(pg, /bw_sweep_last/, "localStorage 节流独立于扩展存储桥");
-    assert.match(pg, /claimnow=1/);
-    assert.match(pg, /"1:true"/, "扫描领取使用与后台一致的严格判据");
-    // flight 正则必须与后台解析器同构（双反斜杠字符类）
-    assert.ok(pg.includes('((?:[^"' + String.fromCharCode(92, 92) + ']|' + String.fromCharCode(92, 92) + '.)*)'));
-});
-
-test("v3.8.0 split: background script keeps the SW side and drops dead page code", () => {
+test("v4.1.0 background script keeps crontab and drops all page-side code", () => {
     const source = fs.readFileSync(scriptPath, "utf8");
     assert.match(source, /@crontab/, "后台脚本保留 @crontab 定时能力");
-    assert.match(source, /@storageName\s+BingRewardsAuto_Shared/);
-    // 页面执行器/DOM 处理器已迁出——后台脚本不再包含注入页面才生效的死代码
+    // 页面执行器/DOM 处理器已退役——后台脚本不再包含注入页面才生效的死代码
     assert.doesNotMatch(source, /const setupPageProxy/);
     assert.doesNotMatch(source, /clickPunchCards/);
     assert.doesNotMatch(source, /autoClaimPoints/);
-    // 后台侧转发协议与失联分诊仍在，且指引指向页面代理脚本
-    assert.match(source, /GM_setValue\("BingRewards_req"/);
-    assert.match(source, /页面代理/);
 });
 
 test("run lock defaults to a 20-minute expiry and renewal only extends the owner's lock", () => {
@@ -1335,89 +1375,36 @@ test("runAll heartbeat timer stops itself once the hold ceiling is reached", asy
     void runPromise;
 });
 
-// ====== v3.6.8：rewards.bing.com 前台同源转发通道 ======
+// ====== v4.1.0：前台同源转发通道退役，rewards 域请求一律 SW 直连 ======
 
-test("rewards.bing.com requests ride the page channel when a live page heartbeats", async () => {
-    let swCalls = 0;
-    const gmXhr = o => { swCalls++; o.onload({ status: 200, responseText: "SW", responseHeaders: "" }); };
+test("rewards.bing.com requests go straight to SW without any page channel", async () => {
+    const calls = [];
+    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW", responseHeaders: "" }); };
     const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now() } }, { gmXhr });
-    Utils.getRandomUUID = () => "req-fixed-0001"; // 固定转发请求 id，便于预置回包
-    storage.set("BingRewards_resp", { id: "req-fixed-0001", ok: true, status: 200, text: "RSC:OK", headers: "x: y" });
 
     const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "[1]" });
 
-    assert.equal(body, "RSC:OK");
-    assert.equal(swCalls, 0, "channel hit must not issue an SW request");
-    assert.equal(storage.get("BingRewards_req").url, "https://rewards.bing.com/dashboard");
+    assert.equal(body, "SW");
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0], "https://rewards.bing.com/dashboard");
+    assert.equal(storage.get("BingRewards_req"), undefined, "channel is retired: no request may be forwarded via shared storage");
 });
 
-test("page-channel non-2xx keeps acceptErrorBody / rejection semantics", async () => {
-    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now() } });
-    Utils.getRandomUUID = () => "req-fixed-0002";
-    storage.set("BingRewards_resp", { id: "req-fixed-0002", ok: true, status: 500, text: "E80", headers: "" });
+test("SW non-2xx keeps acceptErrorBody / rejection semantics", async () => {
+    let n = 0;
+    const gmXhr = o => {
+        n++;
+        if (n === 1) o.onload({ status: 500, responseText: "E80", responseHeaders: "" });
+        else o.onload({ status: 401, responseText: "", responseHeaders: "" });
+    };
+    const { Utils } = createHarness({}, { gmXhr });
     const r = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", acceptErrorBody: true });
     assert.equal(r.status, 500);
     assert.equal(r.body, "E80");
 
-    Utils.getRandomUUID = () => "req-fixed-0003";
-    storage.set("BingRewards_resp", { id: "req-fixed-0003", ok: true, status: 401, text: "", headers: "" });
     await assert.rejects(
         () => Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard" }),
         /HTTP 401/);
-});
-
-test("page execution failure falls back to the direct SW path", async () => {
-    const calls = [];
-    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
-    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now() } }, { gmXhr });
-    Utils.getRandomUUID = () => "req-fixed-0004";
-    storage.set("BingRewards_resp", { id: "req-fixed-0004", ok: false, err: "CORS blocked" });
-
-    const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "d" });
-
-    assert.equal(body, "SW-OK");
-    assert.deepEqual(calls, ["https://rewards.bing.com/dashboard"]);
-});
-
-test("without live page or tab capability the channel disables once and goes direct", async () => {
-    const calls = [];
-    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
-    const { Utils, RewardsAuto } = createHarness({}, { gmXhr });
-    // harness 的 GM_openInTab 返回 undefined：救援不可用 → 通道立即禁用，绝不挂 25 秒
-
-    const body = await Utils.xhr({ url: "https://rewards.bing.com/earn" });
-
-    assert.equal(body, "SW-OK");
-    assert.equal(RewardsAuto._pageChannelOff, true);
-    assert.equal(RewardsAuto._pageRescueUsed, true);
-    await Utils.xhr({ url: "https://rewards.bing.com/earn" });
-    assert.equal(calls.length, 2, "disabled channel: later requests go direct without retrying the tab");
-});
-
-test("www.bing.com requests are never routed through the page channel", async () => {
-    const calls = [];
-    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
-    const { Utils } = createHarness({ "BingRewards_alive": { ts: Date.now() } }, { gmXhr });
-
-    const body = await Utils.xhr({ url: "https://www.bing.com/search?q=abc" });
-
-    assert.equal(body, "SW-OK");
-    assert.equal(calls.length, 1);
-});
-
-test("front-end wires the proxy and gives bgprobe tabs a DOM-processing-free mode", () => {
-    // v3.8.0：页面侧代码整体迁至《页面代理》脚本（后台脚本因 @crontab 不注入页面）
-    const source = fs.readFileSync(pageProxyPath, "utf8");
-    // 页面侧：执行器带真实 cookie（fetch credentials:include / xhr withCredentials 已在
-    // v3.6.9 执行器测试中断言），监听器把请求交给执行器执行并回包
-    assert.match(source, /const pageProxyExecutor = \(\) => \{[\s\S]*?credentials: "include"/);
-    assert.match(source, /GM_addValueChangeListener\("BingRewards_req"[\s\S]{0,1200}?await ex\.exec\(req\)/);
-    // 通道挂在 rewards.bing.com 块最前，先于 dashboard 分支
-    const rewards = source.indexOf('if (location.hostname === "rewards.bing.com") {');
-    const dash = source.indexOf('if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {');
-    assert.ok(rewards > 0 && rewards < dash);
-    assert.match(source.slice(rewards, rewards + 120), /setupPageProxy\(\);/);
-    assert.match(source.slice(dash, dash + 500), /location\.search\.includes\("bgprobe"\)/);
 });
 
 test("background detection uses hostname, not just typeof document (sandbox has document)", () => {
@@ -1428,67 +1415,7 @@ test("background detection uses hostname, not just typeof document (sandbox has 
 
 // ====== v3.6.13：页面注入标记与失联分诊 ======
 
-test("page leaves an injection marker and the SW timeout message triages the cause", () => {
-    const pageSrc = fs.readFileSync(pageProxyPath, "utf8");
-    // 代理页挂载前先写注入标记（区分"未注入"与"注入但无心跳"）
-    assert.match(pageSrc, /const setupPageProxy = \(\) => \{\s*[^}]*?GM_setValue\("BingRewards_injected"/);
-    // v3.8.0：未就绪分诊文案指向页面代理脚本（旧「前台运行开关」排查路径已作废——
-    // 根因是 @crontab 后台脚本类别不注入页面，与用户侧开关无关）
-    const bgSrc = fs.readFileSync(scriptPath, "utf8");
-    assert.ok(bgSrc.includes('"BingRewards_injected"'));
-    assert.ok(bgSrc.includes("页面代理脚本未注入"));
-    assert.ok(!bgSrc.includes("「前台运行/网页脚本」开关与站点权限"));
-});
-
-// ====== v3.6.15：诊断菜单只在页面上下文注册（后台注册是假阳性）======
-
-test("the channel diagnostic menu is registered on rewards pages only, before any early-return", () => {
-    const source = fs.readFileSync(pageProxyPath, "utf8");
-    const rewards = source.indexOf('if (location.hostname === "rewards.bing.com") {');
-    const dash = source.indexOf('if (location.hostname === "rewards.bing.com" && location.pathname === "/dashboard") {');
-    assert.ok(rewards > 0 && dash > rewards);
-    // 页面上下文注册（紧跟 setupPageProxy 之后），且全文件仅此一处
-    const block = source.slice(rewards, dash);
-    assert.match(block, /setupPageProxy\(\);[\s\S]{0,200}?GM_registerMenuCommand\("🔗 通道诊断（本页）"/);
-    assert.equal(source.split('GM_registerMenuCommand("🔗 通道诊断（本页）"').length - 1, 1,
-        "background-registered diagnostic gives a false 'injection OK' (v3.6.14 bug)");
-    assert.ok(!fs.readFileSync(scriptPath, "utf8").includes("通道诊断（本页）"),
-        "v3.8.0：诊断菜单只存在于页面代理脚本");
-    assert.match(block, /BingRewards_alive/);
-});
-
-// ====== v3.6.9：转发执行器多级回退 / 心跳带 mode / 授权码保留 ======
-
-test("a mode:none heartbeat disables the channel instead of per-request timeouts", async () => {
-    const calls = [];
-    const gmXhr = o => { calls.push(o.url); o.onload({ status: 200, responseText: "SW-OK", responseHeaders: "" }); };
-    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now(), mode: "none" } }, { gmXhr });
-
-    const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "d" });
-
-    assert.equal(body, "SW-OK");
-    assert.equal(calls.length, 1);
-    assert.equal(storage.get("BingRewards_req"), undefined, "no request may be forwarded to a dead executor");
-});
-
-test("non-fetch executor modes (xhr/uwfetch) still route through the page channel", async () => {
-    const { Utils, storage } = createHarness({ "BingRewards_alive": { ts: Date.now(), mode: "xhr" } });
-    Utils.getRandomUUID = () => "req-fixed-0005";
-    storage.set("BingRewards_resp", { id: "req-fixed-0005", ok: true, status: 200, text: "RSC:XHR", headers: "" });
-
-    const body = await Utils.xhr({ method: "POST", url: "https://rewards.bing.com/dashboard", data: "d" });
-
-    assert.equal(body, "RSC:XHR");
-});
-
-test("page proxy executor falls back fetch→uw.fetch→XHR→uw.XHR and always heartbeats", () => {
-    const source = fs.readFileSync(pageProxyPath, "utf8");
-    assert.match(source, /const pageProxyExecutor = \(\) => \{[\s\S]*?typeof uw\.fetch === "function"[\s\S]*?typeof XMLHttpRequest === "function"[\s\S]*?typeof uw\.XMLHttpRequest === "function"[\s\S]*?return null;/);
-    // 即使没有任何执行器也必须心跳上报 mode:"none"（后台据此立即禁用，不再干等 25s）
-    assert.match(source, /mode: ex \? ex\.mode : "none"/);
-    // XHR 通道带 cookie 的关键配置
-    assert.match(source, /x\.withCredentials = true/);
-});
+// ====== v4.1.0：转发执行器/注入标记/诊断菜单随通道一并退役（测试移除）======
 
 // ====== v3.6.10：解除已死 legacy 签入接口对阅读的连坐 ======
 

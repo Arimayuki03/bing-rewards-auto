@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.0.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.0.0 路线定案：卡片/每日活动领取主路径改为 DAPI App 上报 type 101+offerid——Bearer 鉴权、无 cookie/Origin 依赖、SW 直连实测入账，彻底绕开 Next.js Server Action 的扩展身份拒收与页面注入依赖；Server Action 链降为兜底；v3.7.0 入账判据 1:true、v3.9.0 页面代理自扫描保留为二级兜底）
+// @version      4.1.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.1.0：App 上报（DAPI type 101+offerid，Bearer 鉴权）为卡片/每日活动唯一实测入账通道；v4.0.0 页面代理同源转发通道与救援标签页整体退役，全部请求 SW 直连；实测标定：服务端对 App 目录外 offer 静默返回 200+p:0，isDuplicate 仅同一 activity id 幂等）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -38,11 +38,11 @@
 // @storageName  BingRewardsAuto_Shared
 // ==/UserScript==
 //
-// ⚠️ 架构说明（v3.8.0）：@crontab 使本脚本被 ScriptCat 归类为「后台脚本」——只在扩展
-// 后台运行、不注入任何页面（弹窗「当前页运行脚本」永远 0/0 属正常现象）。rewards 页面
-// 侧的同源转发执行器、打卡 DOM 处理、OAuth 授权码捕获在配套脚本《微软积分商城签到-页面代理》
-// 中，二者通过相同 @storageName 的共享存储按 BingRewards_req/resp/alive 协议桥接。
-// 页面代理脚本未安装时本脚本仍可独立运行（全部请求走 SW 直连，Server Action 会失败）。
+// ⚠️ 架构说明：@crontab 使本脚本被 ScriptCat 归类为「后台脚本」——只在扩展
+// 后台运行、不注入任何页面（弹窗「当前页运行脚本」永远 0/0 属正常现象）。
+// v4.1.0：前台同源转发通道（页面代理脚本 + 救援标签页）整体退役——App 上报
+// （DAPI type 101）实测为主路径入账通道后，Server Action 网页链仅存兜底价值，
+// 不再为它维持页面注入/共享存储桥/救援标签页。全部请求走 SW 直连。
 
 /* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab, GM_addValueChangeListener */
 
@@ -54,10 +54,6 @@ Config:
         default: true
     lock:
         title: 锁定国区（非大陆IP自动停止）
-        type: checkbox
-        default: true
-    pageProxy:
-        title: rewards.bing.com 请求优先经前台标签页同源转发（带真实登录cookie，推荐开启）
         type: checkbox
         default: true
     span:
@@ -155,13 +151,9 @@ Notice:
 (function() {
     'use strict';
 
-    // OAuth 授权码自动捕获（v3.8.0 迁出至页面代理脚本：后台脚本不注入页面，此处原为死代码）
+    // OAuth 授权码自动捕获（v3.8.0 随页面注入能力一并退役：后台脚本不注入页面）
 
     const RewardsAuto = {
-        // v3.6.8 前台同源转发通道状态：救援标签页句柄 / 本轮是否已尝试救援 / 本轮通道是否已禁用
-        _pageTabHandle: null,
-        _pageRescueUsed: false,
-        _pageChannelOff: false,
         // UA: pc=Edge桌面, mobile=Edge移动, app=BingSapphire真机抓包
         ua: {
             pc: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
@@ -439,124 +431,11 @@ Notice:
             }));
         },
 
-        // ====== 前台同源转发通道 · 后台侧（v3.6.8 建，v3.8.0 定位为唯一可用执行环境）======
-        // v3.7.0 抓包终局：完整 cookie 链（GM_cookie 146 条实证）+ 全套指纹的 SW 直连
-        // 依旧 500（恒定 digest 3825388015@E80）——扩展上下文的请求身份被浏览器强制改写
-        // （Origin 等禁改头），Next.js Server Action 拒收，任何 header 对齐都无法修复。
-        // 页面上下文 fetch 是唯一与真实点击等效的执行环境（实测 /earn、/dashboard 均
-        // 200+1:true 入账）。页面侧执行器在《微软积分商城签到-页面代理》脚本中，
-        // 两脚本以相同 @storageName 共享存储桥接。
-        // 页面侧协议：BingRewards_alive={ts} 心跳（20s）；BingRewards_req={id,method,url,
-        // headers,data} 请求；BingRewards_resp={id,ok,status,text,finalUrl,headers} 回包。
-        _pageRouted(url) {
-            return typeof url === "string" && /^https:\/\/rewards\.bing\.com\//i.test(url) &&
-                GM_getValue("Config.pageProxy", true);
-        },
-
-        _pageChannelAlive() {
-            try {
-                const a = GM_getValue("BingRewards_alive", null);
-                // 心跳每 20 秒一次，45 秒容差（>2 个周期）判定页面在线；
-                // v3.6.9：页面若明确报告无任何可用执行器（mode:"none"），视同不可用
-                if (!(a && typeof a.ts === "number" && Date.now() - a.ts < 45000)) return false;
-                return a.mode !== "none";
-            } catch (_) { return false; }
-        },
-
-        // 确保通道可用：有活页面直接用；没有则开一个隐藏代理标签页（dashboard?bgprobe，
-        // 该页只挂转发监听、不跑前台 DOM 自动处理）等心跳出现。
-        // 每轮至多救援一次；救援失败或环境不支持时本轮禁用通道，避免反复开标签页。
-        async ensurePageChannel() {
-            if (this._pageChannelAlive()) return true;
-            if (RewardsAuto._pageChannelOff || RewardsAuto._pageRescueUsed) return false;
-            RewardsAuto._pageRescueUsed = true;
-            try {
-                // v3.9.0：claimnow=1 让页面代理脚本（若注入成功）强制执行一轮桥无关自扫描
-                // 领取——即使 @storageName 共享存储不生效、req/resp 桥不可用，卡片也能经
-                // 页面上下文入账，由下一轮 discoverCards/复核验证到账。
-                const handle = GM_openInTab("https://rewards.bing.com/dashboard?bgprobe=1&claimnow=1", { active: false, insert: false });
-                if (handle && typeof handle === "object") RewardsAuto._pageTabHandle = handle;
-            } catch (_) {}
-            if (!RewardsAuto._pageTabHandle) {
-                RewardsAuto._pageChannelOff = true; // 无法开标签页（环境不支持），本轮直接请求
-                return false;
-            }
-            Utils.log("🔗", "已打开后台代理标签页，等待同源通道就绪...");
-            const deadline = Date.now() + 25000;
-            while (Date.now() < deadline) {
-                await Utils.delay(1000);
-                if (this._pageChannelAlive()) return true;
-            }
-            RewardsAuto._pageChannelOff = true; // 代理页未响应（被重定向到登录/未注入/无执行器）
-            let why = "代理页无心跳";
-            try {
-                const a = GM_getValue("BingRewards_alive", null);
-                const inj = GM_getValue("BingRewards_injected", null);
-                if (a && typeof a.ts === "number") {
-                    why = `心跳 ${Math.max(0, Math.round((Date.now() - a.ts) / 1000))} 秒前、mode=${a.mode || "?"}`;
-                } else if (inj && typeof inj.ts === "number" && Date.now() - inj.ts < 120000) {
-                    why = "rewards 页面脚本已注入但代理页无心跳（页面可能被重定向到登录）";
-                } else {
-                    why = "页面代理脚本未注入（未安装/未启用《微软积分商城签到-页面代理》脚本，或扩展前台注入被禁）";
-                }
-            } catch (_) {}
-            Utils.log("🟡", `后台代理标签页未就绪（${why}），本轮回退直连请求`);
-            // v3.6.12：每日至多一次浏览器通知，引导手动开页接通通道（代理页注入
-            // 失败时用户侧唯一可靠的替代是让任意 rewards 页面保持打开）
-            try {
-                const todayNum = Utils.getTodayNum();
-                if (GM_getValue("Config.proxyHintDate", 0) !== todayNum && GM_getValue("Notice.bro", true)) {
-                    GM_setValue("Config.proxyHintDate", todayNum);
-                    GM_notification({
-                        title: "🔗 同源转发通道未接通",
-                        text: "后台代理页未挂载，上报/领取正以直连运行（可能失败）。确认已安装并启用《微软积分商城签到-页面代理》脚本，然后打开任意 rewards.bing.com 页面并保持，即可接通（今日仅提醒一次）。",
-                        timeout: 15000
-                    });
-                }
-            } catch (_) {}
-            return false;
-        },
-
-        // 把一个请求转交前台页面同源执行；成功返回 {status,text,finalUrl,headers}，
-        // 失败/超时返回 null，由调用方回退 SW 直连（转发失败绝不能演变为任务失败）。
-        async pageRequest(options, waitMs = 22000) {
-            try {
-                const id = Utils.getRandomUUID();
-                GM_setValue("BingRewards_req", {
-                    id,
-                    method: (options.method || "GET").toUpperCase(),
-                    url: options.url,
-                    headers: options.headers || {},
-                    data: options.data,
-                });
-                const deadline = Date.now() + waitMs;
-                while (Date.now() < deadline) {
-                    await Utils.delay(250);
-                    const r = GM_getValue("BingRewards_resp", null);
-                    if (!r || r.id !== id) continue; // 旧回包/他人回包：忽略
-                    return (r.ok && typeof r.status === "number") ? r : null; // 页面执行失败 → 回退直连
-                }
-                return null; // 页面未应答（被关闭/正在导航）→ 回退直连
-            } catch (_) { return null; }
-        },
-
         // 封装 GM_xmlhttpRequest，15秒超时。
         // GET 重定向自动跟随并返回最终页面内容（earn/dashboard 常见区域跳转），
         // 避免调用方拿到 Location 字符串后误当 HTML 解析、静默失败；非 GET 请求
         // 遇重定向仍返回 Location（或 false），由调用方决定后续处理。
-        // rewards.bing.com 的请求优先尝试前台页面同源转发（真实登录 cookie），
-        // 通道不可用/转发失败时无感回退下面的 SW 直连路径。
         async xhr(options, _redirects = 0) {
-            if (_redirects === 0 && this._pageRouted(options && options.url)) {
-                if (await this.ensurePageChannel()) {
-                    const via = await this.pageRequest(options);
-                    if (via) {
-                        if (via.status >= 200 && via.status < 300) return via.text || "";
-                        if (options.acceptErrorBody) return { status: via.status, body: via.text || "", headers: via.headers || "" };
-                        throw new Error(`HTTP ${via.status}（同源转发）`);
-                    }
-                }
-            }
             return new Promise((resolve, reject) => {
                 const start = Date.now();
                 const isGetLike = !options.method || options.method.toUpperCase() === "GET";
@@ -2444,11 +2323,13 @@ Notice:
         // 200 即上报受理；earn 响应是 RSC 流、不含 `1:true`，是否入账交由调用方的
         // "复核 + 连续 N 轮放弃"机制判定，此处不看响应文本。
         async claimCard(card) {
-            // 策略0（v4.0.0 主路径）：DAPI App 上报 type 101 + offerid——Bearer 鉴权、
+            // 策略0（主路径）：DAPI App 上报 type 101 + offerid——Bearer 鉴权、
             // 无 cookie/Origin 依赖，SW 直连实测真实入账（2026-09-15：Child3 +10p，
-            // balance 4118→4128）。isDuplicate:true 即已入账幂等确认，同样成功。
-            // 无 Token / 该 offer 非 App 可见（4xx）时返回 null，静默落到下方网页
-            // Server Action 路径兜底。
+            // balance 4118→4128）。isDuplicate:true 即同 activity id 幂等确认，同样成功。
+            // v4.1.0 实测标定（2026-09-16）：服务端对 App 目录外/锁定/未开始的 offer
+            // 一律静默 200 + p:0 + isDuplicate:false（WW_Rewards_locked_level2 与已完成
+            // Child3 换 id 重报均为 p:0）——这类响应不代表入账，必须视为"App 上报未受理"，
+            // 落到下方网页策略兜底，绝不能当成功短路。
             const appRes = await this.appActivity(101, card.offerId, true);
             if (appRes && (appRes.points > 0 || appRes.isDuplicate)) {
                 Utils.log("📲", `App上报入账(${card.offerId}): +${appRes.points}p${appRes.isDuplicate ? "（已入账，幂等确认）" : ""}`);
@@ -2460,7 +2341,6 @@ Notice:
             const nextAction = await this._resolveReportActivityActionId()
                 || RewardsAuto._nextAction || RewardsAuto.fallbackActionId;
             const EARN = "https://rewards.bing.com/earn";
-            const referer = card.url || "https://rewards.bing.com/";
 
             // v3.7.0 抓包实证（2026-09-15 登录态页面）：action 成功的唯一判据是响应含
             // `1:true`——缺 cookie 链的请求同样 200，但服务端只重渲染页面、action 不执行
@@ -3000,7 +2880,8 @@ Notice:
                 return false;
             }
 
-            // 领取后复核：claimCard 对任何 2xx 都视为成功，但上报成功≠积分到账。
+            // 领取后复核：上报成功≠积分到账（v4.1.0 实测：App 目录外 offer 会被
+            // 静默吸收、网页 2xx 可能只是页面重渲染）。
             // 未确认卡片按 offerId 累计连续失败次数，达上限后当日放弃（_countUnconfirmed），
             // 未达上限则本轮返回 false，下轮仅重试这些卡片。
             // 本轮没有任何卡片上报成功（如全部是已关闭的 quiz）时跳过复核，省掉 2 次请求。
@@ -3193,6 +3074,8 @@ Notice:
             // v4.0.0 阶梯0：DAPI App 上报（type 101 + offerid）先行——SW 直连实测
             // 入账（与阅读/App签入同族端点，无 Origin 校验问题）；成功项直接出列，
             // 剩余项才走网页 Server Action 阶梯。
+            // v4.1.0 标定：p:0 + isDuplicate:false = App 目录外/未开始的 offer 被
+            // 服务端静默吸收（非入账），必须落到 rest 走网页阶梯，不得当成功。
             if (pendingItems.length > 0 && RewardsAuto.state.token) {
                 const rest = [];
                 for (const it of pendingItems) {
@@ -3676,7 +3559,7 @@ Notice:
 
                 const amount = parseInt(claimableMatch[1].replace(/,/g, '')) || 0;
                 if (amount > 0) {
-                    // v3.6.11：不再只提醒，直接走实测契约领取（同源转发通道/直连均可用）
+                    // v3.6.11：不再只提醒，直接走实测契约领取（SW 直连）
                     const ok = await API.claimPendingPoints();
                     if (ok) {
                         Utils.log("🎁", `已领取 ${amount} 待领取积分`, true);
@@ -3856,9 +3739,6 @@ Notice:
                     this._lockHeartbeat = null;
                 }
             }, RUN_LOCK_HEARTBEAT_MS);
-            // 每轮重置同源转发通道的救援状态（v3.6.8）
-            RewardsAuto._pageRescueUsed = false;
-            RewardsAuto._pageChannelOff = false;
             RewardsAuto.state.startTime = Utils.getTimestamp();
             Utils.log("🚀", "启动全能自动化任务...");
             this.init();
@@ -4060,19 +3940,12 @@ Notice:
                 clearInterval(this._lockHeartbeat);
                 this._releaseRunLock(runLock);
                 this.running = false;
-                // 关闭本轮自行打开的后台代理标签页（用户自己的标签页不在句柄内，不受影响）
-                if (RewardsAuto._pageTabHandle) {
-                    try { RewardsAuto._pageTabHandle.close(); } catch (_) {}
-                    RewardsAuto._pageTabHandle = null;
-                }
             }
         }
     };
 
-    // ====== 前台同源转发通道 · 页面侧（v3.8.0 迁出至《微软积分商城签到-页面代理》脚本）======
-    // 页面侧执行器（pageProxyExecutor/setupPageProxy）、rewards 页打卡 DOM 处理、
-    // 「🔗 通道诊断」页面菜单均随页面代理脚本分发。后台侧协议（BingRewards_req/
-    // resp/alive）不变，两脚本以相同 @storageName 共享存储桥接。
+    // v4.1.0：前台页面侧处理器已随同源转发通道退役。rewards 页 DOM 自动领取/
+    // 每日活动点击由 Server Action 兜底链与 App 上报取代，不再需要页面内代码。
 
     GM_registerMenuCommand("🔑 手动授权", () => {
         GM_openInTab("https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&response_type=code&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&redirect_uri=https://login.live.com/oauth20_desktop.srf", { active: true });
@@ -4261,10 +4134,6 @@ Notice:
     // 清除可能影响搜索的 Cookie（后台 crontab 或引擎不支持时静默跳过，
     // 避免顶层异常导致整次定时运行中断、签到全停）
     try { GM_cookie("delete", { url: "https://bing.com", name: "_EDGE_S" }); } catch (_) {}
-
-    // ====== 前台页面处理器（v3.8.0 迁出至《微软积分商城签到-页面代理》脚本）======
-    // dashboard DOM 自动领取/每日活动点击/后台指令监听均由页面代理脚本承载，
-    // 本脚本因 @crontab 属后台脚本类别不注入页面，此处原代码为永不执行的死代码。
 
     // ====== 后台模式入口 ======
     init();

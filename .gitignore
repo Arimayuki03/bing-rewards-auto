@@ -11,3 +11,6 @@ node_modules/
 
 # ScriptCat 全量备份导出（含各脚本 storage.json 真实凭证，严禁入库）
 /*.zip
+
+# ZCode 工作目录（本次会话的实测探针脚本等临时产物）
+.v2c/
