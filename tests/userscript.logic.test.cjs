@@ -76,6 +76,67 @@ test("claimCard returns false when all earn-action strategies fail (legacy path 
     assert.equal(legacyCalls, 0, "v3.6.11: dead legacy reportactivity must no longer be called");
 });
 
+// ====== v4.2.0：边缘拦截识别 → 转交页面领取脚本（2026-09-17 抓包实证）======
+
+test("isEdgeBlockedError recognizes the 503 + Bing error page signature only", () => {
+    const { Utils } = createHarness();
+    // 实测形态：SW 直连 Server Action 被边缘拦截时抛出的错误消息
+    assert.equal(Utils.isEdgeBlockedError(new Error('HTTP 503: <!DOCTYPE html><html xml:lang="en"><head><title>Bing</title>')), true);
+    assert.equal(Utils.isEdgeBlockedError(new Error("HTTP 503: <html>blocked</html>")), true);
+    // 其他失败形态不得误判（否则会跳过仍可能成功的网页策略）
+    assert.equal(Utils.isEdgeBlockedError(new Error("HTTP 500: 1:E{\"digest\":\"D\"}")), false);
+    assert.equal(Utils.isEdgeBlockedError(new Error("HTTP 503: service unavailable")), false, "无 HTML 体的 503 不算边缘拦截");
+    assert.equal(Utils.isEdgeBlockedError(new Error("2xx 无 1:true（cookie 链缺失特征）: 0:{}")), false);
+    assert.equal(Utils.isEdgeBlockedError(null), false);
+});
+
+test("claimCard short-circuits remaining strategies once edge-blocked and hands off to the page script", async () => {
+    const { API, Utils } = createHarness();
+    API.appActivity = async () => null; // App 路径不可用
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    let posts = 0;
+    Utils.xhr = async options => {
+        if (options.method === "POST") {
+            posts++;
+            // 边缘拦截的真实形态
+            throw new Error('HTTP 503: <!DOCTYPE html><html xml:lang="en"><head><title>Bing</title></head></html>');
+        }
+        return "<html></html>";
+    };
+    Utils.fetchPage = async () => "";
+
+    const ok = await API.claimCard({ offerId: "WW_locked", hash: "h1", url: "https://cn.bing.com/search?q=x" });
+
+    assert.equal(ok, false, "边缘拦截时不得谎报成功");
+    assert.equal(posts, 1, "策略1 被拦截后不得再试 impression 形状（同一拦截态，重复无益）");
+});
+
+test("claimCard still tries impression shape when the failure is not an edge block", async () => {
+    const { API, Utils } = createHarness();
+    API.appActivity = async () => null;
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    const bodies = [];
+    Utils.xhr = async options => {
+        if (options.method === "POST") {
+            const payload = JSON.parse(options.data)[2];
+            bodies.push(payload);
+            // 首轮 context 形状失败（500，非边缘拦截）→ 必须继续尝试 impression
+            if (bodies.length === 1) throw new Error('HTTP 500: 1:E{"digest":"D"}');
+            return "0:{}\n1:true\n";
+        }
+        return "<html></html>";
+    };
+    Utils.fetchPage = async () => "";
+
+    const ok = await API.claimCard({ offerId: "O1", hash: "h1" });
+
+    assert.equal(ok, true, "非拦截失败必须继续走完策略链");
+    assert.equal(bodies.length, 2, "应尝试两种 payload 形状");
+    // context 形状：{offerid, isPromotional, timezoneOffset}；impression 形状：{offerid, form}
+    assert.ok("timezoneOffset" in bodies[0] && !("form" in bodies[0]), "首轮必须是 context 形状");
+    assert.ok("form" in bodies[1] && !("timezoneOffset" in bodies[1]), "第二轮必须是 impression 形状");
+});
+
 test("token exchange uses POST body instead of exposing secrets in the URL", async () => {
     const { API, RewardsAuto, Utils, storage } = createHarness();
     let request;
@@ -1747,4 +1808,129 @@ test("server-action posts carry x-deployment-id when a dpl is known", async () =
     assert.equal(posts[0].headers["sec-fetch-dest"], "empty");
     assert.equal(posts[0].headers.origin, "https://rewards.bing.com");
     assert.ok(posts[0].headers["user-agent"]);
+});
+
+// ====== v4.1.1：锁定等级卡不再阻塞"活动卡片✅"（2026-09-17 日志实证） ======
+// 现场：每日活动 Child1/2/3 已 App 上报入账，但 WW_Rewards_locked_level2_Sep26w3_offer2
+// 每轮被列为可领取、全策略失败 → fail>0 → promosDate 永远写不上 → 摘要整日 ❌。
+
+test("normalizeDashboardCard filters out locked offers (isLocked) at parse layer", async () => {
+    const { API, Utils } = createHarness();
+    API._getUserInfo = async () => ({ dashboard: {
+        morePromotions: [
+            { offerId: "LOCKED1", hash: "a".repeat(64), points: 15, title: "可爱但野性", isLocked: true, unlockCriteria: "level2" },
+            { offerId: "OPEN1", hash: "b".repeat(64), points: 10, title: "T1" },
+        ],
+    } });
+    Utils.fetchPage = async () => "<html></html>"; // 非 earn flight 内容；空串会让 discoverCards 直接返回 null
+
+    const cards = await API.discoverCards();
+
+    assert.deepEqual(Array.from(cards, c => c.offerId), ["OPEN1"],
+        "locked offers must be filtered at the getuserinfo parse layer");
+});
+
+test("parseCard filters out locked offers in activityCards arrays", async () => {
+    const combined = '{"activityCards":['
+        + JSON.stringify({ offerId: "LOCKED2", hash: "a".repeat(64), points: 15, title: "T2", isLocked: true })
+        + "," + JSON.stringify({ offerId: "OPEN2", hash: "b".repeat(64), points: 10, title: "T3" })
+        + '],"hasMore":1}';
+    const { API, Utils } = createHarness();
+    API._getUserInfo = async () => null;
+    Utils.fetchPage = async () => flightHtml(combined);
+
+    const cards = await API.discoverCards();
+
+    assert.deepEqual(Array.from(cards, c => c.offerId), ["OPEN2"],
+        "locked offers must be filtered at the activityCards parse layer");
+});
+
+test("_recordFailedClaims counts toward the give-up ledger and reaches give-up at N", () => {
+    const { RewardsAuto, TaskManager } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260917;
+
+    // 前 4 次：未达上限（5），无卡片出列
+    for (let i = 0; i < 4; i++) {
+        assert.deepEqual(Array.from(TaskManager._recordFailedClaims(["stuck1", "stuck1", "other"])), []);
+    }
+    // 第 5 次：达上限 → stuck1 出列（other 计 4 次未达）
+    assert.deepEqual(Array.from(TaskManager._recordFailedClaims(["stuck1"])), ["stuck1"]);
+
+    // _givenUpOfferIds 同步可见，次日日期变更自动清零
+    assert.ok(TaskManager._givenUpOfferIds().has("stuck1"));
+    RewardsAuto.state.dateNowNum = 20260918;
+    assert.equal(TaskManager._givenUpOfferIds().size, 0);
+});
+
+test("doPromos marks done once failing locked cards reach the give-up limit", async () => {
+    const { API, RewardsAuto, TaskManager, Utils, storage } = createHarness({ "Tasks.promos": true });
+    RewardsAuto.state.dateNowNum = 20260917;
+    Utils.randomDelay = async () => {};
+    // 锁定卡每轮全策略失败（真实场景：WW_Rewards_locked_level2_Sep26w3_offer2）
+    API.discoverCards = async () => [
+        { offerId: "WW_Rewards_locked_level2_Sep26w3_offer2", hash: "h", points: 15, kind: "open_only", title: "可爱但野性" },
+    ];
+    API.claimCard = async () => false;
+
+    // 前 4 轮：未达上限，保持 pending
+    for (let i = 0; i < 4; i++) {
+        TaskManager.promosTimes = 0;
+        assert.equal(await TaskManager.doPromos(), false);
+        assert.equal(TaskManager.promosDate, 0);
+    }
+
+    // 第 5 轮：达上限当日放弃 → promosDate 落账，摘要可转 ✅
+    TaskManager.promosTimes = 0;
+    assert.equal(await TaskManager.doPromos(), true);
+    assert.equal(TaskManager.promosDate, 20260917);
+    // 放弃账本已记账，下轮扫描起不再出列该卡
+    assert.equal(storage.get("Config.promosUnconfirmed").offers["WW_Rewards_locked_level2_Sep26w3_offer2"], 5);
+});
+
+test("doPromos stays pending while a failing card has not reached the give-up limit", async () => {
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness({ "Tasks.promos": true });
+    RewardsAuto.state.dateNowNum = 20260917;
+    Utils.randomDelay = async () => {};
+    API.discoverCards = async () => [{ offerId: "stuck", hash: "h", points: 5, kind: "daily", title: "stuck" }];
+    API.claimCard = async () => false;
+
+    assert.equal(await TaskManager.doPromos(), false);
+    assert.equal(TaskManager.promosDate, 0);
+    assert.equal(TaskManager.promosTimes, 1);
+});
+
+test("second scan keeps promosDate only while failed cards are below the give-up limit", async () => {
+    const { API, RewardsAuto, TaskManager, Utils, storage } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260917;
+    Utils.randomDelay = async () => {};
+    const today = 20260917;
+    // read 未完成 → 非空闲轮，runAll 能走到末尾的二次扫描；其余任务当日已完成
+    storage.set("Config.tasks", { sign: today, read: 0, promos: today, search: today, streakDays: 66 });
+    storage.set("Config.dailySetDone", today);
+    storage.set("Config.punchCardBgDone", today);
+    // 主任务全部 stub 掉（doPromos 也 stub，隔离出纯二次扫描路径）
+    let readRan = 0;
+    API.getBalance = async () => 100;
+    API.checkRegion = async () => true;
+    API.renewToken = async () => true;
+    API.getRewardsInfo = async () => null;
+    API.discoverCards = async () => [{ offerId: "locked", hash: "h", points: 15, kind: "open_only", title: "L" }];
+    API.claimCard = async () => false;
+    TaskManager.doSign = async () => true;
+    TaskManager.doRead = async () => { readRan++; return true; };
+    TaskManager.doPromos = async () => true;
+    TaskManager.doSearch = async () => true;
+    TaskManager.doStreak = async () => true;
+    TaskManager.doDailySet = async () => true;
+    TaskManager.doPunchCard = async () => true;
+    TaskManager.doClaimPoints = async () => true;
+
+    // 第 1 轮失败（未达上限）：promosDate 被重置，下轮继续重试
+    await TaskManager.runAll();
+    assert.ok(readRan > 0, "runAll must reach the task flow");
+    assert.equal(TaskManager.promosDate, 0, "failing scan below the limit must reset promosDate for retry");
+    // 第 2 轮失败：仍未达上限，保持重置状态；账本计数持续累计
+    await TaskManager.runAll();
+    assert.equal(TaskManager.promosDate, 0);
+    assert.equal(storage.get("Config.promosUnconfirmed").offers.locked, 2);
 });

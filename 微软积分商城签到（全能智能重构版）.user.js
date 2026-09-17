@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.1.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.1.0：App 上报（DAPI type 101+offerid，Bearer 鉴权）为卡片/每日活动唯一实测入账通道；v4.0.0 页面代理同源转发通道与救援标签页整体退役，全部请求 SW 直连；实测标定：服务端对 App 目录外 offer 静默返回 200+p:0，isDuplicate 仅同一 activity id 幂等）
+// @version      4.2.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.2.0：配套《微软积分商城签到-页面领取》脚本——抓包实证 SW 直连 Server Action 被边缘 503、页面上下文同样请求 200+入账，仅页面上下文可领的 offer 交由页面侧脚本在用户打开 rewards 页时自动完成；v4.1.1：锁定等级卡解析层过滤 + 失败卡计入放弃账本；v4.1.0：App 上报为主路径，服务端对 App 目录外 offer 静默 200+p:0）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -556,6 +556,16 @@ Notice:
                 Utils.log("🟢", `动态 next-action${label}: ${naMatch[1].slice(0, 12)}…`);
             }
             return naMatch ? naMatch[1] : null;
+        },
+
+        // 判定 Server Action 直连是否被边缘拦截（v4.2.0 抓包实证 2026-09-17）：
+        // SW 直连 rewards 的 Server Action 一律 503 + Bing 边缘错误页 HTML；页面上下文
+        // 同 payload、同 action ID 返回 200 + `1:true` 并真实入账（余额 +15 实测）。
+        // 该形态是结构性拦截，与本轮 hash/ cookie 链 / payload 形状无关——据此跳过同轮
+        // 冗余策略，转交页面侧《页面领取》脚本。
+        isEdgeBlockedError(err) {
+            const msg = String((err && err.message) || err || "");
+            return /^HTTP 503/.test(msg) && /<!DOCTYPE html>|<html[\s>]/i.test(msg);
         },
 
         // 解析 earn flight 流中的可领取 offer 实时状态（2026-09-14 登录态抓包实证）：
@@ -2075,7 +2085,8 @@ Notice:
                     const isCompleted = isCompletedMatch
                         ? (isCompletedMatch[1] === "true" || isCompletedMatch[1] === "completed" || isCompletedMatch[1] === "CLAIMED")
                         : false;
-                    if (isCompleted) return null;
+                    // v4.1.1：锁定卡解析层过滤（与 earn live 合并的 isLocked 过滤同语义）
+                    if (isCompleted || /"isLocked"\s*:\s*true/i.test(obj)) return null;
 
                     const title = titleMatch ? titleMatch[1] : "";
 
@@ -2104,7 +2115,9 @@ Notice:
                             const doneMax = Number(item.pointProgressMax || 0);
                             const doneCur = Number(item.pointProgress || 0);
                             const isCompleted = item.isCompleted || item.complete || item.completed || (doneMax > 0 && doneCur >= doneMax);
-                            if (!offerId || !hash || points <= 0 || isCompleted) return null;
+                            // v4.1.1：isLocked 卡（unlockCriteria:"rewardsApp" 等）只能在对应端
+                            // 完成，网页端结构性不可领——解析层出列，否则每轮进领取链白跑
+                            if (!offerId || !hash || points <= 0 || isCompleted || item.isLocked === true) return null;
                             const skip = RewardsAuto.skipPatterns.some(p =>
                                 title.toLowerCase().includes(p.toLowerCase()) ||
                                 offerId.toLowerCase().includes(p.toLowerCase())
@@ -2384,9 +2397,15 @@ Notice:
             };
 
             // 策略1: context 形 + live hash（discoverCards 已用本次 earn flight 覆盖）
+            // v4.2.0：边缘拦截（503 + Bing 错误页）是结构性拒绝，逐条重试其余形状/路由
+            // 只会重复同一失败。实测标定见 isEdgeBlockedError 注释；此处短路交给页面侧脚本。
+            let edgeBlocked = false;
             if (card.hash) {
                 try { await postEarnAction(card.hash); return true; }
-                catch (e) { Utils.log("🟡", `Earn 同源上报失败(${card.offerId}): ${e.message}`); }
+                catch (e) {
+                    edgeBlocked = Utils.isEdgeBlockedError(e);
+                    Utils.log("🟡", `Earn 同源上报失败(${card.offerId}): ${e.message}`);
+                }
             }
 
             // 策略2: 强制刷新 earn 页再取一次 live hash——卡片来自 getuserinfo 静态源
@@ -2406,11 +2425,12 @@ Notice:
                     return true;
                 }
             } catch (e2) {
+                edgeBlocked = edgeBlocked || Utils.isEdgeBlockedError(e2);
                 Utils.log("🟡", `Live hash 重试失败(${card.offerId}): ${e2.message}`);
             }
 
             // 策略3: impression 形（改版前旧 payload，兼容仍引用旧构建的区域）
-            if (card.hash) {
+            if (!edgeBlocked && card.hash) {
                 try { await postEarnAction(card.hash, "impression"); return true; }
                 catch (e3) { Utils.log("🟡", `Server Action(impression) 失败: ${card.offerId}`); }
             }
@@ -2418,6 +2438,13 @@ Notice:
             // （原 legacy /api/reportactivity 策略删除：2026-09-14 实测该端点已被服务端
             //   下线——真实登录页面同样 401、页面已无 RequestVerificationToken，保留只会
             //   为每张失败卡片白白多打 3 个请求。）
+
+            // 边缘拦截时不发后台标签页（它同样走 SW/扩展发起的网络栈，无法改变拦截结果），
+            // 直接转交页面侧脚本；非拦截性失败仍保留这条原生流程兜底。
+            if (edgeBlocked) {
+                Utils.log("🟡", `卡片需页面上下文领取(${card.offerId}): SW 直连被边缘拦截（503），已交给《页面领取》脚本——打开任意 rewards.bing.com 页面即可自动完成`);
+                return false;
+            }
 
             // 策略5（v3.7.0 重写）：XHR GET 活动链接已证无入账效果——入账只发生在
             // rewards 页的 Server Action（实测 Child2 无任何 bing 访问即入账），且裸 GET
@@ -2859,6 +2886,7 @@ Notice:
             Utils.log("🧩", `发现 ${claimable.length} 个可领取卡片`);
             let ok = 0, fail = 0;
             const claimed = new Set();
+            const failed = [];
 
             for (const card of claimable) {
                 Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
@@ -2871,10 +2899,18 @@ Notice:
                 const result = await API.claimCard(card);
                 result ? ok++ : fail++;
                 if (result) claimed.add(card.offerId);
+                else failed.push(card.offerId);
             }
 
-            // 任何卡片失败都不写入完成日期；下一次扫描会自动过滤已完成卡片，仅重试剩余项。
-            if (fail > 0) {
+            // v4.1.1：领取失败的卡片同样计入放弃账本（此前只统计"上报成功但未确认"，
+            // 锁定等级/时间窗卡每轮全策略失败却永远进不了账本，阻塞 promosDate 整日 ❌）。
+            // 达上限的卡片当日放弃，下轮扫描起不再出列。
+            const newlyGivenUp = this._recordFailedClaims(failed);
+
+            // 仍有失败但未达放弃上限的卡片 → 保持 pending，下轮仅重试这些卡片
+            //（与旧"部分失败"语义一致；复核只对"本轮失败卡全部收口"的轮次执行，省请求数）。
+            const stillPending = failed.filter(id => !newlyGivenUp.includes(id));
+            if (stillPending.length > 0) {
                 this.promosTimes++;
                 Utils.log("🟡", `活动卡片部分失败（${ok} 成功/${fail} 失败），稍后重试`);
                 return false;
@@ -2883,25 +2919,31 @@ Notice:
             // 领取后复核：上报成功≠积分到账（v4.1.0 实测：App 目录外 offer 会被
             // 静默吸收、网页 2xx 可能只是页面重渲染）。
             // 未确认卡片按 offerId 累计连续失败次数，达上限后当日放弃（_countUnconfirmed），
-            // 未达上限则本轮返回 false，下轮仅重试这些卡片。
             // 本轮没有任何卡片上报成功（如全部是已关闭的 quiz）时跳过复核，省掉 2 次请求。
+            let unconfirmed = [];
             if (claimed.size > 0) {
                 await Utils.randomDelay(4000, 8000);
                 // 复核必须绕过轮内缓存（fresh），否则刚上报的卡片永远"未确认"
                 const recheck = await API.discoverCards({ fresh: true });
                 if (Array.isArray(recheck)) {
-                    const { retryable } = this._countUnconfirmed(recheck, claimed);
-                    if (retryable.length > 0) {
-                        this.promosTimes++;
-                        Utils.log("🟡", `已上报但 ${retryable.length} 个卡片服务端未确认（${retryable.join(",")}），下轮重试`);
-                        return false;
-                    }
+                    unconfirmed = this._countUnconfirmed(recheck, claimed).retryable;
                 }
+            }
+
+            // 全部卡片收口（领取成功、复核确认完成、或达上限当日放弃）才落账 ✅
+            if (unconfirmed.length > 0) {
+                this.promosTimes++;
+                Utils.log("🟡", `已上报但 ${unconfirmed.length} 个卡片服务端未确认（${unconfirmed.join(",")}），下轮重试`);
+                return false;
             }
 
             this.promosDate = RewardsAuto.state.dateNowNum;
             this.save();
-            Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败`, true);
+            if (newlyGivenUp.length > 0) {
+                Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败（含 ${newlyGivenUp.length} 个当日放弃）`, true);
+            } else {
+                Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败`, true);
+            }
             return true;
         },
 
@@ -2944,6 +2986,32 @@ Notice:
                 Utils.log("🟡", `卡片服务端连续 ${giveUpAfter} 次未确认，当日放弃（次日自动重试）: ${givenUp.join(",")}`);
             }
             return { retryable, givenUp };
+        },
+
+        // v4.1.1：把"领取直接失败"（所有策略均失败/锁定拒绝）的卡片同样计入放弃账本。
+        // 此前账本只覆盖"上报成功但复核未确认"的卡片，而锁定等级/时间窗卡每轮全策略
+        // 失败却永远进不了账本 → fail>0 阻塞 promosDate，摘要"活动卡片"整日 ❌ 空转。
+        // 返回当日已达放弃上限的 offerId 列表（达上限即从待办出列）。
+        _recordFailedClaims(failedOfferIds, giveUpAfter = PROMOS_GIVE_UP_AFTER) {
+            const ids = [...new Set(failedOfferIds)].filter(Boolean);
+            if (ids.length === 0) return [];
+            const today = RewardsAuto.state.dateNowNum;
+            const key = "Config.promosUnconfirmed";
+            let rec = GM_getValue(key, null);
+            if (!rec || rec.date !== today || typeof rec.offers !== "object") {
+                rec = { date: today, offers: {} };
+            }
+            const givenUp = [];
+            for (const id of ids) {
+                const count = (rec.offers[id] || 0) + 1;
+                rec.offers[id] = count;
+                if (count >= giveUpAfter) givenUp.push(id);
+            }
+            GM_setValue(key, rec);
+            if (givenUp.length > 0) {
+                Utils.log("🟡", `卡片连续 ${giveUpAfter} 次领取失败，当日放弃（次日自动重试）: ${givenUp.join(",")}`);
+            }
+            return givenUp;
         },
 
         async doSearch() {
@@ -3870,6 +3938,7 @@ Notice:
                 Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
                 let ok = 0, fail = 0;
                 const claimedIds = new Set();
+                const failedIds = [];
                 // 与 doPromos 一致：当日已放弃的卡片不再重复上报
                 const giveUpIds = this._givenUpOfferIds();
                 for (const card of newCards) {
@@ -3880,13 +3949,19 @@ Notice:
                     const result = await API.claimCard(card);
                     result ? ok++ : fail++;
                     if (result) claimedIds.add(card.offerId);
+                    else failedIds.push(card.offerId);
                 }
-                if (fail > 0) {
+                // v4.1.1：与 doPromos 同语义——失败卡计入放弃账本；仍有失败且未达
+                // 上限的卡片时重置 promosDate（下轮重试），达上限的当日放弃、不再阻塞落账。
+                const secondGivenUp = this._recordFailedClaims(failedIds);
+                const secondPending = failedIds.filter(id => !secondGivenUp.includes(id));
+                if (secondPending.length > 0) {
                     this.promosDate = 0;
                     this.save();
                 }
                 // 与 doPromos 相同的领取后复核：2xx 不等于到账。
-                // 未确认卡片计入放弃计数并重置 promosDate，交回 doPromos 的重试/放弃机制处理，
+                // 未确认卡片计入放弃计数；仅当仍有未达上限的未确认卡时才重置 promosDate
+                //（交回 doPromos 的重试/放弃机制处理），达上限的当日放弃、不再阻塞落账，
                 // 避免"二次扫描领取未到账→当日被永久跳过"的缺口。
                 if (claimedIds.size > 0) {
                     await Utils.randomDelay(4000, 8000);
