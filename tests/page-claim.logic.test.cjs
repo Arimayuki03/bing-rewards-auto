@@ -70,6 +70,7 @@ test("pageCollector filters completed and locked offers, keeps claimable ones wi
         { offerId: "OPEN", hash: "c".repeat(64), points: 15 },
         { offerId: "NO_POINTS", hash: "d".repeat(64), points: 0 },
         { offerId: "NO_HASH", points: 5 },
+        { offerId: "GARBAGE_HASH", hash: "not-a-real-hash-value", points: 5 },
     ].map(o => JSON.stringify(o)).join(",");
 
     const offers = collectClaimableOffers(combined);
@@ -102,6 +103,21 @@ test("pageCollector extracts nested flight objects via brace matching", () => {
     const offers = collectClaimableOffers(combined);
 
     assert.deepEqual(Array.from(offers, o => o.offerId), ["NESTED"]);
+});
+
+test("pageCollector extracts offers whose object-valued sibling keys precede offerId", () => {
+    // v4.2.0 回归：anchor 前最近的 { 属于兄弟嵌套对象时，向前扩命中的是那个内层
+    // 对象的合法 JSON——解析成功但不含 offerId，旧代码在 parse 成功后无条件 break，
+    // 整个 offer 丢失。v4.2.1 对齐主脚本守卫（边界须包住 anchor + 结果须含 offerId，
+    // 否则继续向前扩）。上方 NESTED 用例 offerId 是首键，恰好绕不开也照不进这条路径。
+    const { collectClaimableOffers } = createPageHarness();
+    const H = "f".repeat(64);
+    const shallow = '{"attributes":{"x":1},"offerId":"SIBLING","hash":"' + H + '","points":10}';
+    assert.deepEqual(Array.from(collectClaimableOffers(shallow), o => o.offerId), ["SIBLING"],
+        "兄弟嵌套对象位于 anchor 之前不得漏提");
+    const deep = '{"outer":{"inner":{"x":1}},"offerId":"DEEP","hash":"' + H + '","points":10}';
+    assert.deepEqual(Array.from(collectClaimableOffers(deep), o => o.offerId), ["DEEP"],
+        "多层命中过浅必须继续向前扩到真实对象边界");
 });
 
 // ====== 请求构造 ======
@@ -233,6 +249,88 @@ test("runSweep posts every claimable offer with its current hash and reports acc
     assert.equal(first[1], 11);
     assert.equal(first[2].offerid, "A");
     assert.equal(offerPosts[0].headers["next-action"], "c".repeat(40), "action ID 必须来自 chunk 扫描");
+});
+
+test("runSweep sends the page's 42-char $ACTION_ID_ to dashboard in full", async () => {
+    // v4.2.0 回归：{40} 把 42 位 claim ID 截成无效前缀，且截断后候选数仍为 1、
+    // 反而优先于正确的 42 位兜底常量被采用——恰在有积分可领时确定性失败。
+    const REAL_CLAIM = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d";
+    assert.equal(REAL_CLAIM.length, 42, "抓包实测长度前提");
+    const posts = [];
+    const { runSweep } = createPageHarness({
+        seedState: { lastRunAt: Date.now() },
+        fetchImpl: async (url, init) => {
+            if (init && init.method === "POST") { posts.push({ url, headers: init.headers }); return { status: 200, text: async () => "0:{}\n1:true\n" }; }
+            if (url.endsWith("/dashboard")) return { status: 200, text: async () => `<html>x $ACTION_ID_${REAL_CLAIM} y</html>` };
+            return { status: 200, text: async () => "<html></html>" };
+        },
+    });
+
+    const result = await runSweep("test");
+
+    const dashPost = posts.find(p => p.url.endsWith("/dashboard"));
+    assert.ok(dashPost, "欢迎积分 POST 必须发出");
+    assert.equal(dashPost.headers["next-action"], REAL_CLAIM, "42 位 $ACTION_ID_ 必须完整传给 next-action，不得截成 40 位");
+    assert.equal(result.welcomeAccepted, true);
+});
+
+test("runSweep skips the welcome POST when the page sends no unique $ACTION_ID_", async () => {
+    // v4.2.1：$ACTION_ID_ 仅当页面存在待领项时随 flight 下发 = 待领信号；无信号时
+    // POST 旧 ID 必不被受理，直接跳过（原兜底常量路径随之退役）
+    const posts = [];
+    const { runSweep } = createPageHarness({
+        seedState: { lastRunAt: Date.now() },
+        fetchImpl: async (url, init) => {
+            if (init && init.method === "POST") { posts.push({ url, headers: init.headers }); return { status: 200, text: async () => "1:true" }; }
+            return { status: 200, text: async () => "<html></html>" };
+        },
+    });
+
+    const result = await runSweep("test");
+
+    assert.equal(posts.filter(p => p.url.endsWith("/dashboard")).length, 0, "无待领信号不得发欢迎积分 POST");
+    assert.equal(result.welcomeAccepted, false);
+});
+
+test("runSweep skips the welcome POST when $ACTION_ID_ candidates are ambiguous", async () => {
+    const posts = [];
+    const { runSweep } = createPageHarness({
+        seedState: { lastRunAt: Date.now() },
+        fetchImpl: async (url, init) => {
+            if (init && init.method === "POST") { posts.push({ url, headers: init.headers }); return { status: 200, text: async () => "1:true" }; }
+            if (url.endsWith("/dashboard")) return { status: 200, text: async () => `<html>$ACTION_ID_${"a".repeat(42)} $ACTION_ID_${"b".repeat(42)}</html>` };
+            return { status: 200, text: async () => "<html></html>" };
+        },
+    });
+
+    await runSweep("test");
+
+    assert.equal(posts.filter(p => p.url.endsWith("/dashboard")).length, 0, "候选歧义时不得猜一个 action 发请求");
+});
+
+test("resolveActionId caches the scanned action ID per dpl across rounds", async () => {
+    // action ID 只随部署轮换：同一 dpl 复用扫描结果（省最多 24 个 chunk 的重抓与
+    // 2-6 秒延迟），dpl 变化必须立即失效、绝不把旧部署 ID 用在新部署上
+    const chunk = `createServerReference("${"d".repeat(42)}",t.callServer,void 0,t.findSourceMapURL,"reportActivity")`;
+    let chunkFetches = 0;
+    const { resolveActionId } = createPageHarness({
+        fetchImpl: async (url) => {
+            if (url.includes("/_next/static/chunks/")) { chunkFetches++; return { status: 200, text: async () => chunk }; }
+            return { status: 200, text: async () => "" };
+        },
+    });
+    const html = `<script src="/_next/static/chunks/abc.js"></script>`;
+
+    const id1 = await resolveActionId(html, "20260916-2");
+    const fetchesAfterFirst = chunkFetches;
+    const id2 = await resolveActionId(html, "20260916-2");
+    assert.equal(id1, "d".repeat(42));
+    assert.equal(id2, "d".repeat(42), "同一 dpl 命中缓存，返回同一 ID");
+    assert.equal(chunkFetches, fetchesAfterFirst, "第二次调用不得重抓 chunk");
+
+    const id3 = await resolveActionId(html, "20260917-9");
+    assert.equal(chunkFetches, fetchesAfterFirst + 1, "dpl 轮换后必须重扫");
+    assert.equal(id3, "d".repeat(42));
 });
 
 test("runSweep skips entirely when both page fetches fail", async () => {

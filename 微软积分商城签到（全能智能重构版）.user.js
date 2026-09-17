@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.2.0
+// @version      4.2.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.2.0：配套《微软积分商城签到-页面领取》脚本——抓包实证 SW 直连 Server Action 被边缘 503、页面上下文同样请求 200+入账，仅页面上下文可领的 offer 交由页面侧脚本在用户打开 rewards 页时自动完成；v4.1.1：锁定等级卡解析层过滤 + 失败卡计入放弃账本；v4.1.0：App 上报为主路径，服务端对 App 目录外 offer 静默 200+p:0）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -169,7 +169,6 @@ Notice:
             rewardsAppId: "SAAndroid/32.6.2110003560",
             channel: "SAAndroid",                       // 渠道：Android 版 Bing App
             offerIds: {
-                dailyCheckIn: "Gamification_Sapphire_DailyCheckIn",  // 每日签到标识
                 readArticle: "ENUS_readarticle3_30points",           // 阅读任务标识
             }
         },
@@ -252,14 +251,11 @@ Notice:
             "redemption goal", "order history", "claim your gift", "shop to earn",
             "set goal", "Available tomorrow", "Offer is Locked", "Earn -1 points"
         ],
-        skipHrefs: [
-            "sweepstakes/", "referandearn", "aka.ms/win", "workinprogress",
-            "punchcard", "microsoft-store", "goal/all", "orderhistory",
-            "/redeem", "/redeemgoal", "xbox.com/rewards"
-        ],
         state: {
             token: false,
             region: "CN",
+            // legacy 网页接口（search/ncheader/reportActivity）的固定入口域（抓包实证）。
+            // 不是随 region 切换的动态字段——国区锁定由 URL 的 mkt=zh-CN 参数承担。
             host: "www.bing.com",
             dateNowNum: 0,
             dateNowStr: "",
@@ -270,7 +266,6 @@ Notice:
             sendMSG: "",
             lastSearchProgress: -1,
             restrictedTimes: 0,
-            pc401: false,
             _rvTokenCache: null,
             reportActionId: null,   // 轮内缓存的 reportActivity action ID（每次部署轮换，需动态解析）
             ip: "",
@@ -729,12 +724,6 @@ Notice:
             return `${mo}/${d}/${y}`;
         },
 
-        // 东经偏移分钟数（中国 UTC+8 返回 "480"）。旧版 cn.bing.com 上报接口的
-        // timeZone/timezoneOffset 使用此约定（实测抓包）。
-        getTimezoneOffset() {
-            return String(-new Date().getTimezoneOffset());
-        },
-
         // JS 原始时区偏移（中国 UTC+8 返回 "-480"）。新版 Next.js Server Action 的
         // timezoneOffset 来自浏览器 client 代码的 new Date().getTimezoneOffset()，
         // 必须使用原始符号，与服务端按 (UTC - offset) 计算本地日期的约定一致。
@@ -795,40 +784,6 @@ Notice:
         // 防封号核心：所有操作间必须使用随机延迟
         randomDelay(min = 3000, max = 8000) {
             return this.delay(this.randomRange(min, max));
-        },
-
-        waitForElementsByText(containerSelector, textPatterns, timeout = 30000) {
-            return new Promise((resolve) => {
-                const findElements = () => {
-                    const containers = document.querySelectorAll(containerSelector);
-                    const results = [];
-                    for (const container of containers) {
-                        const text = container.textContent || "";
-                        for (const pattern of textPatterns) {
-                            if (text.includes(pattern)) {
-                                results.push({ element: container, pattern });
-                                break;
-                            }
-                        }
-                    }
-                    return results;
-                };
-
-                if (typeof document === "undefined" || !document.body) return resolve([]);
-                const found = findElements();
-                if (found.length > 0) return resolve(found);
-
-                const observer = new MutationObserver(() => {
-                    const matched = findElements();
-                    if (matched.length > 0) { observer.disconnect(); resolve(matched); }
-                });
-                observer.observe(document.body, { childList: true, subtree: true });
-
-                setTimeout(() => {
-                    observer.disconnect();
-                    resolve(findElements());
-                }, timeout);
-            });
         },
 
         // ====== 按运行周期的只读请求缓存 ======
@@ -1549,88 +1504,6 @@ Notice:
             }
         },
 
-        // 每日活动上报：通过 reportActivity API 完成（匹配浏览器行为）
-        async reportDailyActivity(searchUrl) {
-            try {
-                const fullUrl = searchUrl.startsWith("http") ? searchUrl : `https://cn.bing.com${searchUrl}`;
-                const urlObj = new URL(fullUrl);
-                const sp = urlObj.searchParams;
-                const ig = Utils.getRandomUUID().replace(/-/g, '').substring(0, 32).toUpperCase();
-
-                // cn.bing.com 版本的 URL（用作 referer 和 body url）
-                const cnUrl = fullUrl.replace(/^https?:\/\/www\.bing\.com/, "https://cn.bing.com")
-                                     .replace(/^https:\/\/bing\.com/, "https://cn.bing.com");
-                const cnUrlObj = new URL(cnUrl);
-                const cnSp = cnUrlObj.searchParams;
-
-                // 构建 reportActivity 查询参数（匹配浏览器抓包：IID=commerce.5067，不含 ajaxreq）
-                const reportParams = new URLSearchParams();
-                reportParams.set("IG", ig);
-                reportParams.set("IID", "commerce.5067");
-                if (cnSp.get("form")) reportParams.set("form", cnSp.get("form"));
-                if (cnSp.get("ocid") || cnSp.get("OCID")) reportParams.set("ocid", cnSp.get("ocid") || cnSp.get("OCID"));
-                if (cnSp.get("rnoreward")) reportParams.set("rnoreward", cnSp.get("rnoreward"));
-
-                // 步骤1: GET 加载活动页面（服务器记录访问）
-                try {
-                    await Utils.xhr({
-                        method: "GET",
-                        url: cnUrl,
-                        headers: {
-                            "user-agent": RewardsAuto.ua.pc,
-                            "referer": "https://rewards.bing.com/",
-                            "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
-                        }
-                    });
-                } catch (_) {}
-
-                // 步骤2: 发送 ncheader（匹配浏览器的预请求）
-                const ncheaderParams = new URLSearchParams();
-                ncheaderParams.set("ver", String(Date.now()).substring(0, 8));
-                ncheaderParams.set("IID", "commerce.5057");
-                ncheaderParams.set("IG", ig);
-                try {
-                    await Utils.xhr({
-                        method: "POST",
-                        url: `https://cn.bing.com/rewardsapp/ncheader?${ncheaderParams.toString()}`,
-                        headers: {
-                            "content-type": "application/x-www-form-urlencoded",
-                            "user-agent": RewardsAuto.ua.pc,
-                            "referer": cnUrl,
-                            "origin": "https://cn.bing.com",
-                            "accept": "*/*",
-                            "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
-                        },
-                        data: "wb=1;i=1;v=1"
-                    });
-                } catch (_) { /* ncheader 失败不阻断 */ }
-
-                // 步骤3: 发送 reportActivity
-                const bodyParams = new URLSearchParams();
-                bodyParams.set("url", cnUrl);
-                bodyParams.set("V", "web");
-
-                await Utils.xhr({
-                    method: "POST",
-                    url: `https://cn.bing.com/rewardsapp/reportActivity?${reportParams.toString()}`,
-                    headers: {
-                        "content-type": "application/x-www-form-urlencoded",
-                        "user-agent": RewardsAuto.ua.pc,
-                        "referer": cnUrl,
-                        "origin": "https://cn.bing.com",
-                        "accept": "*/*",
-                        "accept-language": "zh-CN,zh;q=0.9,en;q=0.8"
-                    },
-                    data: bodyParams.toString()
-                });
-                return true;
-            } catch (e) {
-                Utils.log("🟡", `每日活动上报失败: ${e.message}`);
-                return false;
-            }
-        },
-
         // 获取今日每日活动列表（getuserinfo/flyout 结构化数据，含已完成项；
         // 两者都不可用时回退 flight 流解析，保证列表与完成状态复查不依赖旧接口）
         async getDailySetItems(fetchOpts) {
@@ -1732,7 +1605,7 @@ Notice:
             // 服务端下线——真实页面同样 401，且页面源码中已不存在 RequestVerificationToken，
             // flight 流中亦无 Gamification_DailyCheckIn。保留尝试以兼容区域/改版回滚，
             // 但其失败不代表积分损失或会话过期（签入实际由 App 静默签入与搜索连签覆盖），
-            // 不得再用于连坐其他任务（见 runAll 中 pc401 的解除）。
+            // 不得再用于连坐其他任务（v3.6.10 解除连坐；v4.2.1 起连坐时代的诊断标志位一并清除）。
             try {
                 const res = await this.reportActivity("Gamification_DailyCheckIn", "1", "https://rewards.bing.com/");
                 if (Utils.isJSON(res)) {
@@ -1740,7 +1613,6 @@ Notice:
                     return Number(data.points || data.response?.activity?.p || 0);
                 }
             } catch (e) {
-                if (e.message?.includes("401")) RewardsAuto.state.pc401 = true;
                 Utils.log("🔵", `PC签入（legacy，服务端已下线）跳过: ${e.message}`);
             }
             return -1;
@@ -2292,15 +2164,19 @@ Notice:
         async claimPendingPoints() {
             const DASH = "https://rewards.bing.com/dashboard";
             let actionId = String(GM_getValue("Config.claimActionId", "") || "");
-            if (!/^[a-f0-9]{40}$/.test(actionId)) {
+            // 长度必须用 {40,64} 宽区间：现网 action ID 实测 42 位（兜底常量即 42 位），
+            // 写死 {40} 会把用户按日志指引填回的正确 42 位覆盖值拒掉、静默回退过期常量。
+            if (!/^[a-f0-9]{40,64}$/.test(actionId)) {
                 actionId = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d"; // 2026-09-14 dpl=20260912-2 抓包
             }
             try {
                 const html = await Utils.fetchPage({ url: DASH, headers: { "user-agent": RewardsAuto.ua.pc } }, { fresh: true });
                 if (html) {
+                    // {40,64} 宽区间：现网 $ACTION_ID_ 实测 42 位，写死 {40} 会截出
+                    // 无效前缀且"候选数仍为 1"——截断值反而优先于正确兜底被采用
                     const ids = new Set(
-                        (String(html).match(/\$ACTION_ID_([a-f0-9]{40})/g) || [])
-                            .concat((Utils.concatFlightChunks(html).match(/\$ACTION_ID_([a-f0-9]{40})/g) || []))
+                        (String(html).match(/\$ACTION_ID_([a-f0-9]{40,64})/g) || [])
+                            .concat((Utils.concatFlightChunks(html).match(/\$ACTION_ID_([a-f0-9]{40,64})/g) || []))
                             .map(s => s.slice(11)));
                     if (ids.size === 1) actionId = [...ids][0];
                 }
@@ -2700,7 +2576,6 @@ Notice:
             this.signTimes = 0;
             this.readTimes = 0;
             this.promosTimes = 0;
-            RewardsAuto.state.pc401 = false;
 
             // 搜索受限状态只允许在同一天跨运行恢复，避免把昨天的停滞次数带到今天。
             const progressDate = GM_getValue("Config.searchProgressDate", 0);
@@ -3566,8 +3441,11 @@ Notice:
             const cookie = await Utils.cookieHeaderFor(reqOptions.url);
             if (cookie) { reqOptions.headers.cookie = cookie; reqOptions.anonymous = true; }
             if (GM_getValue("Config.debugDailySet", false)) {
+                // headers 里刚被塞入含 .MSA.Auth/_U 的完整 cookie 明文；调试日志常被
+                // 截图/贴进 issue，序列化前剔除 cookie 字段，仅保留作者本意的条数
+                const { cookie: _omit, ...safeHeaders } = reqOptions.headers;
                 Utils.log("🔵", `Server Action 请求(${shape}): ${JSON.stringify({
-                    url: reqOptions.url, headers: reqOptions.headers, data: reqOptions.data,
+                    url: reqOptions.url, headers: safeHeaders, data: reqOptions.data,
                     cookies: cookie ? cookie.split("; ").length : 0
                 })}`);
             }
@@ -3985,7 +3863,9 @@ Notice:
             const totalTime = ((endTime - RewardsAuto.state.startTime) / 1000).toFixed(1);
 
             // 查询最终积分
-            const endBalance = await API.getBalance();
+            // 轮末必须 fresh 绕开轮内页面缓存：缓存键绑定 dateNowNum（单轮恒定），
+            // 不刷新的话首尾拿到同一份缓存值，"今日获取"恒显示 +0
+            const endBalance = await API.getBalance({ fresh: true });
             const earned = (startBalance > 0 && endBalance > 0) ? (endBalance - startBalance) : 0;
 
             // 汇总必须反映本轮执行后的最新进度，绕过轮内缓存

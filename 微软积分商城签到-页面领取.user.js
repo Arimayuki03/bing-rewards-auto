@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到-页面领取
 // @namespace    local.bing-rewards-auto
-// @version      4.2.0
+// @version      4.2.1
 // @description  《微软积分商城签到（全能智能重构版）》的页面侧领取组件。2026-09-17 抓包实证：Server Action 的入账判据在页面上下文成立（同 payload、同 action ID，页面内 POST /earn → 200 + 1:true，实测余额 +15），而 Service Worker 直连被边缘 503（返回 Bing 错误页 HTML）——这类"仅页面上下文可领"的 offer（如 WW_Rewards_locked_level2_*，unlockCriteria 已满足但不在 App 目录）只有本脚本能拿到。工作方式：仅在用户已打开 rewards.bing.com 页面时生效，不依赖 @storageName 跨脚本存储（v3.9.0 现场已证伪），不开救援标签页；自主抓取 earn/dashboard 的 flight 数据 → 解析待领 offer 与当次轮换 hash → 扫构建 chunk 定位当前部署的 reportActivity action ID → 页面内逐个上报 + 欢迎积分领取，15 分钟节流防重复。后台脚本下一轮复核到账后自然转入完成/放弃账本。
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -20,10 +20,10 @@
     } catch (_) {}
     // 兜底值仅用于 chunk 扫描失败时——action ID 随部署轮换，正常路径必须用扫出来的
     const FALLBACK_REPORT_ACTION = "707e6eb15bdfdd5fba193f0a77e934f7018faf87ce"; // 2026-09-16 dpl=20260916-2
-    const FALLBACK_CLAIM_ACTION = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d";  // 2026-09-14 抓包
     // 同一页面停留期间的节流窗口；?claimnow=1 强制执行（调试/手动触发用）
     const SWEEP_INTERVAL_MS = 15 * 60 * 1000;
     const STATE_KEY = "bw_page_claim";
+    const CHUNK_CACHE_KEY = "bw_page_claim_chunk";
     const AUTO_PATHS = ["/", "/dashboard", "/earn"];
     const OFFER_POST_DELAY = [2500, 5000];
 
@@ -78,13 +78,21 @@
                     if (c === "}") { depth--; if (depth === 0) { end = j + 1; break; } }
                 }
                 if (end === -1) break;
-                try {
-                    const obj = JSON.parse(combined.slice(start, end));
-                    if (obj && typeof obj.offerId === "string") out.push(obj);
-                    break;
-                } catch (_) {
-                    start = combined.lastIndexOf("{", start - 1);
+                // 对齐主脚本 extractFlightObjects 的两道守卫（v4.2.1 修复照抄时漏掉的回归）：
+                // end 为开区间末位，end - 1 >= idx 即对象边界必须包住 anchor 位置；
+                // 命中过浅（如 anchor 前最近的 { 是兄弟嵌套对象、在 anchor 前已闭合）
+                // 或解析失败/结果不含 offerId 时继续向前扩，而不是就此 break 丢弃 offer。
+                if (end > idx) {
+                    try {
+                        const obj = JSON.parse(combined.slice(start, end));
+                        if (obj && typeof obj === "object" && "offerId" in obj) {
+                            if (typeof obj.offerId === "string") out.push(obj);
+                            cursor = Math.max(cursor, end);
+                            break;
+                        }
+                    } catch (_) { /* 边界未对齐，继续向前扩 */ }
                 }
+                start = start > 0 ? combined.lastIndexOf("{", start - 1) : -1;
             }
         }
         return out;
@@ -100,7 +108,9 @@
             const prev = byId.get(id) || { offerId: id, hash: "", points: 0, completed: false, locked: false, title: "" };
             prev.completed = prev.completed || obj.isCompleted === true || obj.complete === true;
             prev.locked = prev.locked || obj.isLocked === true;
-            if (!prev.hash && typeof obj.hash === "string" && obj.hash) prev.hash = obj.hash;
+            // 40-64 hex 格式门：现网 hash 长度实测在 40-64 之间变动过（40 位 SHA-1 与
+            // 64 位两代并存，见主脚本记录）；明显不是 hash 的串不得当作 hash 入领取链
+            if (!prev.hash && typeof obj.hash === "string" && /^[a-f0-9]{40,64}$/i.test(obj.hash)) prev.hash = obj.hash;
             const pts = Number(obj.points ?? obj.pointProgressMax ?? 0);
             if (Number.isFinite(pts) && pts > prev.points) prev.points = pts;
             if (!prev.title && typeof obj.title === "string") prev.title = obj.title;
@@ -156,6 +166,15 @@
     // fallback 的过期 action ID，一旦部署轮换即失效）。chunk 路径在 flight 里以 `\/`
     // 转义，匹配前先反转义。
     const resolveActionId = async (htmlAll, dpl) => {
+        // 同一部署内复用扫描结果：action ID 只随部署轮换，每次扫描重抓最多 24 个 chunk
+        // 既费流量又拖 2-6 秒。localStorage 是页面同源存储（本脚本节流状态同样用它），
+        // 不违反"无跨脚本存储"的自包含约束；dpl 一变即失效，不会吃旧部署的 ID。
+        if (dpl) {
+            try {
+                const cached = JSON.parse(localStorage.getItem(CHUNK_CACHE_KEY) || "null");
+                if (cached && cached.dpl === dpl && /^[a-f0-9]{40,64}$/i.test(String(cached.id || ""))) return cached.id;
+            } catch (_) { /* 缓存损坏当未命中 */ }
+        }
         try {
             const unescaped = String(htmlAll).replace(/\\\//g, "/").replace(/\\u0026/gi, "&");
             const chunkUrls = [...new Set([...unescaped.matchAll(/\/_next\/static\/chunks\/[\w\-./()%]+?\.js/g)].map(m => m[0]))].slice(0, 24);
@@ -167,7 +186,10 @@
                 // 写死 {40} 会静默截断成无效 ID。不用 `createServerReference\)?\("id"` 这种紧邻
                 // 假设：压缩产物里 `createServerReference)("id"` 与 ID 之间可能夹分组括号。
                 const am = js.text.match(/createServerReference[\s\S]{0,60}?([a-f0-9]{40,64})[\s\S]{0,300}?"reportActivity"/);
-                if (am) return am[1];
+                if (am) {
+                    if (dpl) { try { localStorage.setItem(CHUNK_CACHE_KEY, JSON.stringify({ dpl, id: am[1] })); } catch (_) {} }
+                    return am[1];
+                }
             }
         } catch (_) {}
         return "";
@@ -234,10 +256,18 @@
             // $ACTION_ID_（仅当页面存在可领取项时随 flight 下发）；无待领时响应不含 1:true。
             let welcome = { status: 0, accepted: false };
             try {
-                const ids = [...new Set([...String(dash.text + combined).matchAll(/\$ACTION_ID_([a-f0-9]{40})/g)].map(m => m[1]))];
-                const claimId = ids.length === 1 ? ids[0] : FALLBACK_CLAIM_ACTION;
-                welcome = await postServerAction("https://rewards.bing.com/dashboard", claimId, "[]", dpl);
-                log(`欢迎积分领取 HTTP ${welcome.status}`, welcome.accepted ? "✅" : "（无待领或未受理）");
+                // {40,64} 宽区间：现网 $ACTION_ID_ 实测 42 位，写死 {40} 会截出无效前缀，
+                // 且截断后候选数仍为 1、反而优先于兜底值被采用
+                const ids = [...new Set([...String(dash.text + combined).matchAll(/\$ACTION_ID_([a-f0-9]{40,64})/g)].map(m => m[1]))];
+                if (ids.length === 1) {
+                    // 页面下发唯一 $ACTION_ID_ 即"存在待领"信号（〇-Z：该字段仅当页面有
+                    // 可领项时随 flight 下发）。无信号/候选歧义时拿旧 ID POST 必不被受理，
+                    // v4.2.1 起直接跳过——原 42 位兜底常量路径随之退役。
+                    welcome = await postServerAction("https://rewards.bing.com/dashboard", ids[0], "[]", dpl);
+                    log(`欢迎积分领取 HTTP ${welcome.status}`, welcome.accepted ? "✅" : "（未受理）");
+                } else {
+                    log("欢迎积分无待领信号（页面未下发唯一 $ACTION_ID_），跳过领取");
+                }
             } catch (e) {
                 log("欢迎积分领取异常", String((e && e.message) || e));
             }

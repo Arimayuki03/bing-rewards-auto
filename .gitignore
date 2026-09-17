@@ -5,6 +5,9 @@
 .claude/
 .qoder/
 
+# 旧版快照（159KB 死重量；凭证扫描确认干净，但版本控制里留着无意义）
+*.user.js.bak
+
 # 依赖与日志
 node_modules/
 *.log

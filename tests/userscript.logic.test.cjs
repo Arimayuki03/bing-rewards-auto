@@ -330,14 +330,12 @@ test("task initialization resets transient and previous-day restriction state", 
     TaskManager.signTimes = 3;
     TaskManager.readTimes = 3;
     TaskManager.promosTimes = 3;
-    RewardsAuto.state.pc401 = true;
 
     TaskManager.init();
 
     assert.equal(TaskManager.signTimes, 0);
     assert.equal(TaskManager.readTimes, 0);
     assert.equal(TaskManager.promosTimes, 0);
-    assert.equal(RewardsAuto.state.pc401, false);
     assert.equal(RewardsAuto.state.lastSearchProgress, -1);
     assert.equal(RewardsAuto.state.restrictedTimes, 0);
     assert.equal(storage.get("Config.searchProgressDate"), Utils.getTodayNum());
@@ -1207,8 +1205,8 @@ test("jsTimezoneOffset keeps the raw JS sign for the new server action", () => {
     const { Utils } = createHarness();
     const raw = String(new Date().getTimezoneOffset());
     assert.equal(Utils.jsTimezoneOffset(), raw);
-    // 与旧版 DAPI 约定（东经为正）符号相反
-    assert.equal(Number(Utils.jsTimezoneOffset()) + Number(Utils.getTimezoneOffset()), 0);
+    // v4.2.1：旧版 DAPI 东为正的 Utils.getTimezoneOffset 已随死代码清除（无任何现调用），
+    // 不再做双约定符号互验；只钉住 Server Action 必须使用 JS 原始符号这一实测约定。
 });
 
 test("routerStateTree uses the browser-canonical __PAGE__ marker", () => {
@@ -1483,7 +1481,7 @@ test("background detection uses hostname, not just typeof document (sandbox has 
 test("sign 401 (dead legacy endpoint) no longer skips the read task", async () => {
     const d = new Date();
     const today = Number(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`);
-    const { API, RewardsAuto, TaskManager, Utils } = createHarness({
+    const { API, TaskManager, Utils } = createHarness({
         // read 日期未完成 → 非空闲轮；其余今日已完成，缩短 runAll 实际路径
         "Config.tasks": { sign: today, promos: today, search: today, streakDays: 0 },
         "Config.dailySetDone": today,
@@ -1496,7 +1494,9 @@ test("sign 401 (dead legacy endpoint) no longer skips the read task", async () =
     API.renewToken = async () => true;
     API.discoverCards = async () => [];
     API.getRewardsInfo = async () => null;
-    TaskManager.doSign = async () => { RewardsAuto.state.pc401 = true; return true; };
+    // 签到按真实故障形态抛 401（legacy 接口下线场景），验证阅读不被连坐。
+    // v4.2.1：连坐时代的 state.pc401 诊断标志位已随死代码清除，故障经异常表达。
+    TaskManager.doSign = async () => { throw new Error("HTTP 401: legacy reportActivity endpoint retired"); };
     TaskManager.doRead = async () => { readRan++; return true; };
     TaskManager.doPromos = async () => true;
     TaskManager.doSearch = async () => true;
@@ -1508,7 +1508,6 @@ test("sign 401 (dead legacy endpoint) no longer skips the read task", async () =
     await TaskManager.runAll();
 
     assert.ok(readRan > 0, "read must run even after signPC 401s");
-    assert.equal(RewardsAuto.state.pc401, true, "flag still recorded for diagnostics");
 });
 
 test("renewToken keeps an unused auth code on refresh success and logs it", async () => {
@@ -1604,7 +1603,10 @@ test("claimCard abandons without extra posts when the live offer is locked (app-
 test("claimPendingPoints posts empty args to dashboard with dynamic/fallback action id", async () => {
     const posts = [];
     const { API, Utils } = createHarness();
-    const dyn = "1".repeat(40);
+    // 真实长度前提：现网 $ACTION_ID_ 抓包实测 42 位（写死 {40} 会截出无效前缀、
+    // 且候选数仍为 1 反而优先于正确兜底）。40 位夹具曾把错误假设固化为基线。
+    const dyn = "1".repeat(40) + "ab";
+    assert.equal(dyn.length, 42, "夹具必须按真实 42 位构造");
     Utils.fetchPage = async () => `<html>foo $ACTION_ID_${dyn} bar</html>`;
     Utils.xhr = async o => { posts.push(o); return '0:{"a":"$@1"}\n1:true\n'; };
 
@@ -1620,6 +1622,67 @@ test("claimPendingPoints posts empty args to dashboard with dynamic/fallback act
     Utils.fetchPage = async () => "<html>none</html>";
     await API.claimPendingPoints();
     assert.equal(posts[1].headers["next-action"], "00491296f1d668ad46b65342c95cb9d72a62c1fa9d");
+});
+
+test("claimPendingPoints accepts a 42-char Config.claimActionId override (guard regression)", async () => {
+    // 失败日志指引用户"更新 Config.claimActionId"，但旧守卫 /^[a-f0-9]{40}$/ 会把
+    // 正确的 42 位覆盖值拒掉并静默回退过期常量——用户无法自救。
+    const OVERRIDE42 = "a".repeat(40) + "bc";
+    assert.equal(OVERRIDE42.length, 42);
+    assert.notEqual(OVERRIDE42, "00491296f1d668ad46b65342c95cb9d72a62c1fa9d");
+    const posts = [];
+    const { API, Utils } = createHarness({ "Config.claimActionId": OVERRIDE42 });
+    Utils.fetchPage = async () => "<html>no candidates here</html>";
+    Utils.xhr = async o => { posts.push(o); return "0:{}\n1:true\n"; };
+
+    const ok = await API.claimPendingPoints();
+
+    assert.equal(ok, true);
+    assert.equal(posts[0].headers["next-action"], OVERRIDE42, "42 位覆盖值必须通过守卫，不得静默回退兜底常量");
+});
+
+test("getBalance({fresh:true}) bypasses the round cache (今日获取 was pinned at +0)", async () => {
+    // runAll 轮末取数必须 fresh：缓存键绑定轮内恒定的 dateNowNum，
+    // 不绕开的话首尾命中同一缓存、earned 恒为 0。
+    let requests = 0;
+    const balances = [4100, 4300];
+    const { API, Utils } = createHarness();
+    Utils.xhr = async () => {
+        const v = balances[Math.min(requests, balances.length - 1)];
+        requests++;
+        return JSON.stringify({ response: { balance: v } });
+    };
+
+    const first = await API.getBalance();
+    const cached = await API.getBalance();
+    assert.equal(first, 4100);
+    assert.equal(cached, 4100);
+    assert.equal(requests, 1, "轮内第二次非 fresh 调用应命中缓存，不再发请求");
+
+    const fresh = await API.getBalance({ fresh: true });
+    assert.equal(fresh, 4300, "fresh 必须绕开缓存拿到轮末真实余额");
+    assert.equal(requests, 2);
+});
+
+test("debugDailySet action-request log never carries cookie plaintext", async () => {
+    const logged = [];
+    const { TaskManager, Utils } = createHarness({ "Config.debugDailySet": true }, {
+        gmCookie(...args) {
+            const callback = args.find(a => typeof a === "function");
+            callback([{ name: ".MSA.Auth", value: "MSA_SECRET_VALUE_1234567890" }]);
+        },
+    });
+    Utils.log = (...a) => logged.push(a.join(" "));
+    Utils.xhr = async () => "0:{}\n1:true\n";
+
+    const ok = await TaskManager._sendDailySetAction("offer-1", "a".repeat(40), "f".repeat(42), {});
+
+    assert.equal(ok, true);
+    const line = logged.find(l => String(l).includes("Server Action 请求"));
+    assert.ok(line, "调试开启时应输出请求形态日志");
+    assert.ok(!String(line).includes("MSA_SECRET_VALUE_1234567890"), "cookie 值不得进入日志（截图/issue 外泄面）");
+    assert.ok(!/"cookie"\s*:/.test(String(line)), "序列化的 headers 中不得出现 cookie 字段");
+    assert.ok(String(line).includes('"cookies":1'), "作者本意的 cookie 条数应保留");
 });
 
 test("discoverCards overlays earn live state: filters done/locked, restamps live hash", async () => {
