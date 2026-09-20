@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.2.1
+// @version      4.3.0
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.2.0：配套《微软积分商城签到-页面领取》脚本——抓包实证 SW 直连 Server Action 被边缘 503、页面上下文同样请求 200+入账，仅页面上下文可领的 offer 交由页面侧脚本在用户打开 rewards 页时自动完成；v4.1.1：锁定等级卡解析层过滤 + 失败卡计入放弃账本；v4.1.0：App 上报为主路径，服务端对 App 目录外 offer 静默 200+p:0）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -24,7 +24,6 @@
 // @match        https://www.bing.com/*
 // @match        https://cn.bing.com/*
 // @run-at       document-start
-// @grant        unsafeWindow
 // @grant        GM_xmlhttpRequest
 // @grant        GM_notification
 // @grant        GM_openInTab
@@ -34,7 +33,6 @@
 // @grant        GM_info
 // @grant        GM_log
 // @grant        GM_registerMenuCommand
-// @grant        GM_addValueChangeListener
 // @storageName  BingRewardsAuto_Shared
 // ==/UserScript==
 //
@@ -44,7 +42,7 @@
 // （DAPI type 101）实测为主路径入账通道后，Server Action 网页链仅存兜底价值，
 // 不再为它维持页面注入/共享存储桥/救援标签页。全部请求走 SW 直连。
 
-/* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab, GM_addValueChangeListener */
+/* global GM_cookie, GM_getValue, GM_setValue, GM_xmlhttpRequest, GM_log, GM_info, GM_notification, GM_openInTab, GM_registerMenuCommand */
 
 /* ==UserConfig==
 Config:
@@ -69,6 +67,10 @@ Config:
         values: [offline, hot.nntool.cc, hot.baiwumm.com, hot.cnxiaobai.com]
     debugDailySet:
         title: 调试日志（输出每日活动原始字段，排查用）
+        type: checkbox
+        default: false
+    debugDAPI:
+        title: DAPI调试日志（输出getuserinfo/DAPI诊断细节，排查用）
         type: checkbox
         default: false
     code:
@@ -271,6 +273,10 @@ Notice:
             ip: "",
             ipInfo: "",
             startTime: 0,
+            // 本轮"边缘拦截（503+Bing 错误页）"标记：_sendDailySetAction 首次检出时
+            // 置位，doDailySet 跳过本轮剩余项。仅本轮内存态，doDailySet 入口显式归零
+            //（同实例经菜单"立即运行"重复触发 runAll 时也不会跨轮残留）。
+            dailySetEdgeBlocked: false,
         }
     };
 
@@ -485,6 +491,11 @@ Notice:
         cookieHeaderFor(url, timeoutMs = 2500) {
             return new Promise((resolve) => {
                 let done = false;
+                // 提前声明（#11 防御加固）：report 在闭包中引用 timer，当前所有调用点
+                // 都晚于 setTimeout 赋值行，TDZ 不可达；若未来重构把 report 调用挪到
+                // 赋值之前，届时 clearTimeout(timer) 会抛 ReferenceError 且 Promise
+                // 永久挂起，比空置更难排查。
+                let timer;
                 const report = (cookie, diag) => {
                     if (done) return; done = true;
                     clearTimeout(timer);
@@ -498,7 +509,7 @@ Notice:
                     }
                     resolve(cookie);
                 };
-                const timer = setTimeout(() => report("", { form: "timeout", error: `${timeoutMs}ms 无回调` }), timeoutMs);
+                timer = setTimeout(() => report("", { form: "timeout", error: `${timeoutMs}ms 无回调` }), timeoutMs);
                 try {
                     if (typeof GM_cookie === "function") {
                         GM_cookie("list", { url }, (cookies, error) => {
@@ -888,7 +899,12 @@ Notice:
                     RewardsAuto.state.token = null;
                     const refreshed = await this.renewToken();
                     if (!refreshed) return null;
-                    return await requestFn(RewardsAuto.state.token);
+                    // v4.3.0 判空守卫：续期"成功"但 state.token 仍非真值（如 renewToken
+                    // 语义变动/并发清空）时，直接返回 null，不得把 null 传给 requestFn
+                    // 拼出 "Bearer null" 鉴权头。
+                    token = RewardsAuto.state.token;
+                    if (!token) return null;
+                    return await requestFn(token);
                 }
                 throw e;
             }
@@ -909,21 +925,26 @@ Notice:
         // 统一的 DAPI 请求：自动携带 App 端鉴权头、Token 失效重试，返回原始响应文本
         async _dapiRequest({ path = "/me/activities", method = "POST", body = null, region = null, extraHeaders = {} }) {
             const country = region || this._resolveRegion();
-            return this.withTokenRetry(token => Utils.xhr({
-                method,
-                url: `https://prod.rewardsplatform.microsoft.com/dapi${path}`,
-                headers: {
-                    "content-type": "application/json; charset=UTF-8",
-                    "user-agent": RewardsAuto.ua.app,
-                    "authorization": `Bearer ${token}`,
-                    "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
-                    "x-rewards-ismobile": "true",
-                    "x-rewards-country": country,
-                    "x-rewards-language": "zh",
-                    ...extraHeaders
-                },
-                data: body ? JSON.stringify(body) : undefined
-            }));
+            return this.withTokenRetry(token => {
+                // v4.3.0 判空守卫：token 非真值时不发请求（此前会无条件拼出 "Bearer null"
+                // 鉴权头），与 withTokenRetry 既有 `if (!token) return null` 模式一致。
+                if (!token) return null;
+                return Utils.xhr({
+                    method,
+                    url: `https://prod.rewardsplatform.microsoft.com/dapi${path}`,
+                    headers: {
+                        "content-type": "application/json; charset=UTF-8",
+                        "user-agent": RewardsAuto.ua.app,
+                        "authorization": `Bearer ${token}`,
+                        "x-rewards-appid": RewardsAuto.appConfig.rewardsAppId,
+                        "x-rewards-ismobile": "true",
+                        "x-rewards-country": country,
+                        "x-rewards-language": "zh",
+                        ...extraHeaders
+                    },
+                    data: body ? JSON.stringify(body) : undefined
+                });
+            });
         },
 
         // 统一的 getuserinfo 请求（无需 Token），解析失败返回 null。
@@ -1060,7 +1081,16 @@ Notice:
         },
 
         async renewToken() {
-            if (!GM_getValue("Tasks.sign", true) && !GM_getValue("Tasks.read", true)) return true;
+            // v4.3.0：续期门槛扩展为四个 DAPI 消费任务（此前只看 sign/read——promos
+            // 的 App 上报路径与 search 的 DAPI 配额查询同关时漏判，带着过期 Token
+            // 空跑）；且早退语义与"续期成功"解耦：无任何消费方开启时跳过续期并
+            // 返回 false，不再假成功返回 true。runAll 的 isTokenOK 逻辑据此区分
+            // "无需续期"与"续期失败"，不会触发误告警（见 runAll 同名处理）。
+            if (!GM_getValue("Tasks.sign", true) && !GM_getValue("Tasks.read", true) &&
+                !GM_getValue("Tasks.promos", true) && !GM_getValue("Tasks.search", true)) {
+                Utils.log("🟡", "签入/阅读/活动卡片/搜索任务均已关闭，跳过 Token 续期");
+                return false;
+            }
 
             const authUrl = "https://login.live.com/oauth20_authorize.srf?client_id=0000000040170455&response_type=code&scope=service::prod.rewardsplatform.microsoft.com::MBI_SSL&redirect_uri=https://login.live.com/oauth20_desktop.srf";
             // @crontab 运行环境（service_worker/sandbox）无微软登录 Cookie，自动获取授权码
@@ -1650,6 +1680,12 @@ Notice:
         // 需要 Token，失败返回 null；options 作为缓存键的一部分，不同 options 独立缓存。
         // region 默认 cn：这些端点原本就固定发往国区（与 _dapiRequest 的动态区域不同），保持不变。
         async _getMeInfo(options = "613", fetchOpts, region = "cn") {
+            // v4.3.0 判空守卫：Token 非真值时不发请求——此前会无条件拼出
+            // "Bearer false"/"Bearer null" 鉴权头（getBalance 不受开关门控调用本函数，
+            // 静默取 0 只能靠 _getUserInfo 兜底）。返回 null 保持既有语义：调用方
+            // （getBalance/getReadProgress/getSearchQuotaFromAPI）本就按 null 走
+            // 各自的兜底/失败分支。
+            if (!RewardsAuto.state.token) return null;
             try {
                 const res = await Utils.fetchPage({
                     url: "https://prod.rewardsplatform.microsoft.com/dapi/me?channel=SAAndroid&options=" + options,
@@ -2160,27 +2196,34 @@ Notice:
         // POST https://rewards.bing.com/dashboard，body 为空参数数组 []，
         // next-action 为 claim 专用 ID（独立于 reportActivity，随部署轮换，且仅在
         // 页面存在可领取项时随 flight 下发 "$ACTION_ID_xxx"）。成功响应包含 `1:true`。
-        // 解析顺序：页面 $ACTION_ID_ 唯一候选 → Config.claimActionId 覆盖值 → 抓包兜底值。
+        // v4.3.0：action ID 来源收敛为 页面 $ACTION_ID_ 唯一候选 → Config.claimActionId
+        // 覆盖值。页面未下发唯一 $ACTION_ID_ 信号（候选 0 个=无待领、≥2 个=结构歧义）
+        // 时拿旧 ID POST 必不被受理，直接跳过本轮；抓包兜底常量已过期（2026-09-14），
+        // 与页面侧《页面领取》脚本同款退役——保留只会产出误导性的失败日志。
         async claimPendingPoints() {
             const DASH = "https://rewards.bing.com/dashboard";
+            // 长度必须用 {40,64} 宽区间：现网 action ID 实测 42 位，
+            // 写死 {40} 会把用户按日志指引填回的正确 42 位覆盖值拒掉。
             let actionId = String(GM_getValue("Config.claimActionId", "") || "");
-            // 长度必须用 {40,64} 宽区间：现网 action ID 实测 42 位（兜底常量即 42 位），
-            // 写死 {40} 会把用户按日志指引填回的正确 42 位覆盖值拒掉、静默回退过期常量。
-            if (!/^[a-f0-9]{40,64}$/.test(actionId)) {
-                actionId = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d"; // 2026-09-14 dpl=20260912-2 抓包
-            }
+            if (!/^[a-f0-9]{40,64}$/.test(actionId)) actionId = "";
             try {
                 const html = await Utils.fetchPage({ url: DASH, headers: { "user-agent": RewardsAuto.ua.pc } }, { fresh: true });
                 if (html) {
                     // {40,64} 宽区间：现网 $ACTION_ID_ 实测 42 位，写死 {40} 会截出
-                    // 无效前缀且"候选数仍为 1"——截断值反而优先于正确兜底被采用
+                    // 无效前缀且"候选数仍为 1"——截断值反而优先于正确候选被采用
                     const ids = new Set(
                         (String(html).match(/\$ACTION_ID_([a-f0-9]{40,64})/g) || [])
                             .concat((Utils.concatFlightChunks(html).match(/\$ACTION_ID_([a-f0-9]{40,64})/g) || []))
                             .map(s => s.slice(11)));
                     if (ids.size === 1) actionId = [...ids][0];
                 }
-            } catch (_) { /* 拿不到就用配置/兜底值 */ }
+            } catch (_) { /* 拿不到页面信号时仅依赖覆盖值 */ }
+            if (!actionId) {
+                // 用户显式配置的 Config.claimActionId 覆盖值仍会走到下方 POST；
+                // 此处仅拦截"既无页面信号也无覆盖值"的轮次。
+                Utils.log("🟡", "欢迎积分无待领信号（页面未下发唯一 $ACTION_ID_，且无有效 Config.claimActionId 覆盖值），跳过领取");
+                return false;
+            }
             const dpl = this._currentDpl();
             const headers = {
                 "accept": "text/x-component",
@@ -2197,7 +2240,8 @@ Notice:
             try {
                 const res = await Utils.xhr({ method: "POST", url: DASH, headers, data: "[]" });
                 if (typeof res === "string" && res.includes("1:true")) return true;
-                Utils.log("🟡", `欢迎积分领取响应形态异常: ${String(typeof res === "string" ? res : (res && res.status) || "?").slice(0, 80)}`);
+                // 2xx 无 1:true：action 未被执行（cookie 链缺失/ID 不被受理），非响应结构损坏
+                Utils.log("🟡", `欢迎积分领取未确认（2xx 响应无 1:true，action 可能未执行）: ${String(typeof res === "string" ? res : (res && res.status) || "?").slice(0, 80)}`);
                 return false;
             } catch (e) {
                 Utils.log("🟡", `欢迎积分领取失败（action id 可能已轮换，可更新 Config.claimActionId）: ${e.message}`);
@@ -2538,6 +2582,12 @@ Notice:
     // 活动卡片"连续未确认"放弃上限：某卡片服务端连续 N 次复核仍未确认完成时，
     // 当日不再重复上报（多为需真实访问才结算的开放型卡片），次日按日期清零重试。
     const PROMOS_GIVE_UP_AFTER = 5;
+
+    // 每日活动"当日连续失败"放弃上限（v4.3.0）：Config.dailySetFail 此前只计数无
+    // 上限，接口异常/边缘拦截日每 20 分钟轮次都会全量重试。当日失败达上限即当日
+    // 放弃（任务返回 true 对齐 promos 放弃语义），以 {date,count} 结构按日自动重置；
+    // 放弃不写 Config.dailySetDone，次日自愈逻辑不受影响。
+    const DAILY_SET_GIVE_UP_AFTER = 5;
 
     // 运行锁参数：运行中心跳每 5 分钟续期一次；过期窗口 20 分钟（> 2 个心跳周期），
     // 既保证活跃长任务不被误判过期，又把实例意外终止（关标签页/SW 被杀）后
@@ -2991,11 +3041,22 @@ Notice:
                 Utils.log("📅", "每日活动今日已完成，跳过");
                 return true;
             }
+            // v4.3.0：当日连续失败达上限（DAILY_SET_GIVE_UP_AFTER，仿 PROMOS_GIVE_UP_AFTER）
+            // 即当日放弃——返回 true 对齐 promos 放弃语义；不写 Config.dailySetDone，
+            // 次日 {date} 失配自动重置，自愈逻辑不受影响。
+            const savedFailRec = GM_getValue("Config.dailySetFail", null);
+            if (savedFailRec && typeof savedFailRec === "object" &&
+                savedFailRec.date === today && (Number(savedFailRec.count) || 0) >= DAILY_SET_GIVE_UP_AFTER) {
+                Utils.log("🟡", `每日活动当日已连续失败 ${Number(savedFailRec.count)} 轮（上限 ${DAILY_SET_GIVE_UP_AFTER}），今日放弃重试`);
+                return true;
+            }
             const processedKey = "Config.dailySetProcessed";
             let processed = GM_getValue(processedKey, []);
             if (!Array.isArray(processed)) processed = [];
             if (processed.length > 0 && processed[0]?.date !== today) processed = [];
             const processedIds = new Set(processed.map(p => p.offerId));
+            // 同实例重复触发时清掉上一轮的边缘拦截标记，作用域严格限定单轮
+            RewardsAuto.state.dailySetEdgeBlocked = false;
 
             Utils.log("📅", `开始执行每日活动（已处理 ${processedIds.size} 个）...`);
             await Utils.randomDelay(3000, 8000);
@@ -3034,12 +3095,34 @@ Notice:
                 pendingItems.push(...rest);
             }
 
+            // v4.3.0：空清单早退。两条路径可汇合到空清单——① items 为空数组（非 null，
+            // 上方守卫不触发）；② 阶梯0 App 上报把全部 pending 项出列。此时若继续走
+            // 网页阶梯：_extractDailySetHashes 会以空 pendingIds 触发前缀兜底，用非
+            // fresh 陈旧 items 收出无关 hash，_sendDailySetAction 又把刚入账 offer 的
+            // 链接再开一遍；_resolveReportActivityActionId 也会在判定前无条件执行
+            // （最多 16 个 chunk GET 纯浪费）。判定为"本轮无待办"：置当日完成判据、
+            // 任务级早退（对齐上方 items 全完成分支的写法；不写 processed 账本，
+            // 不伪造任何 offer 的入账记录）。
+            if (pendingItems.length === 0) {
+                Utils.log("✅", "每日活动无待办项（列表为空或已全部 App 上报出列）");
+                GM_setValue("Config.dailySetDone", today);
+                return true;
+            }
+
             // 2) 优先：从 flight 流解析每个活动的专属 hash，发送 Server Action 完成（纯后台请求，不打开网页）
             const hashes = await this._extractDailySetHashes(pendingItems);
             const nextAction = await API._resolveReportActivityActionId() || RewardsAuto._nextAction;
             if (hashes.length > 0) {
                 Utils.log("📅", `解析到 ${hashes.length} 个每日活动 hash，开始完成上报...`);
                 for (const h of hashes) {
+                    // v4.3.0：边缘拦截（503+Bing 错误页）是结构性拒绝，对本轮所有
+                    // offer 同样成立——首次检出后跳过剩余项，避免每项 1+2+1 的
+                    // 冗余请求。标记为本轮内存态（RewardsAuto.state.dailySetEdgeBlocked），
+                    // 不跨轮残留。
+                    if (RewardsAuto.state.dailySetEdgeBlocked) {
+                        Utils.log("🟡", `边缘拦截已检出，跳过剩余每日活动上报（含 ${h.offerId}），转交《页面领取》脚本`);
+                        break;
+                    }
                     Utils.log("📅", `完成每日活动: ${h.offerId}`);
                     const variants = Array.isArray(h.variants) && h.variants.length > 0
                         ? h.variants
@@ -3071,6 +3154,12 @@ Notice:
 
                 // 复查完成状态（上报后的状态变化必须绕过缓存）；rnoreward 跳转入账
                 // 有数秒延迟（v3.6.12：4-8 秒实测偏短，出现过 0/3 误报后同轮二次扫描又确认成功）
+                // v4.3.0：本轮已检出边缘拦截时跳过复查——同轮内拦截态不会解除，复查
+                // 必然 503，直接返回 false 交由 runAll 计入当日失败账本。
+                if (RewardsAuto.state.dailySetEdgeBlocked) {
+                    Utils.log("🟡", "本轮每日活动上报被边缘拦截，跳过复查，下轮重试");
+                    return false;
+                }
                 await Utils.randomDelay(8000, 15000);
                 const after = await API.getDailySetItems({ fresh: true });
                 if (after && after.length > 0) {
@@ -3106,17 +3195,20 @@ Notice:
                 Utils.log("🟡", `仍有 ${pendingItems.length} 个每日活动未完成，但未提取到可用链接`);
                 return false;
             }
-            let opened = 0;
+            let tabCount = 0;
             for (let i = 0; i < urls.length; i++) {
                 try {
-                    GM_openInTab(urls[i], { active: false, insert: true });
-                    opened++;
+                    // 接句柄并 10 秒后关闭（与 claimCard 策略5 同款模式）：此前不接句柄
+                    // 是全脚本唯一不管理生命周期的开页点，泄漏随 20 分钟轮次累积。
+                    const opened = GM_openInTab(urls[i], { active: false, insert: true });
+                    setTimeout(() => { try { if (opened && opened.close) opened.close(); } catch (_) {} }, 10000);
+                    tabCount++;
                 } catch (e) {
                     Utils.log("🟡", `打开活动链接失败: ${e.message}`);
                 }
                 await Utils.randomDelay(6000, 12000);
             }
-            if (opened === 0) return false;
+            if (tabCount === 0) return false;
 
             // 打开链接只代表已触发操作，仍需以后端状态为准，避免把弹窗失败或页面结构变化误记为完成。
             await Utils.randomDelay(8000, 15000);
@@ -3458,10 +3550,22 @@ Notice:
                 if (typeof res === "string") {
                     Utils.log("🟡", `Server Action ${shape} 未执行(${offerId}): 2xx 无 1:true（cookie 链缺失特征）: ${res.slice(0, 100)}`);
                 } else {
-                    Utils.log("🟡", `Server Action ${shape} 失败(${offerId}): HTTP ${res && res.status ? res.status : "?"}: ${String(res && res.body || "").slice(0, 240)}`);
+                    // v4.3.0：acceptErrorBody 下 503+Bing 错误页走的是 resolve（非 reject），
+                    // 只在 catch 判 isEdgeBlockedError 会静默失效（claimCard 走的是抛错
+                    // 路径）。此处合成同构消息 "HTTP <status>: <body>" 后判定，检出即置
+                    // 本轮标记，doDailySet 据此跳过本轮剩余项（结构性拦截对全体 offer 成立）。
+                    const detail = `HTTP ${res && res.status ? res.status : "?"}: ${String(res && res.body || "")}`;
+                    if (Utils.isEdgeBlockedError(detail)) {
+                        RewardsAuto.state.dailySetEdgeBlocked = true;
+                        Utils.log("🟡", `Server Action ${shape} 被边缘拦截(${offerId}): SW 直连被 503 拦截，本轮剩余项跳过，转交《页面领取》脚本`);
+                        return false;
+                    }
+                    Utils.log("🟡", `Server Action ${shape} 失败(${offerId}): ${detail.slice(0, 240)}`);
                 }
                 return false;
             } catch (e) {
+                // 抛错路径（网络错误/超时等）同样判定，保持与 resolve 路径口径一致
+                if (Utils.isEdgeBlockedError(e)) RewardsAuto.state.dailySetEdgeBlocked = true;
                 Utils.log("🟡", `Server Action ${shape} 请求异常(${offerId}): ${e.message}`);
                 return false;
             }
@@ -3703,13 +3807,23 @@ Notice:
             Utils.log("📊", `初始积分: ${startBalance}`);
 
             const regionOK = await API.checkRegion();
-            
-            // Token 续期
+
+            // Token 续期。renewToken 返回 false 有两种情形：① 四个 DAPI 消费任务
+            // （sign/read/promos/search）全部关闭 → "无需续期"，不算失败（各任务
+            // 函数自己的开关守卫会跳过）；② 有任务开启但续期失败 → 本轮 DAPI 通道
+            // 不可用。两种情形都不阻断后续任务（web 路径不依赖 Token），沿用既有
+            // isTokenOK 门控不变，仅日志区分，避免"无需续期"被误报为 Token 失败。
             let isTokenOK = false;
             if (regionOK) {
                 isTokenOK = await API.renewToken();
                 if (!isTokenOK) {
-                    Utils.log("🟡", "Token失败，跳过签入/阅读", true);
+                    const anyDapiTask = GM_getValue("Tasks.sign", true) || GM_getValue("Tasks.read", true) ||
+                        GM_getValue("Tasks.promos", true) || GM_getValue("Tasks.search", true);
+                    if (anyDapiTask) {
+                        Utils.log("🟡", "Token失败，跳过签入/阅读", true);
+                    } else {
+                        Utils.log("🟡", "DAPI 消费任务均已关闭，本轮无需续期 Token");
+                    }
                 }
             } else {
                 Utils.log("🔴", "IP非国内，已暂停全部任务", true);
@@ -3783,15 +3897,24 @@ Notice:
             Utils.log("📅", "开始执行每日活动任务...");
             const dailySetOk = await runOnce(() => this.doDailySet(), "每日活动");
             if (dailySetOk === false) {
-                // 记录跨轮次失败次数用于诊断，但不伪造“已完成”状态。
+                // 记录跨轮次失败次数用于诊断，但不伪造"已完成"状态。
+                // v4.3.0：结构改为 {date, count}（以当日 dateNowNum 为键，跨日自动重置），
+                // 当日连续失败达 DAILY_SET_GIVE_UP_AFTER 时当日放弃（下一轮
+                // doDailySet 入口门直接返回 true），不再每 20 分钟全量重试。
                 const savedFailRec = GM_getValue("Config.dailySetFail", null);
                 const failRec = savedFailRec && typeof savedFailRec === "object"
                     ? savedFailRec
                     : { date: 0, count: 0 };
                 const fails = failRec.date === RewardsAuto.state.dateNowNum ? (Number(failRec.count) || 0) + 1 : 1;
                 GM_setValue("Config.dailySetFail", { date: RewardsAuto.state.dateNowNum, count: fails });
-                Utils.log("🟡", `每日活动本轮未能确认完成（连续 ${fails} 轮），保留待重试状态`);
+                if (fails >= DAILY_SET_GIVE_UP_AFTER) {
+                    Utils.log("🟡", `每日活动当日已连续失败 ${fails} 轮（上限 ${DAILY_SET_GIVE_UP_AFTER}），今日放弃重试，次日自动恢复`);
+                } else {
+                    Utils.log("🟡", `每日活动本轮未能确认完成（连续 ${fails} 轮），保留待重试状态`);
+                }
             } else if (dailySetOk === true) {
+                // 成功清零，对齐 {date, count} 结构（含 doDailySet 入口放弃门返回 true
+                // 的情形——保持记录日期为当日，不影响次日重置判定）
                 GM_setValue("Config.dailySetFail", { date: RewardsAuto.state.dateNowNum, count: 0 });
             }
 
@@ -4063,13 +4186,17 @@ Notice:
         TaskManager.init();
 
         // 检查今日任务是否已完成
+        // v4.3.0：口径与 _isIdle 对齐——补上 punchCardBgDone。此前 isAllDone 只看
+        // 四任务 + dailySetDone，打卡（如 doPunchCard 抓取失败返回 false）未完成时
+        // keep=false 会在本函数提前 return，调度语句永不执行，当日剩余 tick 零调度。
         const isKeep = GM_getValue("Config.keep", true);
         const checkDone = (enabled, date) => !enabled || date === RewardsAuto.state.dateNowNum;
         const isAllDone = checkDone(GM_getValue("Tasks.sign", true), TaskManager.signDate) &&
                           checkDone(GM_getValue("Tasks.read", true), TaskManager.readDate) &&
                           checkDone(GM_getValue("Tasks.promos", true), TaskManager.promosDate) &&
                           checkDone(GM_getValue("Tasks.search", true), TaskManager.searchDate) &&
-                          GM_getValue("Config.dailySetDone", 0) === RewardsAuto.state.dateNowNum;
+                          GM_getValue("Config.dailySetDone", 0) === RewardsAuto.state.dateNowNum &&
+                          GM_getValue("Config.punchCardBgDone", 0) === RewardsAuto.state.dateNowNum;
 
         if (!isKeep && isAllDone) {
             Utils.log("💤", "今日任务已全部完成");

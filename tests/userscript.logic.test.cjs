@@ -6,7 +6,7 @@ const vm = require("node:vm");
 
 const scriptPath = path.resolve(__dirname, "..", "微软积分商城签到（全能智能重构版）.user.js");
 
-function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
+function createHarness(initialStorage = {}, { gmXhr, gmCookie, setTimeout: setTimeoutOverride } = {}) {
     const storage = new Map(Object.entries(initialStorage));
     const intervals = { set: [], cleared: [] };
     const openTabs = [];
@@ -14,14 +14,13 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     const entryPattern = /\s*\/\/ ====== 后台模式入口 ======\s*\r?\n\s*init\(\);\s*\r?\n\s*\}\)\(\);/;
     assert.match(source, entryPattern, "test harness could not locate the userscript entry point");
     source = source.replace(entryPattern, `
-    globalThis.__userscriptTest = { RewardsAuto, Utils, API, TaskManager };
+    globalThis.__userscriptTest = { RewardsAuto, Utils, API, TaskManager, init };
 })();`);
 
     const context = {
         URL,
         URLSearchParams,
-        clearTimeout,
-        console: { debug() {}, error() {}, log() {} },
+        clearTimeout,        console: { debug() {}, error() {}, log() {} },
         crypto: globalThis.crypto,
         GM_addValueChangeListener() {},
         GM_cookie() {},
@@ -50,7 +49,7 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
         confirm() { return false; },
         location: { hostname: "test.invalid", pathname: "/", search: "" },
         prompt() { return null; },
-        setTimeout,
+        setTimeout: setTimeoutOverride || setTimeout,
         // runAll 的运行锁心跳通过计时器实现；记录回调与周期供断言/手动触发使用
         setInterval: (fn, ms) => { intervals.set.push({ fn, ms }); return intervals.set.length; },
         clearInterval: (id) => { intervals.cleared.push(id); },
@@ -58,7 +57,7 @@ function createHarness(initialStorage = {}, { gmXhr, gmCookie } = {}) {
     context.globalThis = context;
     vm.createContext(context);
     vm.runInContext(source, context, { filename: scriptPath });
-    return { ...context.__userscriptTest, storage, intervals, openTabs };
+    return { ...context.__userscriptTest, storage, intervals, openTabs, setTimeoutOverride };
 }
 
 test("claimCard returns false when all earn-action strategies fail (legacy path retired)", async () => {
@@ -615,12 +614,15 @@ test("getuserinfo is fetched once per run across all consumers", async () => {
 
 test("getReadProgress and getSearchQuotaFromAPI share one DAPI /me request", async () => {
     const { API, RewardsAuto, Utils } = createHarness();
+    // v4.3.0：_getMeInfo 入口判空——须配置有效 token 才能走到 DAPI /me 共享缓存路径
+    RewardsAuto.state.token = "at-mock";
     RewardsAuto.state.dateNowNum = 20260810;
     let fetches = 0;
     Utils.xhr = async options => {
         fetches++;
         assert.ok(options.url.includes("prod.rewardsplatform.microsoft.com/dapi/me"));
         assert.equal(options.headers["x-rewards-country"], "cn");
+        assert.equal(options.headers.authorization, "Bearer at-mock");
         return JSON.stringify({
             response: {
                 balance: 1234,
@@ -639,6 +641,23 @@ test("getReadProgress and getSearchQuotaFromAPI share one DAPI /me request", asy
     assert.equal(JSON.stringify(read), JSON.stringify({ progress: 3, max: 30 }));
     assert.equal(quota.pc.progress, 5);
     assert.equal(balance, 1234);
+});
+
+test("getReadProgress with no token sends no DAPI request and reports failure", async () => {
+    // v4.3.0 判空守卫回归：state.token 非真值时 _getMeInfo 直接 return null，
+    // 绝不能拼出 "Bearer false"/"Bearer null" 鉴权头发请求。
+    const { API, RewardsAuto, Utils } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260810;
+    const dapiUrls = [];
+    Utils.xhr = async options => {
+        if (String(options.url).includes("prod.rewardsplatform.microsoft.com")) {
+            dapiUrls.push(options.url);
+        }
+        return "<html></html>";
+    };
+
+    assert.equal(await API.getReadProgress(), false, "无 token 时阅读进度走失败分支");
+    assert.equal(dapiUrls.length, 0, "无 token 不得发出任何 DAPI /me 请求");
 });
 
 test("cache key includes the run day so a new day invalidates the cache", async () => {
@@ -731,6 +750,13 @@ function flightHtml(...payloads) {
         .map(p => `self.__next_f.push([1,${JSON.stringify(p)}])`)
         .join(";</script><script>");
     return `<html><body><script>${pushes}</script></body></html>`;
+}
+
+// v4.3.0 init 口径测试共用：TaskManager.init 与主脚本 init 均以 Utils.getTodayNum()
+// 为"今天"基准，测试侧用同款计算避免硬编码日期跨日失效
+function Utils_getTodayNumForInit() {
+    const d = new Date();
+    return Number(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`);
 }
 
 test("concatFlightChunks decodes and joins __next_f payload strings", () => {
@@ -1600,11 +1626,11 @@ test("claimCard abandons without extra posts when the live offer is locked (app-
     assert.equal(posts.length, 1, "locked offers must short-circuit after the single failed attempt");
 });
 
-test("claimPendingPoints posts empty args to dashboard with dynamic/fallback action id", async () => {
+test("claimPendingPoints posts empty args with the unique $ACTION_ID_ signal and skips without one", async () => {
     const posts = [];
     const { API, Utils } = createHarness();
     // 真实长度前提：现网 $ACTION_ID_ 抓包实测 42 位（写死 {40} 会截出无效前缀、
-    // 且候选数仍为 1 反而优先于正确兜底）。40 位夹具曾把错误假设固化为基线。
+    // 且候选数仍为 1）。42 位夹具同时验证 {40,64} 宽区间守卫不截断。
     const dyn = "1".repeat(40) + "ab";
     assert.equal(dyn.length, 42, "夹具必须按真实 42 位构造");
     Utils.fetchPage = async () => `<html>foo $ACTION_ID_${dyn} bar</html>`;
@@ -1618,10 +1644,12 @@ test("claimPendingPoints posts empty args to dashboard with dynamic/fallback act
     assert.equal(posts[0].data, "[]");
     assert.equal(posts[0].headers["next-action"], dyn);
 
-    // 页面没有唯一 $ACTION_ID 候选 → 抓包兜底 id
+    // v4.3.0：页面没有唯一 $ACTION_ID 候选且无 Config.claimActionId 覆盖值 →
+    // 兜底常量已退役，不得再 POST，直接轻量日志 + return false
     Utils.fetchPage = async () => "<html>none</html>";
-    await API.claimPendingPoints();
-    assert.equal(posts[1].headers["next-action"], "00491296f1d668ad46b65342c95cb9d72a62c1fa9d");
+    const skipped = await API.claimPendingPoints();
+    assert.equal(skipped, false, "无唯一 action id 信号时必须跳过领取");
+    assert.equal(posts.length, 1, "无信号轮次不得发出任何 POST");
 });
 
 test("claimPendingPoints accepts a 42-char Config.claimActionId override (guard regression)", async () => {
@@ -1644,10 +1672,14 @@ test("claimPendingPoints accepts a 42-char Config.claimActionId override (guard 
 test("getBalance({fresh:true}) bypasses the round cache (今日获取 was pinned at +0)", async () => {
     // runAll 轮末取数必须 fresh：缓存键绑定轮内恒定的 dateNowNum，
     // 不绕开的话首尾命中同一缓存、earned 恒为 0。
+    // v4.3.0：_getMeInfo 入口判空——harness 须配置有效 token 才能走 DAPI 取数路径。
     let requests = 0;
     const balances = [4100, 4300];
-    const { API, Utils } = createHarness();
-    Utils.xhr = async () => {
+    const { API, RewardsAuto, Utils } = createHarness();
+    RewardsAuto.state.token = "at-mock";
+    Utils.xhr = async options => {
+        assert.ok(String(options.headers.authorization).startsWith("Bearer at-mock"),
+            "DAPI /me 请求必须携带真实 Bearer 鉴权头");
         const v = balances[Math.min(requests, balances.length - 1)];
         requests++;
         return JSON.stringify({ response: { balance: v } });
@@ -1662,6 +1694,25 @@ test("getBalance({fresh:true}) bypasses the round cache (今日获取 was pinned
     const fresh = await API.getBalance({ fresh: true });
     assert.equal(fresh, 4300, "fresh 必须绕开缓存拿到轮末真实余额");
     assert.equal(requests, 2);
+});
+
+test("getBalance without a token falls back to getuserinfo and sends no DAPI request", async () => {
+    // v4.3.0 判空守卫：state.token 非真值时 _getMeInfo 直接 return null，
+    // getBalance 落到 _getUserInfo 既有兜底——绝不能拼出 "Bearer null"/"Bearer false"。
+    const dapiUrls = [];
+    const { API, RewardsAuto, Utils } = createHarness();
+    assert.ok(!RewardsAuto.state.token, "harness 默认无 token 前提成立");
+    Utils.xhr = async options => {
+        if (String(options.url).includes("prod.rewardsplatform.microsoft.com")) {
+            dapiUrls.push(options.url);
+        }
+        return JSON.stringify({ dashboard: { availablePoints: 4260, dailySetPromotions: {}, userStatus: { counters: {} } } });
+    };
+
+    const balance = await API.getBalance();
+
+    assert.equal(balance, 4260, "无 token 时走 getuserinfo 兜底取数");
+    assert.equal(dapiUrls.length, 0, "无 token 不得发出任何 DAPI 请求");
 });
 
 test("debugDailySet action-request log never carries cookie plaintext", async () => {
@@ -1855,7 +1906,15 @@ test("server-action posts carry x-deployment-id when a dpl is known", async () =
         "Config.reportAction": { dpl: "20260912-2", id: "f".repeat(40) },
     });
     API._resolveReportActivityActionId = async () => "f".repeat(40);
-    Utils.fetchPage = async () => "<html></html>";
+    // claimPendingPoints 需要 dashboard 页下发唯一 $ACTION_ID_ 信号才会 POST
+    // （v4.3.0：兜底常量已退役，无信号轮次直接跳过）——含信号后仍验证 dpl 头。
+    const dyn = "2".repeat(40) + "ab";
+    Utils.fetchPage = async options => {
+        if (String(options.url) === "https://rewards.bing.com/dashboard") {
+            return `<html>$ACTION_ID_${dyn}</html>`;
+        }
+        return "<html></html>";
+    };
     Utils.xhr = async o => { posts.push(o); return "1:true"; };
 
     await API.claimCard({ offerId: "O1", hash: "c".repeat(64), points: 10 });
@@ -1863,7 +1922,9 @@ test("server-action posts carry x-deployment-id when a dpl is known", async () =
 
     assert.equal(posts[0].url, "https://rewards.bing.com/earn");
     assert.equal(posts[0].headers["x-deployment-id"], "20260912-2");
+    assert.equal(posts.length, 2, "claimPendingPoints 有唯一信号时必须照常 POST");
     assert.equal(posts[1].url, "https://rewards.bing.com/dashboard");
+    assert.equal(posts[1].headers["next-action"], dyn);
     assert.equal(posts[1].headers["x-deployment-id"], "20260912-2");
     // v3.6.16：直连补齐浏览器指纹头（sec-fetch-*），earn 动作对齐 origin/referer/UA
     assert.equal(posts[0].headers["sec-fetch-site"], "same-origin");
@@ -1871,6 +1932,22 @@ test("server-action posts carry x-deployment-id when a dpl is known", async () =
     assert.equal(posts[0].headers["sec-fetch-dest"], "empty");
     assert.equal(posts[0].headers.origin, "https://rewards.bing.com");
     assert.ok(posts[0].headers["user-agent"]);
+});
+
+test("claimPendingPoints sends no POST when the page has no unique $ACTION_ID_ signal", async () => {
+    // v4.3.0：场景页无 $ACTION_ID_ 信号（旧版在此用已退役的兜底常量 POST）——
+    // 现在必须零请求跳过，Config.reportAction 里的 dpl/id 也不得被挪用。
+    const posts = [];
+    const { API, Utils } = createHarness({
+        "Config.reportAction": { dpl: "20260912-2", id: "f".repeat(40) },
+    });
+    Utils.fetchPage = async () => "<html>no action signal</html>";
+    Utils.xhr = async o => { posts.push(o); return "1:true"; };
+
+    const ok = await API.claimPendingPoints();
+
+    assert.equal(ok, false);
+    assert.equal(posts.length, 0, "无信号轮次不得发出任何 POST");
 });
 
 // ====== v4.1.1：锁定等级卡不再阻塞"活动卡片✅"（2026-09-17 日志实证） ======
@@ -1996,4 +2073,393 @@ test("second scan keeps promosDate only while failed cards are below the give-up
     await TaskManager.runAll();
     assert.equal(TaskManager.promosDate, 0);
     assert.equal(storage.get("Config.promosUnconfirmed").offers.locked, 2);
+});
+
+// ====== v4.3.0：每日活动空清单早退 + 当日放弃上限 + 边缘拦截短路 ======
+
+test("doDailySet exits early when every item is already complete (empty pending list)", async () => {
+    // 空清单早退（v4.3.0）：全完成时不再走网页阶梯——不调 _extractDailySetHashes、
+    // 不调 _resolveReportActivityActionId（chunk GET 为 0）、不开标签页，仅置当日完成。
+    const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+    API.getDailySetItems = async () => [
+        { offerId: "DS1", complete: true, pointProgress: 30, pointProgressMax: 30 },
+        { offerId: "DS2", complete: true, pointProgress: 30, pointProgressMax: 30 },
+    ];
+    let chunkGets = 0;
+    Utils.xhr = async options => {
+        if (String(options.url).includes("/_next/static/chunks/")) chunkGets++;
+        return "<html></html>";
+    };
+
+    const result = await TaskManager.doDailySet();
+
+    assert.equal(result, true);
+    assert.equal(storage.get("Config.dailySetDone"), 20260920, "空清单早退必须置当日完成判据");
+    assert.equal(chunkGets, 0, "_resolveReportActivityActionId 不得被调用（零 chunk GET）");
+    assert.equal(openTabs.length, 0, "空清单不得打开任何标签页");
+});
+
+test("doDailySet exits early when getDailySetItems returns an empty array", async () => {
+    // 另一条空清单路径：items 为空数组（非 null）同样早退，不得误判为"获取失败"。
+    const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+    API.getDailySetItems = async () => [];
+    let chunkGets = 0;
+    Utils.xhr = async options => {
+        if (String(options.url).includes("/_next/static/chunks/")) chunkGets++;
+        return "<html></html>";
+    };
+
+    const result = await TaskManager.doDailySet();
+
+    assert.equal(result, true);
+    assert.equal(storage.get("Config.dailySetDone"), 20260920);
+    assert.equal(chunkGets, 0);
+    assert.equal(openTabs.length, 0);
+});
+
+test("doDailySet exits early when ladder0 App reports clear every pending item", async () => {
+    // 空清单早退的第二条汇合路径：阶梯0 App 上报把全部 pending 项出列后，
+    // 网页阶梯（含 _extractDailySetHashes）不得再执行，已入账 offer 的链接不得再开。
+    const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+    RewardsAuto.state.token = "at-mock";
+    const offerId = "Gamification_DailySet_Test_Child1";
+    API.getDailySetItems = async () => [{ offerId, complete: false, url: "https://cn.bing.com/x?rnoreward=1" }];
+    API.appActivity = async () => ({ points: 10, isDuplicate: false, balance: 4260 }); // 全部入账出列
+    let hashesCalled = 0;
+    TaskManager._extractDailySetHashes = async () => { hashesCalled++; return []; };
+    const posts = [];
+    Utils.xhr = async options => {
+        if (options.method === "POST") posts.push(options);
+        return "1:true";
+    };
+
+    const result = await TaskManager.doDailySet();
+
+    assert.equal(result, true);
+    assert.equal(hashesCalled, 0, "全部出列后不得再触发网页 hash 提取");
+    assert.equal(posts.length, 0, "全部出列后不得再发 Server Action POST");
+    assert.equal(openTabs.length, 0, "已入账 offer 的链接不得再开标签页");
+    assert.equal(storage.get("Config.dailySetDone"), 20260920);
+});
+
+// ====== v4.3.0：dailySetFail 当日放弃上限（{date, count} 结构，次日自动恢复） ======
+
+test("doDailySet gives up for the day after DAILY_SET_GIVE_UP_AFTER consecutive failures", async () => {
+    // 同日第 5 次失败落账后，入口放弃门直接返回 true 且零请求；不伪造 dailySetDone。
+    // 失败轮用真实形态构造：待办项 Server Action 500（非边缘拦截）+ 复查仍未完成
+    // （getDailySetItems 返回 [] 会命中空清单早退，不能当失败轮）。
+    const { API, RewardsAuto, TaskManager, Utils, storage } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+    API.getDailySetItems = async () => [{ offerId: "DS_stuck", complete: false }];
+    TaskManager._extractDailySetHashes = async () => [{ offerId: "DS_stuck", hash: "a".repeat(40) }];
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    Utils.xhr = async () => { throw new Error('HTTP 500: 1:E{"digest":"D"}'); };
+
+    // 前 4 次：未达上限（5），正常执行并返回 false
+    for (let i = 0; i < 4; i++) {
+        assert.equal(await TaskManager.doDailySet(), false);
+        assert.notEqual(storage.get("Config.dailySetDone"), 20260920);
+    }
+
+    // 第 5 次失败落账（5 ≥ 上限）→ 次轮入口放弃门当日放弃
+    storage.set("Config.dailySetFail", { date: 20260920, count: 5 });
+    const requests = [];
+    Utils.xhr = async options => { requests.push(options); return "<html></html>"; };
+    const result = await TaskManager.doDailySet();
+
+    assert.equal(result, true, "达上限后当日放弃必须返回 true（对齐 promos 放弃语义）");
+    assert.equal(requests.length, 0, "放弃轮必须零请求");
+    assert.notEqual(storage.get("Config.dailySetDone"), 20260920, "放弃不得伪造当日完成标记");
+});
+
+test("dailySetFail counter rebuilds with the new date instead of carrying yesterday's count", async () => {
+    // 次日 {date} 失配 → 放弃门不再命中；runAll 的失败落账以当日 dateNowNum
+    // 重建 {date, count}，昨日计数不隔日累计。
+    const d = new Date();
+    const today = Number(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`);
+    const { API, RewardsAuto, TaskManager, Utils, storage } = createHarness();
+    RewardsAuto.state.dateNowNum = today;
+    Utils.randomDelay = async () => {};
+    Utils.delay = async () => {};
+    API.getDailySetItems = async () => [{ offerId: "DS_stuck", complete: false }];
+    TaskManager._extractDailySetHashes = async () => [{ offerId: "DS_stuck", hash: "a".repeat(40) }];
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    Utils.xhr = async () => { throw new Error('HTTP 500: 1:E{"digest":"D"}'); };
+    storage.set("Config.dailySetFail", { date: today - 1, count: 9 }); // 昨天失败 9 次
+
+    // 次日放弃门不再命中（昨日计数不触发今日放弃）→ 真实 doDailySet 仍会尝试并失败
+    assert.equal(await TaskManager.doDailySet(), false, "昨日失败 9 次不得触发今日放弃门");
+
+    // runAll 的失败落账以当日 dateNowNum 重建账本
+    TaskManager.doDailySet = async () => false;
+    API.getBalance = async () => 100;
+    API.checkRegion = async () => true;
+    API.renewToken = async () => true;
+    API.getRewardsInfo = async () => null;
+    API.discoverCards = async () => null;
+    TaskManager.doSign = async () => true;
+    TaskManager.doRead = async () => true;
+    TaskManager.doPromos = async () => true;
+    TaskManager.doSearch = async () => true;
+    TaskManager.doStreak = async () => true;
+    TaskManager.doPunchCard = async () => true;
+    TaskManager.doClaimPoints = async () => true;
+
+    await TaskManager.runAll();
+    let rec = storage.get("Config.dailySetFail");
+    assert.deepEqual([rec.date, rec.count], [today, 1], "昨日计数 9 不得累计进今日账本");
+
+    await TaskManager.runAll();
+    rec = storage.get("Config.dailySetFail");
+    assert.deepEqual([rec.date, rec.count], [today, 2], "当日内失败继续累计");
+});
+
+test("runAll resets the dailySetFail ledger to {date, count} on success", async () => {
+    // 成功清零保留原语义，结构对齐 {date, count}（doDailySet 入口放弃门返回 true 同样清零）。
+    const d = new Date();
+    const today = Number(`${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`);
+    const { API, TaskManager, Utils, storage, intervals } = createHarness({
+        "Config.dailySetFail": { date: today - 1, count: 4 },
+    });
+    Utils.randomDelay = async () => {};
+    API.getBalance = async () => 100;
+    API.checkRegion = async () => true;
+    API.renewToken = async () => true;
+    API.getRewardsInfo = async () => null;
+    API.discoverCards = async () => null;
+    TaskManager.doSign = async () => true;
+    TaskManager.doRead = async () => true;
+    TaskManager.doPromos = async () => true;
+    TaskManager.doSearch = async () => true;
+    TaskManager.doStreak = async () => true;
+    TaskManager.doDailySet = async () => true;
+    TaskManager.doPunchCard = async () => true;
+    TaskManager.doClaimPoints = async () => true;
+    intervals.set.push({ fn: () => {}, ms: 5 * 60 * 1000 }); // 心跳计时器由 runAll 自己管理，这里防误清
+
+    await TaskManager.runAll();
+
+    const rec = storage.get("Config.dailySetFail");
+    assert.deepEqual([rec.date, rec.count], [today, 0], "成功后账本必须清零且保持 {date, count} 结构");
+});
+
+// ====== v4.3.0：_sendDailySetAction 边缘拦截短路（503+HTML resolve 路径） ======
+
+test("_sendDailySetAction flags edge block on the 503+HTML resolve path and doDailySet short-circuits", async () => {
+    // acceptErrorBody 下 503+Bing 错误页走 resolve（非 catch）——必须合成
+    // "HTTP <status>: <body>" 后判 isEdgeBlockedError，检出置本轮标记；
+    // doDailySet 跳过剩余 pending 项（总请求数不随 pending 数增长）并返回 false。
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+    const offerIds = ["DS_A", "DS_B", "DS_C"];
+    API.getDailySetItems = async () => offerIds.map(id => ({ offerId: id, complete: false }));
+    TaskManager._extractDailySetHashes = async () => offerIds.map(id => ({ offerId: id, hash: "a".repeat(40) }));
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    const posts = [];
+    Utils.xhr = async options => {
+        if (options.method === "POST") {
+            posts.push(options);
+            return { status: 503, body: '<!DOCTYPE html><html xml:lang="en"><head><title>Bing</title></head></html>' };
+        }
+        return "<html></html>";
+    };
+
+    const result = await TaskManager.doDailySet();
+
+    assert.equal(RewardsAuto.state.dailySetEdgeBlocked, true, "503+HTML resolve 路径必须置本轮边缘拦截标记");
+    assert.equal(posts.length, 1, `检出拦截后必须跳过剩余 ${offerIds.length - 1} 项，总请求数不随 pending 数增长`);
+    assert.equal(JSON.parse(posts[0].data)[2].offerid, "DS_A");
+    assert.equal(result, false, "拦截轮不得复查/落账，返回 false 交由 runAll 计入失败账本");
+});
+
+test("non-edge failures (500) keep trying every pending item without short-circuiting", async () => {
+    // 500（非边缘拦截）不得触发短路：逐项尝试的旧行为保持不变。
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+    const offerIds = ["DS_A", "DS_B", "DS_C"];
+    API.getDailySetItems = async () => offerIds.map(id => ({ offerId: id, complete: false }));
+    TaskManager._extractDailySetHashes = async () => offerIds.map(id => ({ offerId: id, hash: "a".repeat(40) }));
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    const posts = [];
+    Utils.xhr = async options => {
+        if (options.method === "POST") {
+            posts.push(options);
+            return { status: 500, body: '1:E{"digest":"D"}' };
+        }
+        return "<html></html>";
+    };
+
+    await TaskManager.doDailySet();
+
+    assert.equal(RewardsAuto.state.dailySetEdgeBlocked, false, "500 不是边缘拦截，不得置标记");
+    assert.equal(posts.length, offerIds.length, "非拦截失败必须逐项尝试（每项 context 形状 1 次）");
+});
+
+// ====== v4.3.0：renewToken 续期门槛 + Bearer null 回归 ======
+
+test("renewToken refreshes the token when any DAPI consumer task is enabled", async () => {
+    // 四开关任一开启 → 正常续期（覆盖 sign/read/promos/search 各单独开启的组合）。
+    for (const onlyTask of ["Tasks.sign", "Tasks.read", "Tasks.promos", "Tasks.search"]) {
+        const initialStorage = {
+            "Tasks.sign": false, "Tasks.read": false, "Tasks.promos": false, "Tasks.search": false,
+            [onlyTask]: true,
+            "Config.token": "refresh-value",
+        };
+        const { API, Utils, storage } = createHarness(initialStorage);
+        const posts = [];
+        Utils.xhr = async options => {
+            posts.push(options);
+            return JSON.stringify({ refresh_token: "new-refresh", access_token: "access" });
+        };
+
+        assert.equal(await API.renewToken(), true, `${onlyTask} 开启时必须续期`);
+        assert.equal(posts.length, 1, "应发出一次 refresh_token 续期请求");
+        assert.equal(storage.get("Config.token"), "new-refresh");
+    }
+});
+
+test("renewToken returns false with zero requests when all DAPI consumer tasks are off", async () => {
+    // v4.3.0：四开关全关 → 跳过续期并返回 false，不再假成功 true。
+    const { API, Utils, storage } = createHarness({
+        "Tasks.sign": false, "Tasks.read": false, "Tasks.promos": false, "Tasks.search": false,
+        "Config.token": "refresh-value",
+    });
+    let requests = 0;
+    Utils.xhr = async () => { requests++; return "{}"; };
+
+    assert.equal(await API.renewToken(), false, "无消费方开启时返回 false（不再假成功）");
+    assert.equal(requests, 0, "零续期请求");
+    assert.equal(storage.get("Config.token"), "refresh-value", "存储的 refresh_token 不得被误清");
+});
+
+test("withTokenRetry returns null without a second request when renewal leaves no token (never Bearer null)", async () => {
+    // 核心回归点：401 续期后 state.token 仍为空 → 直接返回 null，
+    // 全部打桩请求中绝不出现 "Bearer null"/"Bearer false" 鉴权头。
+    const seenAuth = [];
+    const { API, RewardsAuto, Utils } = createHarness({ "Config.token": "refresh-value" });
+    RewardsAuto.state.token = "expired-access";
+    API.renewToken = async () => {
+        // 模拟"续期流程走完但 token 仍空"（如授权码获取失败）
+        RewardsAuto.state.token = null;
+        return true;
+    };
+    Utils.xhr = async options => {
+        seenAuth.push(options.headers && options.headers.authorization);
+        return JSON.stringify({ response: { balance: 1 } });
+    };
+
+    const result = await API.withTokenRetry(async token => {
+        // requestFn 本身不该被第二次调用；首次调用收到过期 token 后抛 401
+        assert.equal(token, "expired-access");
+        throw new Error("HTTP 401");
+    });
+
+    assert.equal(result, null, "续期后 token 仍空必须返回 null");
+    assert.equal(seenAuth.length, 0, "不得带着空 token 发出第二次请求");
+});
+
+test("no stubbed DAPI request ever carries a falsy Bearer header across the retry ladder", async () => {
+    // 与上一条互补：走真实 _dapiRequest 链路（renewToken mock 为失败，避免真实
+    // 授权码流程阻塞 90 秒），401 → 续期失败 → 无第二次请求；全链路鉴权头逐个体检。
+    const seenAuth = [];
+    const { API, RewardsAuto, Utils } = createHarness({ "Config.token": "refresh-value" });
+    RewardsAuto.state.token = "expired-access";
+    API.renewToken = async () => false;
+    Utils.xhr = async options => {
+        seenAuth.push(options.headers && options.headers.authorization);
+        if (String(options.url).includes("prod.rewardsplatform.microsoft.com")) {
+            throw new Error("HTTP 401");
+        }
+        return "{}";
+    };
+
+    const result = await API._dapiRequest({ body: { probe: 1 } });
+
+    assert.equal(result, null, "续期失败后必须返回 null");
+    assert.equal(seenAuth.length, 1, "只应有首次（过期 token）请求，不得二次重试");
+    assert.equal(seenAuth[0], "Bearer expired-access");
+    for (const auth of seenAuth) {
+        assert.notEqual(auth, "Bearer null", "鉴权头不得为 Bearer null");
+        assert.notEqual(auth, "Bearer false", "鉴权头不得为 Bearer false");
+        assert.notEqual(auth, "Bearer undefined", "鉴权头不得为 Bearer undefined");
+        assert.ok(/^Bearer \S+$/.test(String(auth)), `鉴权头必须携带非空 token，实际: ${auth}`);
+    }
+});
+
+test("_dapiRequest entry guard sends nothing when the token is falsy (no Bearer false)", async () => {
+    // v4.3.0：_dapiRequest 入口判空——token 非真值时不发请求直接返回 null，
+    // 消灭历史 "Bearer false"/"Bearer null" 鉴权头。
+    const { API, RewardsAuto, Utils } = createHarness();
+    RewardsAuto.state.token = null;
+    let requests = 0;
+    Utils.xhr = async () => { requests++; return "{}"; };
+
+    assert.equal(await API._dapiRequest({ body: { probe: 1 } }), null);
+    assert.equal(await API._dapiRequest({ body: { probe: 1 }, region: "cn" }), null);
+    assert.equal(requests, 0, "空 token 不得发出任何 DAPI 请求");
+
+    // 交叉验证：token 存在时同一入口正常发请求并携带 Bearer 头
+    RewardsAuto.state.token = "valid-token";
+    const seen = [];
+    Utils.xhr = async options => { seen.push(options.headers.authorization); return "{}"; };
+    await API._dapiRequest({ body: { probe: 1 } });
+    assert.deepEqual(seen, ["Bearer valid-token"]);
+});
+
+// ====== v4.3.0：init 的 isAllDone 口径补 punchCardBgDone ======
+
+test("init keeps scheduling runAll when only the punch card is incomplete (keep=false)", () => {
+    // 四任务 + 每日活动全完成、打卡未完成（punchCardBgDone 非当日）→ 不得短路，
+    // runAll 仍被随机延迟调度（否则当日剩余 tick 零调度）。
+    const today = Utils_getTodayNumForInit();
+    const scheduled = [];
+    const { TaskManager, init } = createHarness({
+        "Config.keep": false,
+        "Config.tasks": { sign: today, read: today, promos: today, search: today, streakDays: 0 },
+        "Config.dailySetDone": today,
+        // punchCardBgDone 故意缺省（非当日）
+        "Config.searchProgressDate": 1,
+    }, {
+        setTimeout: (fn, ms) => { scheduled.push({ fn, ms }); return scheduled.length; },
+    });
+    TaskManager.signDate = today;
+    TaskManager.readDate = today;
+    TaskManager.promosDate = today;
+    TaskManager.searchDate = today;
+
+    init();
+
+    assert.equal(scheduled.length, 1, "打卡未完成时不得短路，runAll 必须被调度");
+    assert.ok(scheduled[0].ms >= 2000, "后台随机延迟语义保持");
+});
+
+test("init short-circuits without scheduling when everything including the punch card is done (keep=false)", () => {
+    const today = Utils_getTodayNumForInit();
+    const scheduled = [];
+    const { TaskManager, init } = createHarness({
+        "Config.keep": false,
+        "Config.tasks": { sign: today, read: today, promos: today, search: today, streakDays: 0 },
+        "Config.dailySetDone": today,
+        "Config.punchCardBgDone": today,
+        "Config.searchProgressDate": 1,
+    }, {
+        setTimeout: (fn, ms) => { scheduled.push({ fn, ms }); return scheduled.length; },
+    });
+    TaskManager.signDate = today;
+    TaskManager.readDate = today;
+    TaskManager.promosDate = today;
+    TaskManager.searchDate = today;
+
+    init();
+
+    assert.equal(scheduled.length, 0, "全部完成（含打卡当日）必须短路，零调度");
 });

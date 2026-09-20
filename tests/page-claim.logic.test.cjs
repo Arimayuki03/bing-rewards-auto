@@ -120,6 +120,143 @@ test("pageCollector extracts offers whose object-valued sibling keys precede off
         "多层命中过浅必须继续向前扩到真实对象边界");
 });
 
+// ====== v4.3.0:skipPatterns 出列 ======
+
+test("pageCollector filters skipPattern hits in title and offerId, keeps clean offers", () => {
+    // 与主脚本 skipPatterns 对齐（v4.3.0）：title/offerId 任一字段大小写不敏感
+    // 子串命中即出列；两字段都不命中才保留
+    const { collectClaimableOffers } = createPageHarness();
+    const H = "1".repeat(64);
+    const combined = [
+        // title 命中排除类目（大小写混杂）
+        { offerId: "OK_TITLE_REFERRAL", title: "Refer A Friend", hash: H, points: 10 },
+        { offerId: "OK_TITLE_SWEEP", title: "Enter the SWEEPSTAKES now", hash: H, points: 10 },
+        // offerId 命中排除类目（title 干净也照样出列）
+        { offerId: "Install The App Promo", title: "Great Rewards", hash: H, points: 10 },
+        { offerId: "PROMO PUNCH CARD X", title: " Totally Clean ", hash: H, points: 10 },
+        // title/offerId 都不命中
+        { offerId: "CLEAN_OFFER", title: "Search and earn", hash: H, points: 15 },
+    ].map(o => JSON.stringify(o)).join(",");
+
+    const offers = collectClaimableOffers(combined);
+
+    assert.deepEqual(Array.from(offers, o => o.offerId), ["CLEAN_OFFER"],
+        "仅 title/offerId 均不命中 skipPatterns 的卡可进入领取列表");
+    assert.equal(offers[0].points, 15);
+});
+
+test("pageCollector filters the points-gate-evading and locked-wording skip patterns", () => {
+    // "Earn -1 points" 类目原本只靠 points>0 门部分自滤（points 字段缺 0/-1 以外
+    // 形态时会漏）；"Available tomorrow" 是纯文案型排除——两者必须由 skipPatterns
+    // 兜住，不能依赖格式巧合
+    const { collectClaimableOffers } = createPageHarness();
+    const H = "2".repeat(64);
+    const combined = [
+        { offerId: "MINUS_ONE", title: "Earn -1 Points", hash: H, points: 10 },
+        { offerId: "TOMORROW", title: "Available Tomorrow", hash: H, points: 10 },
+    ].map(o => JSON.stringify(o)).join(",");
+
+    const offers = collectClaimableOffers(combined);
+
+    assert.deepEqual(Array.from(offers, o => o.offerId), [],
+        "skip 模式命中的卡必须出列，即便 points 数值伪装为正");
+});
+
+test("pageCollector keeps only the clean card in a mixed batch", async () => {
+    // 综合场景：同一批 offer 混有正常卡与多张命中不同 skip 模式的卡
+    const offers = [
+        { offerId: "A_REFERRAL_PROMO", hash: "a".repeat(64), points: 10, title: "Invite friends" },
+        { offerId: "B", hash: "b".repeat(64), points: 20, title: "Daily search bonus" },
+        { offerId: "C", hash: "c".repeat(64), points: 30, title: "Sea Of Thieves special" },
+        { offerId: "D_REWARDS EXTENSION", hash: "d".repeat(64), points: 40, title: "One click claim" },
+        { offerId: "E", hash: "e".repeat(64), points: 50, title: "Redeem points" },
+        { offerId: "F", hash: "f".repeat(64), points: 60, title: "Shop To Earn cashback" },
+    ];
+    const chunk = `createServerReference("${"0".repeat(40)}",t.callServer,void 0,t.findSourceMapURL,"reportActivity")`;
+    const posts = [];
+    const { runSweep } = createPageHarness({
+        seedState: { lastRunAt: Date.now() },
+        fetchImpl: async (url, init) => {
+            if (init && init.method === "POST") {
+                posts.push({ url, body: init.body });
+                return { status: 200, text: async () => "0:{}\n1:true\n" };
+            }
+            if (url.includes("/_next/static/chunks/")) return { status: 200, text: async () => chunk };
+            if (url.endsWith("/earn")) {
+                return { status: 200, text: async () => flightHtml(JSON.stringify({ activityCards: offers }))
+                    .replace("</body>", '<script src="/_next/static/chunks/x.js?dpl=20260920-1"></script></body>') };
+            }
+            return { status: 200, text: async () => "<html></html>" };
+        },
+    });
+
+    const result = await runSweep("test");
+
+    assert.equal(result.ok, 2, "仅 B/E 两张干净卡应上报受理");
+    assert.equal(result.total, 2);
+    const claimed = posts.filter(p => p.url.endsWith("/earn"))
+        .map(p => JSON.parse(p.body)[2].offerid);
+    assert.deepEqual(claimed.sort(), ["B", "E"], "命中各 skip 模式的卡均不得发出领取请求");
+});
+
+// ====== v4.3.0:$undefined 归一 ======
+
+test("pageCollector falls back to pointProgressMax when points is the $undefined sentinel", () => {
+    // v4.3.0：非 nullish 哨兵 "$undefined" 会使 Number(...) 变 NaN、卡被 points 门
+    // 单向漏领；解析前必须归一为 null，让 ?? 回退到 pointProgressMax
+    const { collectClaimableOffers } = createPageHarness();
+    const H = "3".repeat(64);
+    const combined = '{"offerId":"UNDEF_PTS","title":"Daily set","hash":"' + H + '","points":"$undefined","pointProgressMax":30}';
+
+    const offers = collectClaimableOffers(combined);
+
+    assert.deepEqual(Array.from(offers, o => o.offerId), ["UNDEF_PTS"], "哨兵 points 不得把可领卡挤出列表");
+    assert.equal(offers[0].points, 30, "points 必须回退到 pointProgressMax 而非 NaN/0");
+});
+
+test("pageCollector still filters offers with no numeric points after sentinel normalization", () => {
+    // 对照：哨兵归一为 null 且无 pointProgressMax 可回退时，points 门照常滤除——
+    // 归一不得放宽"无积分不领"的边界
+    const { collectClaimableOffers } = createPageHarness();
+    const H = "4".repeat(64);
+    const combined = '{"offerId":"UNDEF_NO_MAX","title":"Daily set","hash":"' + H + '","points":"$undefined"}';
+
+    const offers = collectClaimableOffers(combined);
+
+    assert.deepEqual(Array.from(offers, o => o.offerId), [], "无 pointProgressMax 回退时必须照常被 points 门滤除");
+});
+
+// ====== v4.3.0:转义状态机（串外反斜杠不得开启转义态） ======
+
+test("extractFlightObjects ignores backslashes outside strings when brace matching", () => {
+    // v4.3.0 对齐主脚本：转义仅在字符串内成立。判别性形态——锚点前最近的 { 落在
+    // note 字符串值内部，值内含 \" 转义；旧版把串外 \ 也当转义开关，从假起点扫描
+    // 时 inStr 状态崩坏、边界错乱 → 解析失败丢 offer；新版正确提取
+    const { extractFlightObjects } = createPageHarness();
+    const BS = String.fromCharCode(92); // 反斜杠（源码里手写易踩转义歧义，运行时拼）
+    const H = "5".repeat(64);
+    const combined = '{"note":"a { b' + BS + '"c","offerId":"X","hash":"' + H + '","points":5}';
+
+    const objs = extractFlightObjects(combined);
+
+    assert.deepEqual(Array.from(objs, o => o.offerId), ["X"],
+        "串外反斜杠不得开启转义态吞掉后续引号导致解析失败");
+    assert.equal(objs[0].hash, H);
+});
+
+test("extractFlightObjects still honors real in-string escapes", () => {
+    // 对照基线：串内 \" 是合法转义，不得因状态机收紧而误断字符串边界
+    const { extractFlightObjects } = createPageHarness();
+    const BS = String.fromCharCode(92);
+    const H = "6".repeat(64);
+    const combined = '{"note":"say ' + BS + '"hi' + BS + '"","offerId":"K","hash":"' + H + '","points":5}';
+
+    const objs = extractFlightObjects(combined);
+
+    assert.deepEqual(Array.from(objs, o => o.offerId), ["K"]);
+    assert.equal(objs[0].note, 'say "hi"', "串内 \\\" 必须按转义处理，字符串边界不提前闭合");
+});
+
 // ====== 请求构造 ======
 
 test("routerStateTree encodes the earn segment like the observed browser request", () => {

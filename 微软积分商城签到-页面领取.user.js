@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到-页面领取
 // @namespace    local.bing-rewards-auto
-// @version      4.2.1
+// @version      4.3.0
 // @description  《微软积分商城签到（全能智能重构版）》的页面侧领取组件。2026-09-17 抓包实证：Server Action 的入账判据在页面上下文成立（同 payload、同 action ID，页面内 POST /earn → 200 + 1:true，实测余额 +15），而 Service Worker 直连被边缘 503（返回 Bing 错误页 HTML）——这类"仅页面上下文可领"的 offer（如 WW_Rewards_locked_level2_*，unlockCriteria 已满足但不在 App 目录）只有本脚本能拿到。工作方式：仅在用户已打开 rewards.bing.com 页面时生效，不依赖 @storageName 跨脚本存储（v3.9.0 现场已证伪），不开救援标签页；自主抓取 earn/dashboard 的 flight 数据 → 解析待领 offer 与当次轮换 hash → 扫构建 chunk 定位当前部署的 reportActivity action ID → 页面内逐个上报 + 欢迎积分领取，15 分钟节流防重复。后台脚本下一轮复核到账后自然转入完成/放弃账本。
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
@@ -26,6 +26,15 @@
     const CHUNK_CACHE_KEY = "bw_page_claim_chunk";
     const AUTO_PATHS = ["/", "/dashboard", "/earn"];
     const OFFER_POST_DELAY = [2500, 5000];
+    // 与主脚本 skipPatterns（config 默认列表，19 条，无用户配置通道）逐条照抄：
+    // 页面侧代领同样必须尊重用户明确排除的类目，不能只靠后台账本兜底
+    const SKIP_PATTERNS = [
+        "referral", "refer and earn", "sweepstake", "entries",
+        "install the", "set bing as your default", "bing wallpaper",
+        "punch card", "ancient coin", "sea of thieves", "rewards extension",
+        "redemption goal", "order history", "claim your gift", "shop to earn",
+        "set goal", "Available tomorrow", "Offer is Locked", "Earn -1 points"
+    ];
 
     const log = (...a) => {
         try { GM_log(`[页面领取] ${a.map(x => typeof x === "string" ? x : JSON.stringify(x)).join(" ")}`); }
@@ -71,7 +80,8 @@
                 for (let j = start; j < combined.length; j++) {
                     const c = combined[j];
                     if (esc) { esc = false; continue; }
-                    if (c === "\\") { esc = true; continue; }
+                    // 与主脚本对齐：转义仅在字符串内成立，字符串外的 \ 不得吞掉下一字符
+                    if (inStr && c === "\\") { esc = true; continue; }
                     if (c === '"') { inStr = !inStr; continue; }
                     if (inStr) continue;
                     if (c === "{") depth++;
@@ -84,7 +94,9 @@
                 // 或解析失败/结果不含 offerId 时继续向前扩，而不是就此 break 丢弃 offer。
                 if (end > idx) {
                     try {
-                        const obj = JSON.parse(combined.slice(start, end));
+                        // 与主脚本对齐：$undefined 哨兵串归一为 null，避免非 nullish 哨兵
+                        // 使 ?? 不回退（points 侧曾因此单向漏领）
+                        const obj = JSON.parse(combined.slice(start, end).replace(/"\$undefined"/g, "null"));
                         if (obj && typeof obj === "object" && "offerId" in obj) {
                             if (typeof obj.offerId === "string") out.push(obj);
                             cursor = Math.max(cursor, end);
@@ -116,7 +128,12 @@
             if (!prev.title && typeof obj.title === "string") prev.title = obj.title;
             byId.set(id, prev);
         }
-        return [...byId.values()].filter(o => o.hash && o.points > 0 && !o.completed && !o.locked);
+        // 与主脚本 skipPatterns 对齐：title/offerId 任一字段大小写不敏感子串命中即出列
+        return [...byId.values()].filter(o =>
+            o.hash && o.points > 0 && !o.completed && !o.locked
+            && !SKIP_PATTERNS.some(p =>
+                o.title.toLowerCase().includes(p.toLowerCase()) ||
+                o.offerId.toLowerCase().includes(p.toLowerCase())));
     };
 
     // ====== 请求构造 ======
