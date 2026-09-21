@@ -1,6 +1,6 @@
-# Microsoft Rewards 自动任务脚本
-
 <div align="center">
+
+# Microsoft Rewards 自动任务脚本
 
 **微软积分商城每日签到全家桶 · 后台静默执行 · 多通道消息推送**
 
