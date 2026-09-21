@@ -4,12 +4,12 @@
 
 **微软积分商城每日签到全家桶 · 后台静默执行 · 多通道消息推送**
 
-[![Version](https://img.shields.io/badge/version-4.3.1-blue)](https://github.com/Arimayuki03/scriptcat/releases)
+[![Version](https://img.shields.io/badge/version-4.3.1-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
 [![ScriptCat](https://img.shields.io/badge/ScriptCat-%E6%89%A9%E5%B1%95%E8%84%9A%E6%9C%AC-orange)](https://scriptcat.org/)
 [![Tests](https://img.shields.io/badge/tests-146%2F146-brightgreen)](#开发与测试)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](#License)
 [![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-%E5%9B%BD%E5%8C%BA%20Microsoft%20Rewards-9cf)](https://rewards.bing.com/)
-[![Stars](https://img.shields.io/github/stars/Arimayuki03/scriptcat?style=social)](https://github.com/Arimayuki03/scriptcat/stargazers)
+[![Stars](https://img.shields.io/github/stars/Arimayuki03/bing-rewards-auto?style=social)](https://github.com/Arimayuki03/bing-rewards-auto/stargazers)
 
 </div>
 
@@ -152,7 +152,7 @@ node --check "微软积分商城签到-页面领取.user.js"
 项目结构：
 
 ```
-scriptcat/
+bing-rewards-auto/
 ├── 微软积分商城签到（全能智能重构版）.user.js   # 主脚本（后台 @crontab，4200+ 行）
 ├── 微软积分商城签到-页面领取.user.js            # 页面领取组件（350+ 行）
 ├── 微软积分商城签到（全能智能重构版）.options.json
