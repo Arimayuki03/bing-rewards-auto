@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到-页面领取
 // @namespace    local.bing-rewards-auto
-// @version      4.3.0
+// @version      4.3.1
 // @description  《微软积分商城签到（全能智能重构版）》的页面侧领取组件。2026-09-17 抓包实证：Server Action 的入账判据在页面上下文成立（同 payload、同 action ID，页面内 POST /earn → 200 + 1:true，实测余额 +15），而 Service Worker 直连被边缘 503（返回 Bing 错误页 HTML）——这类"仅页面上下文可领"的 offer（如 WW_Rewards_locked_level2_*，unlockCriteria 已满足但不在 App 目录）只有本脚本能拿到。工作方式：仅在用户已打开 rewards.bing.com 页面时生效，不依赖 @storageName 跨脚本存储（v3.9.0 现场已证伪），不开救援标签页；自主抓取 earn/dashboard 的 flight 数据 → 解析待领 offer 与当次轮换 hash → 扫构建 chunk 定位当前部署的 reportActivity action ID → 页面内逐个上报 + 欢迎积分领取，15 分钟节流防重复。后台脚本下一轮复核到账后自然转入完成/放弃账本。
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT

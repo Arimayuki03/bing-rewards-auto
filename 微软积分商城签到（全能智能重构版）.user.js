@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.3.0
+// @version      4.3.1
 // @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.2.0：配套《微软积分商城签到-页面领取》脚本——抓包实证 SW 直连 Server Action 被边缘 503、页面上下文同样请求 200+入账，仅页面上下文可领的 offer 交由页面侧脚本在用户打开 rewards 页时自动完成；v4.1.1：锁定等级卡解析层过滤 + 失败卡计入放弃账本；v4.1.0：App 上报为主路径，服务端对 App 目录外 offer 静默 200+p:0）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
