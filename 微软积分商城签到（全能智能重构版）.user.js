@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.4.3
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.3：修复设置面板粘贴授权码不能正常保存——SW 菜单无 prompt/alert 静默失效改通知指引、fetchCode 预清空抹掉刚保存的值、失败路径无差别清空改条件化清理，新增 Utils.parseAuthCode 统一解析容错；v4.4.2：边缘拦截开页检查前移；v4.4.1：放弃账本卡片先转页面代领；v4.4.0：边缘 503 自动开页代领+页面脚本清扫复核+🩺 诊断菜单）
+// @version      4.4.4
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.4：页面代领闭环断点定位——页面脚本清扫后写 bw_page_claim_seen 信号 cookie，后台开页后下一轮读信号点名"脚本未安装/未执行/被节流"，开页账本双写防 SW 存储偶发丢写；v4.4.3：修复设置面板粘贴授权码不能正常保存；v4.4.2：边缘拦截开页检查前移；v4.4.1：放弃账本卡片先转页面代领；v4.4.0：边缘 503 自动开页代领+页面脚本清扫复核+🩺 诊断菜单）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2827,6 +2827,16 @@ Notice:
             Utils.log("🧩", "扫描活动卡片...");
             const cards = await API.discoverCards();
 
+            // v4.4.4：上一轮开页代领后的信号解读——上轮拦截开过页、本轮卡片仍在
+            // 可领清单（页面没领到）时，检查页面脚本的执行信号并点名断点，避免
+            // "开页成功但页面侧什么都没发生"的静默空转。
+            if (cards && cards.length > 0 && RewardsAuto.state.pageClaimSeenBaseline !== undefined) {
+                const seen = await this._readPageClaimSeenCookie();
+                const hint = this._pageClaimSignalHint(seen, RewardsAuto.state.pageClaimSeenBaseline);
+                if (hint) Utils.log("🟡", hint);
+                RewardsAuto.state.pageClaimSeenBaseline = undefined;
+            }
+
             if (cards === null) {
                 this.promosTimes++;
                 Utils.log("🟡", "活动卡片扫描失败，稍后重试");
@@ -2892,6 +2902,8 @@ Notice:
             // "已开 rewards 页"）。此处立即开页代领并保 pending，下轮 fresh 复核确认；
             // 限额用尽/冷却中保持失败语义交由下轮再试。
             if (RewardsAuto.state.promosEdgeBlocked) {
+                // v4.4.4：先记录本轮开页前的页面信号基线，供下一轮断点判定
+                RewardsAuto.state.pageClaimSeenBaseline = await this._readPageClaimSeenCookie();
                 const kicked = this._kickPageSweep("活动卡片");
                 this.promosTimes++;
                 Utils.log("🟡", kicked
@@ -2943,9 +2955,7 @@ Notice:
                     ? "活动卡片被边缘拦截，已开页代领，下轮复核"
                     : "活动卡片被边缘拦截且开页代领暂不可用（限额/冷却），下轮重试");
                 return false;
-            }
-
-            this.promosDate = RewardsAuto.state.dateNowNum;
+            }            this.promosDate = RewardsAuto.state.dateNowNum;
             this.save();
             if (newlyGivenUp.length > 0) {
                 Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败（含 ${newlyGivenUp.length} 个当日放弃）`, true);
@@ -3781,23 +3791,60 @@ Notice:
         // v4.4.0：边缘拦截日开页代领编排。当日次数 + 冷却双门槛，超限静默返回
         // false（不刷日志）。返回 true 表示本轮已开页：调用方应跳过同轮内的
         // Server Action 重试与复查（拦截态不会在同轮解除），等待下轮复核。
+        // v4.4.4：账本双写（主键+备份）+ 写后回读校验——2026-09-26 20:10/20:20
+        // 日志实证 ScriptCat SW 存储偶发丢写（20:10 写 count=2，20:20 读仍 1，
+        // 冷却门随之失效），双写取最大值把丢写概率压到最低，回读异常显式报日志。
         _kickPageSweep(reason) {
             const today = RewardsAuto.state.dateNowNum;
+            const pick = (r) => (r && r.date === today && Number(r.count) || 0);
             const rec = GM_getValue("Config.pageSweep", null);
-            const count = (rec && rec.date === today && Number(rec.count) || 0);
+            const bak = GM_getValue("Config.pageSweepBak", null);
+            const count = Math.max(pick(rec), pick(bak));
             if (count >= PAGE_SWEEP_MAX_PER_DAY) return false;
-            const last = (rec && Number(rec.lastAt)) || 0;
+            const last = Math.max((rec && Number(rec.lastAt)) || 0, (bak && Number(bak.lastAt)) || 0);
             if (Date.now() - last < PAGE_SWEEP_COOLDOWN_MS) return false;
             try {
-                GM_setValue("Config.pageSweep", { date: today, count: count + 1, lastAt: Date.now() });
+                const next = { date: today, count: count + 1, lastAt: Date.now() };
+                GM_setValue("Config.pageSweep", next);
+                GM_setValue("Config.pageSweepBak", next);
+                const after = GM_getValue("Config.pageSweep", null);
+                if (!after || Number(after.count) !== next.count) {
+                    Utils.log("🟡", `开页代领账本回读异常（期望 count=${next.count}，实际=${after && after.count}）——存储写入未持久化，限次/冷却门可能失效`);
+                }
                 const opened = GM_openInTab(PAGE_SWEEP_URL, { active: false, insert: true });
                 setTimeout(() => { try { if (opened && opened.close) opened.close(); } catch (_) {} }, PAGE_SWEEP_TAB_LIFETIME_MS);
-                Utils.log("🟡", `边缘拦截，已开 rewards 页交由《页面领取》脚本代领(${reason})，${Math.round(PAGE_SWEEP_TAB_LIFETIME_MS / 1000)} 秒后自动关闭（今日第 ${count + 1}/${PAGE_SWEEP_MAX_PER_DAY} 次）`);
+                Utils.log("🟡", `边缘拦截，已开 rewards 页交由《页面领取》脚本代领(${reason})，${Math.round(PAGE_SWEEP_TAB_LIFETIME_MS / 1000)} 秒后自动关闭（今日第 ${next.count}/${PAGE_SWEEP_MAX_PER_DAY} 次）`);
                 return true;
             } catch (e) {
                 Utils.log("🟡", `开页代领失败(${reason}): ${e.message}`);
                 return false;
             }
+        },
+
+        // v4.4.4：读取页面领取脚本的活动信号 cookie（页面脚本每次清扫后写
+        // bw_page_claim_seen=<ts>；cookie 同源共享、不依赖跨脚本存储桥，是
+        // 后台 SW 唯一能读到的页面侧执行凭证）。无信号返回 0。
+        _readPageClaimSeenCookie() {
+            return new Promise(resolve => {
+                try {
+                    GM_cookie("list", { url: "https://rewards.bing.com/" }, (cookies) => {
+                        const list = Array.isArray(cookies) ? cookies : (cookies && cookies.cookies) || [];
+                        const hit = list.find(c => c && c.name === "bw_page_claim_seen");
+                        resolve(hit ? (Number(hit.value) || 0) : 0);
+                    });
+                } catch (_) { resolve(0); }
+            });
+        },
+
+        // v4.4.4：解读页面脚本活动信号——闭环断点定位。返回提示文案，null = 信号正常。
+        _pageClaimSignalHint(seen, preKickLastAt) {
+            if (!seen) {
+                return "⚠️ 未检测到《页面领取》脚本的执行信号——后台开页代领依赖它完成页面内领取。请确认已安装并启用《微软积分商城签到-页面领取》v4.4.0+；可在 rewards.bing.com 页面菜单「🧾 页面领取状态（本页）」查看是否注入";
+            }
+            if (preKickLastAt && seen < preKickLastAt) {
+                return "⚠️ 上次开页后页面领取脚本未再执行（活动信号早于上次开页）——标签页可能被浏览器节流或脚本已停用；可在 rewards 页手动点「▶️ 立即领取（本页）」验证";
+            }
+            return null;
         },
 
         // 今日任务是否全部完成（用于空闲短路）。搜索受限日也会被计入"已完成"，
@@ -4358,10 +4405,27 @@ Notice:
             const resolved = await API._resolveReportActivityActionId();
             lines.push(`【Action ID】${resolved ? `✅ ${resolved.slice(0, 16)}…` : "❌ 未能从 chunk 解析（将用兜底值，若站点已改版则失效）"} dpl=${API._currentDpl() || "?"}`);
 
-            // 5) 开页代领账本
+            // 5) 开页代领账本 + 页面脚本执行信号
             const sweep = GM_getValue("Config.pageSweep", null);
+            const sweepBak = GM_getValue("Config.pageSweepBak", null);
             const today = RewardsAuto.state.dateNowNum;
-            lines.push(`【开页代领】${sweep && sweep.date === today ? `今日已开 ${sweep.count}/${PAGE_SWEEP_MAX_PER_DAY} 次` : "今日未开页"}；每日活动完成判据: ${GM_getValue("Config.dailySetDone", 0) === today ? "✅" : "❌ 未完成"}`);
+            const sweepCount = Math.max((sweep && sweep.date === today && Number(sweep.count)) || 0, (sweepBak && sweepBak.date === today && Number(sweepBak.count)) || 0);
+            lines.push(`【开页代领】今日已开 ${sweepCount}/${PAGE_SWEEP_MAX_PER_DAY} 次；每日活动完成判据: ${GM_getValue("Config.dailySetDone", 0) === today ? "✅" : "❌ 未完成"}`);
+            try {
+                const seen = await new Promise(resolve => {
+                    try {
+                        GM_cookie("list", { url: "https://rewards.bing.com/" }, (cookies) => {
+                            const list = Array.isArray(cookies) ? cookies : (cookies && cookies.cookies) || [];
+                            const hit = list.find(c => c && c.name === "bw_page_claim_seen");
+                            resolve(hit ? (Number(hit.value) || 0) : 0);
+                        });
+                    } catch (_) { resolve(0); }
+                });
+                const agoMin = seen ? Math.max(0, Math.round((Date.now() - seen) / 60000)) : -1;
+                lines.push(`【页面领取信号】${seen ? `✅ ${agoMin} 分钟前执行过清扫（cookie 10 分钟有效）` : "❌ 无信号——《页面领取》脚本未安装/未启用，或 10 分钟内未在 rewards 页执行过清扫"}（v4.4.4+）`);
+            } catch (_) {
+                lines.push("【页面领取信号】（此环境无法读取 cookie，跳过）");
+            }
 
             lines.push("", "— 以上为只读探测，未发送任何领取请求 —");
         } catch (e) {

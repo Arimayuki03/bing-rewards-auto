@@ -36,12 +36,18 @@ function createPageHarness({ search = "", pathname = "/earn", fetchImpl, gmLog, 
     };
 
     const timers = [];
+    // v4.4.4：信号 cookie 模拟——脚本清扫后写 document.cookie，断言回传通道
+    const cookieJar = [];
     const context = {
         URL,
         URLSearchParams,
         clearTimeout,
         console: { debug() {}, error() {}, log() {}, warn() {} },
         fetch: fetchStub,
+        document: {
+            set cookie(v) { cookieJar.push(String(v)); },
+            get cookie() { return cookieJar.join("; "); },
+        },
         // 记录调度但仍以 0 延迟真实执行：runSweep 内部的 sleep() 依赖 setTimeout 能否
         // resolve，只记录不执行会让扫描永久挂起（本文件首轮运行即踩到）。
         setTimeout: (fn, ms) => { timers.push({ fn, ms }); return setTimeout(fn, 0); },
@@ -57,7 +63,7 @@ function createPageHarness({ search = "", pathname = "/earn", fetchImpl, gmLog, 
     context.globalThis = context;
     vm.createContext(context);
     vm.runInContext(source, context, { filename: pageScriptPath });
-    return { ...context.__pageClaim, context, store, fetchCalls, timers };
+    return { ...context.__pageClaim, context, store, fetchCalls, timers, cookieJar };
 }
 
 // ====== flight 解析 ======
@@ -583,6 +589,17 @@ test("runSweep verifies credited offers against a fresh earn flight and records 
 });
 
 // ====== 与主脚本的协作契约 ======
+
+test("page script writes the claim-seen cookie after a completed sweep", async () => {
+    // v4.4.4 后台断点定位的回传通道：清扫完成（含复核）后必须写 bw_page_claim_seen
+    // 信号 cookie（10 分钟有效），后台 SW 经 GM_cookie 读取判定"开页后页面侧是否执行"。
+    const h = createPageHarness({ pathname: "/earn", search: "" });
+    h.store.set("bw_page_claim", JSON.stringify({ lastRunAt: Date.now() }));
+    await h.runSweep("manual");
+
+    assert.match(h.context.document.cookie, /bw_page_claim_seen=\d+/, "清扫完成后必须写信号 cookie");
+    assert.match(h.context.document.cookie, /max-age=600/, "信号必须带 10 分钟有效期");
+});
 
 test("page claim script stays self-contained: no cross-script storage, no rescue tab", () => {
     const source = fs.readFileSync(pageScriptPath, "utf8");

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到-页面领取
 // @namespace    local.bing-rewards-auto
-// @version      4.4.0
-// @description  《微软积分商城签到（全能智能重构版）》的页面侧领取组件。2026-09-17 抓包实证：Server Action 的入账判据在页面上下文成立（同 payload、同 action ID，页面内 POST /earn → 200 + 1:true，实测余额 +15），而 Service Worker 直连被边缘 503（返回 Bing 错误页 HTML）——这类"仅页面上下文可领"的 offer（如 WW_Rewards_locked_level2_*，unlockCriteria 已满足但不在 App 目录）只有本脚本能拿到。工作方式：仅在 rewards.bing.com 页面打开时生效，不依赖 @storageName 跨脚本存储（v3.9.0 现场已证伪），不开救援标签页；自主抓取 earn/dashboard 的 flight 数据 → 解析待领 offer 与当次轮换 hash → 扫构建 chunk 定位当前部署的 reportActivity action ID → 页面内逐个上报 + 欢迎积分领取，15 分钟节流防重复；v4.4.0：支持后台 ?autoclaim=1 开页代领（与 claimnow 同等强制语义），清扫后重抓 flight 逐卡复核 isCompleted（1:true 不代表到账）并计入状态，新增 🩺 只读诊断菜单。
+// @version      4.4.4
+// @description  《微软积分商城签到（全能智能重构版）》的页面侧领取组件。2026-09-17 抓包实证：Server Action 的入账判据在页面上下文成立（同 payload、同 action ID，页面内 POST /earn → 200 + 1:true，实测余额 +15），而 Service Worker 直连被边缘 503（返回 Bing 错误页 HTML）——这类"仅页面上下文可领"的 offer（如 WW_Rewards_locked_level2_*，unlockCriteria 已满足但不在 App 目录）只有本脚本能拿到。工作方式：仅在 rewards.bing.com 页面打开时生效，不依赖 @storageName 跨脚本存储（v3.9.0 现场已证伪），不开救援标签页；自主抓取 earn/dashboard 的 flight 数据 → 解析待领 offer 与当次轮换 hash → 扫构建 chunk 定位当前部署的 reportActivity action ID → 页面内逐个上报 + 欢迎积分领取，15 分钟节流防重复；v4.4.0：支持后台 ?autoclaim=1 开页代领（与 claimnow 同等强制语义），清扫后重抓 flight 逐卡复核 isCompleted（1:true 不代表到账）并计入状态，新增 🩺 只读诊断菜单；v4.4.4：清扫完成后写 bw_page_claim_seen 信号 cookie（10 分钟有效期），供后台脚本定位"开页后页面侧未执行"的闭环断点。
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @match        https://rewards.bing.com/*
@@ -320,6 +320,13 @@
             } catch (_) { /* 复核失败不影响本次结果记录 */ }
 
             writeState(rec);
+
+            // v4.4.4：清扫完成信号——写 bw_page_claim_seen cookie（同源共享，
+            // 后台 SW 经 GM_cookie 可读，是不依赖跨脚本存储的唯一回传通道），
+            // 10 分钟有效期自然过期；后台脚本据此判定"开页后页面侧是否真的执行了"。
+            try {
+                document.cookie = `bw_page_claim_seen=${Date.now()}; path=/; max-age=600; SameSite=Lax`;
+            } catch (_) { /* cookie 不可写不影响清扫结果 */ }
             log(`扫描完成: ${accepted}/${offers.length} 个上报受理（到账由后台下一轮复核确认）`);
             return rec.lastResult;
         } finally {

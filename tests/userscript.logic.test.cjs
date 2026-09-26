@@ -2334,6 +2334,46 @@ test("_kickPageSweep stops at PAGE_SWEEP_MAX_PER_DAY for the day", () => {
     assert.equal(openTabs.length, 0);
 });
 
+// ====== v4.4.4：开页账本双写防丢 + 页面脚本执行信号 ======
+
+test("_kickPageSweep takes the max of the dual-write ledger (SW write-loss guard)", () => {
+    // 2026-09-26 20:10/20:20 日志实证：主键写 2 被丢、读回 1，冷却门失效致 10 分钟内
+    // 重复开页。双写后任一键残留高值即可拦住：备份键 count=2 时主键丢写也按 2 计。
+    const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    storage.set("Config.pageSweep", { date: 20260920, count: 1, lastAt: 0 });
+    storage.set("Config.pageSweepBak", { date: 20260920, count: 2, lastAt: Date.now() - 60 * 1000 });
+
+    assert.equal(TaskManager._kickPageSweep("测试"), false, "备份键冷却期内必须拦住（即使主键显示可开）");
+    assert.equal(openTabs.length, 0);
+});
+
+test("_kickPageSweep writes both ledger keys and verifies the primary readback", () => {
+    const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+
+    assert.equal(TaskManager._kickPageSweep("测试"), true);
+    const primary = storage.get("Config.pageSweep");
+    const backup = storage.get("Config.pageSweepBak");
+    assert.equal(primary.count, 1);
+    assert.deepEqual(backup, primary, "双写键必须一致");
+    assert.equal(openTabs.length, 1);
+});
+
+test("_pageClaimSignalHint names the broken link for each signal state", () => {
+    const { TaskManager } = createHarness();
+    const now = Date.now();
+    // 无信号：脚本未安装/未启用
+    assert.match(TaskManager._pageClaimSignalHint(0, now - 600000), /未检测到《页面领取》脚本的执行信号/);
+    // 信号早于上次开页：标签页被节流/脚本停用
+    assert.match(TaskManager._pageClaimSignalHint(now - 1200000, now - 600000), /未再执行/);
+    // 信号晚于上次开页：正常，无提示
+    assert.equal(TaskManager._pageClaimSignalHint(now - 60000, now - 600000), null);
+    // 无开页历史时仅区分有无信号
+    assert.match(TaskManager._pageClaimSignalHint(0, 0), /未检测到/);
+    assert.equal(TaskManager._pageClaimSignalHint(now, 0), null);
+});
+
 test("_kickPageSweep ledger resets on a new day", () => {
     const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
     RewardsAuto.state.dateNowNum = 20260921;
