@@ -2313,7 +2313,7 @@ test("_kickPageSweep opens the earn page with autoclaim under daily cap and cool
     RewardsAuto.state.dateNowNum = 20260920;
     Utils.randomDelay = async () => {};
 
-    assert.equal(TaskManager._kickPageSweep("测试"), true, "首次开页必须成功");
+    assert.equal(await TaskManager._kickPageSweep("测试"), true, "首次开页必须成功");
     assert.equal(openTabs.length, 1);
     assert.equal(openTabs[0].url, "https://rewards.bing.com/earn?autoclaim=1", "开页必须携带 autoclaim 握手参数");
     assert.equal(openTabs[0].opts.active, false, "代领页必须后台打开");
@@ -2321,22 +2321,22 @@ test("_kickPageSweep opens the earn page with autoclaim under daily cap and cool
     assert.deepEqual([rec.date, rec.count], [20260920, 1]);
 
     // 冷却期内第二次开页被拒
-    assert.equal(TaskManager._kickPageSweep("测试"), false, "冷却期内不得重复开页");
+    assert.equal(await TaskManager._kickPageSweep("测试"), false, "冷却期内不得重复开页");
     assert.equal(openTabs.length, 1);
 });
 
-test("_kickPageSweep stops at PAGE_SWEEP_MAX_PER_DAY for the day", () => {
+test("_kickPageSweep stops at PAGE_SWEEP_MAX_PER_DAY for the day", async () => {
     const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
     RewardsAuto.state.dateNowNum = 20260920;
     storage.set("Config.pageSweep", { date: 20260920, count: 6, lastAt: 0 });
 
-    assert.equal(TaskManager._kickPageSweep("测试"), false, "当日达上限后不得再开页");
+    assert.equal(await TaskManager._kickPageSweep("测试"), false, "当日达上限后不得再开页");
     assert.equal(openTabs.length, 0);
 });
 
 // ====== v4.4.4：开页账本双写防丢 + 页面脚本执行信号 ======
 
-test("_kickPageSweep takes the max of the dual-write ledger (SW write-loss guard)", () => {
+test("_kickPageSweep takes the max of the dual-write ledger (SW write-loss guard)", async () => {
     // 2026-09-26 20:10/20:20 日志实证：主键写 2 被丢、读回 1，冷却门失效致 10 分钟内
     // 重复开页。双写后任一键残留高值即可拦住：备份键 count=2 时主键丢写也按 2 计。
     const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
@@ -2344,19 +2344,32 @@ test("_kickPageSweep takes the max of the dual-write ledger (SW write-loss guard
     storage.set("Config.pageSweep", { date: 20260920, count: 1, lastAt: 0 });
     storage.set("Config.pageSweepBak", { date: 20260920, count: 2, lastAt: Date.now() - 60 * 1000 });
 
-    assert.equal(TaskManager._kickPageSweep("测试"), false, "备份键冷却期内必须拦住（即使主键显示可开）");
+    assert.equal(await TaskManager._kickPageSweep("测试"), false, "备份键冷却期内必须拦住（即使主键显示可开）");
     assert.equal(openTabs.length, 0);
 });
 
-test("_kickPageSweep writes both ledger keys and verifies the primary readback", () => {
+test("_kickPageSweep writes both ledger keys and verifies the primary readback", async () => {
     const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
     RewardsAuto.state.dateNowNum = 20260920;
 
-    assert.equal(TaskManager._kickPageSweep("测试"), true);
+    assert.equal(await TaskManager._kickPageSweep("测试"), true);
     const primary = storage.get("Config.pageSweep");
     const backup = storage.get("Config.pageSweepBak");
     assert.equal(primary.count, 1);
     assert.deepEqual(backup, primary, "双写键必须一致");
+    assert.equal(openTabs.length, 1);
+});
+
+test("_kickPageSweep records the page-claim signal baseline on every trigger path", async () => {
+    // v4.4.5：基线记录下沉到 _kickPageSweep——"放弃账本卡片"等非边缘拦截触发路径
+    // 同样必须记录（v4.4.4 的 20:54 日志实证该路径无声，下一轮诊断缺据）。
+    const { RewardsAuto, TaskManager, Utils, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260926;
+    Utils.randomDelay = async () => {};
+    // SW 测试环境 GM_cookie 默认回调空列表 → _readPageClaimSeenCookie 返回 0
+
+    assert.equal(await TaskManager._kickPageSweep("放弃账本卡片"), true);
+    assert.equal(RewardsAuto.state.pageClaimSeenBaseline, 0, "开页前必须记录信号基线（本环境为 0）");
     assert.equal(openTabs.length, 1);
 });
 
@@ -2374,12 +2387,12 @@ test("_pageClaimSignalHint names the broken link for each signal state", () => {
     assert.equal(TaskManager._pageClaimSignalHint(now, 0), null);
 });
 
-test("_kickPageSweep ledger resets on a new day", () => {
+test("_kickPageSweep ledger resets on a new day", async () => {
     const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
     RewardsAuto.state.dateNowNum = 20260921;
     storage.set("Config.pageSweep", { date: 20260920, count: 6, lastAt: 0 });
 
-    assert.equal(TaskManager._kickPageSweep("测试"), true, "次日账本重置，可再次开页");
+    assert.equal(await TaskManager._kickPageSweep("测试"), true, "次日账本重置，可再次开页");
     assert.equal(openTabs.length, 1);
     assert.equal(storage.get("Config.pageSweep").date, 20260921);
 });

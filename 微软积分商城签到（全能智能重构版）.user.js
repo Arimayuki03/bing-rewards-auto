@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.4.4
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.4：页面代领闭环断点定位——页面脚本清扫后写 bw_page_claim_seen 信号 cookie，后台开页后下一轮读信号点名"脚本未安装/未执行/被节流"，开页账本双写防 SW 存储偶发丢写；v4.4.3：修复设置面板粘贴授权码不能正常保存；v4.4.2：边缘拦截开页检查前移；v4.4.1：放弃账本卡片先转页面代领；v4.4.0：边缘 503 自动开页代领+页面脚本清扫复核+🩺 诊断菜单）
+// @version      4.4.5
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.5：页面信号基线记录下沉到 _kickPageSweep——v4.4.4 日志实证"放弃账本卡片"触发路径未记基线致信号诊断无声；v4.4.4：页面清扫信号 cookie + 开页账本双写防丢；v4.4.3：修复粘贴授权码保存；v4.4.2：拦截检查前移；v4.4.1：放弃卡片转代领；v4.4.0：边缘 503 自动开页代领闭环）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2861,7 +2861,7 @@ Notice:
             const giveUpIds = this._givenUpOfferIds();
             const claimable = cards.filter(c => !giveUpIds.has(c.offerId));
             if (claimable.length === 0) {
-                if (giveUpIds.size > 0 && this._kickPageSweep("放弃账本卡片")) {
+                if (giveUpIds.size > 0 && await this._kickPageSweep("放弃账本卡片")) {
                     this.promosTimes++;
                     Utils.log("🟡", `${giveUpIds.size} 个已放弃卡片转页面代领，下轮复核确认`);
                     return false;
@@ -2902,9 +2902,8 @@ Notice:
             // "已开 rewards 页"）。此处立即开页代领并保 pending，下轮 fresh 复核确认；
             // 限额用尽/冷却中保持失败语义交由下轮再试。
             if (RewardsAuto.state.promosEdgeBlocked) {
-                // v4.4.4：先记录本轮开页前的页面信号基线，供下一轮断点判定
-                RewardsAuto.state.pageClaimSeenBaseline = await this._readPageClaimSeenCookie();
-                const kicked = this._kickPageSweep("活动卡片");
+                // v4.4.5：信号基线由 _kickPageSweep 内部统一记录（覆盖全部触发路径）
+                const kicked = await this._kickPageSweep("活动卡片");
                 this.promosTimes++;
                 Utils.log("🟡", kicked
                     ? "活动卡片被边缘拦截，已开页代领，下轮复核"
@@ -2949,7 +2948,7 @@ Notice:
             // 罕见路径，正常轮 promosEdgeBlocked 已在上方消费并归零语义，不会双开页——
             // _kickPageSweep 自带冷却/限次门。）
             if (RewardsAuto.state.promosEdgeBlocked) {
-                const kicked = this._kickPageSweep("活动卡片");
+                const kicked = await this._kickPageSweep("活动卡片");
                 this.promosTimes++;
                 Utils.log("🟡", kicked
                     ? "活动卡片被边缘拦截，已开页代领，下轮复核"
@@ -3260,7 +3259,7 @@ Notice:
                 // 必然 503。v4.4.0：此时改为开页代领（当日限次+冷却），页面脚本的
                 // 领取结果由下轮 fresh 复核确认；开页限额用尽/冷却中则维持 false。
                 if (RewardsAuto.state.dailySetEdgeBlocked) {
-                    this._kickPageSweep("每日活动");
+                    await this._kickPageSweep("每日活动");
                     Utils.log("🟡", "本轮每日活动上报被边缘拦截，转页面代领，下轮复核");
                     return false;
                 }
@@ -3794,7 +3793,10 @@ Notice:
         // v4.4.4：账本双写（主键+备份）+ 写后回读校验——2026-09-26 20:10/20:20
         // 日志实证 ScriptCat SW 存储偶发丢写（20:10 写 count=2，20:20 读仍 1，
         // 冷却门随之失效），双写取最大值把丢写概率压到最低，回读异常显式报日志。
-        _kickPageSweep(reason) {
+        // v4.4.5：页面信号基线记录下沉到本函数——20:54 日志实证"放弃账本卡片"
+        // 触发路径未记基线，下一轮信号诊断缺据无声。所有触发路径统一在开页前
+        // 记录当前信号值，下一轮 doPromos 扫描据此三态定位断点。
+        async _kickPageSweep(reason) {
             const today = RewardsAuto.state.dateNowNum;
             const pick = (r) => (r && r.date === today && Number(r.count) || 0);
             const rec = GM_getValue("Config.pageSweep", null);
@@ -3804,6 +3806,7 @@ Notice:
             const last = Math.max((rec && Number(rec.lastAt)) || 0, (bak && Number(bak.lastAt)) || 0);
             if (Date.now() - last < PAGE_SWEEP_COOLDOWN_MS) return false;
             try {
+                RewardsAuto.state.pageClaimSeenBaseline = await this._readPageClaimSeenCookie();
                 const next = { date: today, count: count + 1, lastAt: Date.now() };
                 GM_setValue("Config.pageSweep", next);
                 GM_setValue("Config.pageSweepBak", next);
@@ -4124,7 +4127,7 @@ Notice:
                 // v4.4.2：二次扫描同样边缘拦截优先——与 doPromos 主路径同款开页代领，
                 // 否则拦截轮在此处静默收尾（18:04 日志的"二次扫描完成: 0成功/1失败"）。
                 if (RewardsAuto.state.promosEdgeBlocked) {
-                    const kicked = this._kickPageSweep("二次扫描");
+                    const kicked = await this._kickPageSweep("二次扫描");
                     if (kicked) {
                         this.promosDate = 0;
                         this.save();
