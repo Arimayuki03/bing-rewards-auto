@@ -4,9 +4,9 @@
 
 **微软积分商城每日签到全家桶 · 后台静默执行 · 多通道消息推送**
 
-[![Version](https://img.shields.io/badge/version-4.4.2-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
+[![Version](https://img.shields.io/badge/version-4.4.3-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
 [![ScriptCat](https://img.shields.io/badge/ScriptCat-%E6%89%A9%E5%B1%95%E8%84%9A%E6%9C%AC-orange)](https://scriptcat.org/)
-[![Tests](https://img.shields.io/badge/tests-159%2F159-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-163%2F163-brightgreen)](#开发与测试)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](#License)
 [![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-%E5%9B%BD%E5%8C%BA%20Microsoft%20Rewards-9cf)](https://rewards.bing.com/)
 [![Stars](https://img.shields.io/github/stars/Arimayuki03/bing-rewards-auto?style=social)](https://github.com/Arimayuki03/bing-rewards-auto/stargazers)
@@ -44,7 +44,7 @@
 
 | 文件 | 角色 | 版本 |
 |---|---|---|
-| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.4.2 |
+| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.4.3 |
 | [`微软积分商城签到-页面领取.user.js`](微软积分商城签到-页面领取.user.js) | 页面侧组件：rewards.bing.com 页面打开时（含后台 `?autoclaim=1` 开页代领）自动领取锁定卡 | 4.4.0 |
 
 > 两个脚本独立工作、互不依赖：主脚本不注入页面，页面组件不依赖跨脚本存储。只装主脚本即可覆盖绝大多数任务；页面组件用于补领主脚本通道拿不到的少量 offer。
@@ -159,7 +159,7 @@ bing-rewards-auto/
 ├── 微软积分商城签到-页面领取.user.js            # 页面领取组件（420+ 行）
 ├── 微软积分商城签到（全能智能重构版）.options.json
 ├── tests/
-│   ├── userscript.logic.test.cjs               # 主脚本逻辑测试（129）
+│   ├── userscript.logic.test.cjs               # 主脚本逻辑测试（133）
 │   └── page-claim.logic.test.cjs               # 页面组件逻辑测试（30）
 ├── 改动与待办记录.md                            # 31 轮迭代完整改动日志
 └── 优化分析.md                                  # 初期优化分析与裁定记录
@@ -171,6 +171,7 @@ bing-rewards-auto/
 
 | 版本 | 要点 |
 |---|---|
+| v4.4.3 | 修复设置面板粘贴授权码不能正常保存（SW 菜单无 prompt/alert 静默失效、预清空竞态抹值、失败路径无差别清理），新增 parseAuthCode 统一解析与 Token 状态可解析性显示；测试 159 → 163 |
 | v4.4.2 | 边缘拦截开页检查前移至失败落账后（v4.4.1 首轮日志实证：部分失败早退短路了开页代领）、二次扫描补检查点；测试 157 → 159 |
 | v4.4.1 | 放弃账本卡片先转页面代领再收账（v4.4.0 上线首日实证的编排缺口：账本只判 SW 通道失败，不否决页面通道）；测试 154 → 157 |
 | v4.4.0 | 日常任务卡片修复（内置浏览器抓包实证）：边缘拦截日自动开页代领闭环（autoclaim 握手 + 每日限次/冷却 + 自动收页）、页面脚本清扫后逐卡复核、空清单不再假标完成、双脚本新增 🩺 只读诊断菜单；测试 146 → 154 |

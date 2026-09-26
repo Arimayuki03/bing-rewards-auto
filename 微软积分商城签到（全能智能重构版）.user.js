@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.4.2
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.2：边缘拦截开页检查前移至失败落账后、部分失败早退之前——v4.4.1 日志实证 claimCard 置标记后走"部分失败"早退导致开页代领永远轮不到；二次扫描路径同步补检查点；v4.4.1：放弃账本卡片在开页配额有余时先转页面代领再收账；v4.4.0：SW 直发 Server Action 被边缘 503 拦截时自动打开 rewards 页（每日限次+冷却）交由《页面领取》脚本代领并自动收页，页面脚本清扫后逐卡复核；每日活动空清单不再假标完成；新增 🩺 日常卡片诊断菜单）
+// @version      4.4.3
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.3：修复设置面板粘贴授权码不能正常保存——SW 菜单无 prompt/alert 静默失效改通知指引、fetchCode 预清空抹掉刚保存的值、失败路径无差别清空改条件化清理，新增 Utils.parseAuthCode 统一解析容错；v4.4.2：边缘拦截开页检查前移；v4.4.1：放弃账本卡片先转页面代领；v4.4.0：边缘 503 自动开页代领+页面脚本清扫复核+🩺 诊断菜单）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -577,6 +577,36 @@ Notice:
             return /^HTTP 503/.test(msg) && /<!DOCTYPE html>|<html[\s>]/i.test(msg);
         },
 
+        // 解析用户粘贴的授权码（v4.4.3 抽取统一）：支持三种粘贴形态——完整跳转
+        // URL、URL 前后带杂散文本/换行（设置面板常见，URL 构造失败时落正则提取）、
+        // 仅粘贴 code 值。返回 { code } 或 null。
+        parseAuthCode(raw) {
+            if (typeof raw !== "string") return null;
+            const s = raw.trim();
+            if (!s) return null;
+            if (/[?&#]code=/.test(s)) {
+                let c = null;
+                try {
+                    c = new URL(s).searchParams.get("code");
+                } catch (_) { /* URL 前后带文字等解析失败，落正则提取 */ }
+                if (!c) {
+                    const m = s.match(/[?&#]code=([^&\s"']+)/);
+                    if (m) {
+                        c = m[1];
+                        try { c = decodeURIComponent(c); } catch (_) {}
+                    }
+                }
+                // 清洗提取结果：粘贴串可能混入换行的字面转义（\r\n/\n 字符或
+                // "\\n" 两字符序列）与引号，截断到首个杂质字符
+                if (c) c = c.split(/\\n|\\r|\r?\n|["']/)[0].trim();
+                if (c && c.length > 10) return { code: c };
+            }
+            // 仅粘贴 code 值：无 URL 特征、无空白、纯 ASCII 可打印字符（微软
+            // code 为 base64/JWT 形态；排除整段误粘的页面中文/说明文本）
+            if (!s.includes("http") && !/\s/.test(s) && /^[\x21-\x7E]+$/.test(s) && s.length > 10) return { code: s };
+            return null;
+        },
+
         // 解析 earn flight 流中的可领取 offer 实时状态（2026-09-14 登录态抓包实证）：
         // offerId → {hash, isCompleted, isLocked, unlockCriteria}。卡片上报的 hash 必须
         // 用本次页面加载 flight 里的轮换值（服务端拒收与当次加载不一致的旧 hash）；
@@ -858,7 +888,10 @@ Notice:
                         Utils.log("🔴", `Token错误: ${tokenData.error} - ${tokenData.error_description || ''}`);
                         if (["invalid_grant","invalid_request"].includes(tokenData.error)) {
                             GM_setValue("Config.token", false);
-                            GM_setValue("Config.code", "");
+                            // v4.4.3：不再清 Config.code——invalid_grant 可能源于
+                            // refresh_token 过期而非刚粘贴的授权码；误清会把用户
+                            // 在设置面板刚保存的值抹掉。code 的消费/清理统一由
+                            // renewToken 的换取路径负责。
                         }
                         return false;
                     }
@@ -876,7 +909,8 @@ Notice:
                 } catch (e) {
                     if (e.message.includes("400") || e.message.includes("401")) {
                         GM_setValue("Config.token", false);
-                        GM_setValue("Config.code", "");
+                        // v4.4.3：不再清 Config.code（同 invalid_grant——失败方可能
+                        // 是 refresh_token 续期，与粘贴的授权码无关）
                         return false;
                     }
                     if (attempt < maxRetries) {
@@ -1105,24 +1139,20 @@ Notice:
             const fetchCode = async (msg) => {
                 Utils.log("🟡", `${msg}，尝试获取授权码...`);
 
-                // 优先检查用户是否已提前粘贴授权码（脚本设置或授权页自动捕获），有则直接用，不清空
+                // 优先检查用户是否已提前粘贴授权码（脚本设置或授权页自动捕获），有则直接用
+                // v4.4.3：不再预清空 Config.code——预清空在"用户刚在设置面板保存、
+                // 后台轮次先启动"的竞态里会把刚保存的值抹掉（"粘贴后提示已保存，回
+                // 头一看没了"的直接来源）。无效值留着无害：所有消费点都经
+                // parseAuthCode 校验，换取成功后由唯一清理点收走。
                 const existing = GM_getValue("Config.code", "");
                 if (existing) {
-                    let code = null;
-                    if (existing.includes("code=")) {
-                        try { code = new URL(existing).searchParams.get("code"); } catch {}
-                    }
-                    if (!code && existing.length > 20 && !existing.includes("http")) {
-                        code = existing.trim();
-                    }
-                    if (code && code.length > 10) {
+                    const parsed = Utils.parseAuthCode(existing);
+                    if (parsed) {
                         Utils.log("🟢", "检测到已保存的授权码，直接使用");
-                        return code;
+                        return parsed.code;
                     }
+                    Utils.log("🟡", "已保存的授权码无法解析，等待重新粘贴");
                 }
-
-                // 无有效授权码，清空残留值后等待用户输入
-                GM_setValue("Config.code", "");
 
                 if (!isBackground) {
                     try {
@@ -1166,17 +1196,10 @@ Notice:
                     await Utils.delay(1000);
                     const raw = GM_getValue("Config.code", "");
                     if (!raw) continue;
-
-                    let code = null;
-                    if (raw.includes("code=")) {
-                        try { code = new URL(raw).searchParams.get("code"); } catch {}
-                    }
-                    if (!code && raw.length > 20 && !raw.includes("http")) {
-                        code = raw.trim();
-                    }
-                    if (code && code.length > 10) {
+                    const parsed = Utils.parseAuthCode(raw);
+                    if (parsed) {
                         Utils.log("🟢", "授权码获取成功");
-                        return code;
+                        return parsed.code;
                     }
                 }
                 Utils.log("🔴", "授权码获取超时", true);
@@ -1228,14 +1251,20 @@ Notice:
                     grant_type: "authorization_code"
                 };
                 if (await this.getToken(params)) {
-                    // 一次性授权码已消费，及时清理明文残留
-                    GM_setValue("Config.code", "");
+                    // 一次性授权码已消费，及时清理明文残留。v4.4.3：仅当存储值仍是
+                    // 本轮消费的这份（或已空）才清——用户在换取期间重新粘贴的新值
+                    // 不得被旧轮次的清理抹掉。
+                    const cur = GM_getValue("Config.code", "");
+                    if (!cur || cur === code || (cur.includes("code=") && Utils.parseAuthCode(cur)?.code === code)) {
+                        GM_setValue("Config.code", "");
+                    }
                     Utils.log("🟢", "Token获取成功！", true);
                     return true;
                 }
-                // 授权码失效，清除后下轮重新获取
+                // 授权码失效。v4.4.3：不再无条件清空 Config.code——失效的可能是
+                // refresh_token（grant 无关），且无法区分"这份 code 坏了"与"用户
+                // 刚粘贴了新值"；保留下次重新解析/由用户覆盖，Token 状态菜单可见。
                 GM_setValue("Config.token", false);
-                GM_setValue("Config.code", "");
             }
 
             Utils.log("🔴", "Token 多次获取失败，请检查账号授权状态", true);
@@ -4131,10 +4160,30 @@ Notice:
     });
 
     GM_registerMenuCommand("📋 粘贴授权码", () => {
-        const code = prompt("粘贴授权页面跳转后的完整URL:");
-        if (code?.trim()) {
+        // v4.4.3：本脚本是 @crontab 后台脚本，菜单回调在 service worker 执行——
+        // SW 无 prompt/alert（调用直接抛错，此前点击后"什么都没发生"的根因）。
+        // 降级路径：提示改走 GM_notification，粘贴动作引导到设置面板的
+        // 「授权码链接」文本框（ScriptCat 面板进程有完整 UI）。
+        let code = null;
+        try { code = prompt("粘贴授权页面跳转后的完整URL:"); } catch (_) {}
+        if (code === null || code === undefined) {
+            // SW 环境 / 用户取消：无法区分，统一给出面板指引通知
+            try {
+                GM_notification({
+                    text: "后台界面无法弹输入框。请在 ScriptCat 脚本设置的「授权码链接」文本框粘贴 login.live.com 跳转后的完整 URL 并保存；或在浏览器打开授权页完成授权（页面脚本会自动捕获）。",
+                    title: "📋 粘贴授权码指引", timeout: 0
+                });
+            } catch (_) {}
+            return;
+        }
+        if (code && code.trim()) {
+            const parsed = Utils.parseAuthCode(code);
+            if (!parsed) {
+                try { alert("粘贴内容中未找到有效授权码（需包含 code= 参数或为纯 code 值），请检查后重试"); } catch (_) {}
+                return;
+            }
             GM_setValue("Config.code", code.trim());
-            alert("已保存！");
+            try { alert("已保存！（后台将在需要时自动换取）"); } catch (_) {}
         }
     });
 
@@ -4154,7 +4203,15 @@ Notice:
             ageStr = parts.join("");
         }
         const tokenDate = time > 0 ? new Date(time).toLocaleString("zh-CN") : "未知";
-        alert(`Token: ${token ? "已保存" : "无"}\n获取时间: ${tokenDate}\n已过: ${ageStr}\n授权码: ${GM_getValue("Config.code", "") ? "有" : "无"}`);
+        // v4.4.3：授权码显示"有/无 + 可解析性"，排查"粘贴了但没生效"
+        const rawCode = GM_getValue("Config.code", "");
+        const codeStatus = !rawCode ? "无" : (Utils.parseAuthCode(rawCode) ? "有（可解析）" : "有（无法解析——请重新粘贴完整跳转 URL）");
+        try {
+            alert(`Token: ${token ? "已保存" : "无"}\n获取时间: ${tokenDate}\n已过: ${ageStr}\n授权码: ${codeStatus}`);
+        } catch (_) {
+            // SW 无 alert：落日志保证可见
+            Utils.log("📊", `Token状态: ${token ? "已保存" : "无"}；授权码: ${codeStatus}`);
+        }
     });
 
     GM_registerMenuCommand("🚀 立即运行", () => TaskManager.runAll());
@@ -4163,7 +4220,14 @@ Notice:
     // 反复打扰授权）；想用刚粘贴的授权码彻底重建登录态，点这个清除旧 Token 即可。
     GM_registerMenuCommand("🔁 强制用授权码换取新Token", () => {
         if (!GM_getValue("Config.code", "")) {
-            alert("未检测到已保存的授权码。请先「🔑 手动授权」完成授权，再用「📋 粘贴授权码」保存跳转后的完整URL。");
+            // v4.4.3：SW 无 alert，崩掉整个回调；降级通知+日志
+            try {
+                GM_notification({
+                    text: "未检测到已保存的授权码。请在脚本设置的「授权码链接」粘贴 login.live.com 跳转后的完整 URL，或先点「🔑 手动授权」。",
+                    title: "🔁 缺少授权码", timeout: 0
+                });
+            } catch (_) {}
+            Utils.log("🟡", "未检测到已保存的授权码，无法强制换取（请先在设置面板粘贴或完成手动授权）");
             return;
         }
         GM_setValue("Config.token", false);

@@ -2545,6 +2545,95 @@ test("withTokenRetry returns null without a second request when renewal leaves n
     assert.equal(seenAuth.length, 0, "不得带着空 token 发出第二次请求");
 });
 
+// ====== v4.4.3：设置面板粘贴授权码保存链路修复 ======
+
+test("parseAuthCode accepts every paste shape users actually produce", () => {
+    const { Utils } = createHarness();
+    const code = "M.C5x5_BAY.0.-AeypQ2ZlU-EyI-XXX-long-token-value";
+    // 完整跳转 URL
+    assert.equal(Utils.parseAuthCode(`https://login.live.com/oauth20_desktop.srf?code=${code}&lc=2052`).code, code);
+    // URL 前后带杂散文本/换行（设置面板常见误粘）——URL 构造失败落正则提取
+    assert.equal(Utils.parseAuthCode(`已复制\nhttps://login.live.com/oauth20_desktop.srf?code=${code}\n请粘贴`).code, code, "前后杂散文本必须被剥净");
+    // 字面 "\n" 转义序列（部分面板序列化产物）同样截断
+    assert.equal(Utils.parseAuthCode(`https://login.live.com/oauth20_desktop.srf?code=${code}\\nlc=2052`).code, code, "字面反斜杠n必须被截断");
+    // fragment 形态（#code=）
+    assert.equal(Utils.parseAuthCode(`https://login.live.com/oauth20_desktop.srf#code=${code}`).code, code);
+    // URL 编码的 code
+    assert.equal(Utils.parseAuthCode(`https://login.live.com/oauth20_desktop.srf?code=${encodeURIComponent(code)}`).code, code);
+    // 仅粘贴 code 值
+    assert.equal(Utils.parseAuthCode(`  ${code}  `).code, code);
+    // 无效形态一律拒绝
+    assert.equal(Utils.parseAuthCode(""), null);
+    assert.equal(Utils.parseAuthCode(null), null);
+    assert.equal(Utils.parseAuthCode("https://example.com/without-code"), null);
+    assert.equal(Utils.parseAuthCode("short"), null);
+    assert.equal(Utils.parseAuthCode("一段没有任何URL或code特征的中文说明文字"), null);
+});
+
+test("fetchCode keeps an already-saved code and does not pre-clear Config.code", async () => {
+    // v4.4.3 核心：已保存的授权码必须被直接使用，且任何路径不得在消费前清空它。
+    // 走 renewToken 真实链路：无 token（跳过 refresh 分支）→ fetchCode 命中已存值
+    // → 换取成功 → 条件清理。
+    const code = "M.C5x5_BAY.0.-AeypQ2ZlU-EyI-XXX-long-token-value";
+    const posts = [];
+    const { API, Utils, storage } = createHarness({
+        "Config.code": `https://login.live.com/oauth20_desktop.srf?code=${code}&lc=2052`,
+    });
+    Utils.delay = async () => {};
+    Utils.xhr = async options => {
+        posts.push(options);
+        if (String(options.url).includes("oauth20_token.srf")) {
+            return JSON.stringify({ refresh_token: "new-refresh", access_token: "new-access" });
+        }
+        return "{}";
+    };
+
+    assert.equal(await API.renewToken(), true, "已保存授权码必须直接完成换取");
+    assert.equal(storage.get("Config.token"), "new-refresh");
+    assert.equal(storage.get("Config.code"), "", "消费成功后清理明文残留");
+    const body = new URLSearchParams(posts.find(p => String(p.url).includes("oauth20_token.srf")).data);
+    assert.equal(body.get("code"), code, "换取请求必须使用粘贴的授权码");
+});
+
+test("token refresh failure keeps the pasted Config.code (no unconditional wipe)", async () => {
+    // 失败路径回归：refresh_token 失效（invalid_grant）不得抹掉用户刚粘贴的授权码。
+    const { API, Utils, storage } = createHarness({
+        "Config.token": "dead-refresh",
+        "Config.code": "M.C5x5_BAY.0.-AeypQ2ZlU-EyI-XXX-long-token-value",
+    });
+    Utils.delay = async () => {};
+    Utils.xhr = async options => {
+        if (String(options.url).includes("oauth20_token.srf")) {
+            return JSON.stringify({ error: "invalid_grant", error_description: "token expired" });
+        }
+        // 授权页自动获取等其余请求一律失败（后台无登录态）
+        throw new Error("HTTP 403");
+    };
+
+    assert.equal(await API.renewToken(), false, "refresh 与授权码均不可用时返回失败");
+    assert.equal(storage.get("Config.code"), "M.C5x5_BAY.0.-AeypQ2ZlU-EyI-XXX-long-token-value", "失败路径不得清空已保存的授权码");
+    assert.equal(storage.get("Config.token"), false, "失效 token 必须被清");
+});
+
+test("successful exchange does not wipe a re-pasted newer Config.code", async () => {
+    // 条件清理回归：换取期间用户重新粘贴了新值（存储值 ≠ 本轮消费值）→ 不得清除。
+    const code = "M.C5x5_BAY.0.-AeypQ2ZlU-EyI-XXX-long-token-value";
+    const { API, Utils, storage } = createHarness({ "Config.code": code });
+    Utils.delay = async () => {};
+    Utils.xhr = async options => {
+        if (String(options.url).includes("oauth20_token.srf")) {
+            // 换取请求在途时模拟用户重新粘贴新授权码
+            storage.set("Config.code", "M.C5x5_BAY.0.-BRAND-NEW-CODE-pasted-during-exchange");
+            return JSON.stringify({ refresh_token: "new-refresh", access_token: "new-access" });
+        }
+        return "{}";
+    };
+
+    assert.equal(await API.renewToken(), true);
+    assert.equal(storage.get("Config.code"), "M.C5x5_BAY.0.-BRAND-NEW-CODE-pasted-during-exchange", "重粘贴的新值不得被旧轮次清理抹掉");
+    assert.equal(storage.get("Config.token"), "new-refresh");
+});
+
 test("no stubbed DAPI request ever carries a falsy Bearer header across the retry ladder", async () => {
     // 与上一条互补：走真实 _dapiRequest 链路（renewToken mock 为失败，避免真实
     // 授权码流程阻塞 90 秒），401 → 续期失败 → 无第二次请求；全链路鉴权头逐个体检。
