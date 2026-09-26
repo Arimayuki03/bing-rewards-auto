@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到-页面领取
 // @namespace    local.bing-rewards-auto
-// @version      4.3.1
-// @description  《微软积分商城签到（全能智能重构版）》的页面侧领取组件。2026-09-17 抓包实证：Server Action 的入账判据在页面上下文成立（同 payload、同 action ID，页面内 POST /earn → 200 + 1:true，实测余额 +15），而 Service Worker 直连被边缘 503（返回 Bing 错误页 HTML）——这类"仅页面上下文可领"的 offer（如 WW_Rewards_locked_level2_*，unlockCriteria 已满足但不在 App 目录）只有本脚本能拿到。工作方式：仅在用户已打开 rewards.bing.com 页面时生效，不依赖 @storageName 跨脚本存储（v3.9.0 现场已证伪），不开救援标签页；自主抓取 earn/dashboard 的 flight 数据 → 解析待领 offer 与当次轮换 hash → 扫构建 chunk 定位当前部署的 reportActivity action ID → 页面内逐个上报 + 欢迎积分领取，15 分钟节流防重复。后台脚本下一轮复核到账后自然转入完成/放弃账本。
+// @version      4.4.0
+// @description  《微软积分商城签到（全能智能重构版）》的页面侧领取组件。2026-09-17 抓包实证：Server Action 的入账判据在页面上下文成立（同 payload、同 action ID，页面内 POST /earn → 200 + 1:true，实测余额 +15），而 Service Worker 直连被边缘 503（返回 Bing 错误页 HTML）——这类"仅页面上下文可领"的 offer（如 WW_Rewards_locked_level2_*，unlockCriteria 已满足但不在 App 目录）只有本脚本能拿到。工作方式：仅在 rewards.bing.com 页面打开时生效，不依赖 @storageName 跨脚本存储（v3.9.0 现场已证伪），不开救援标签页；自主抓取 earn/dashboard 的 flight 数据 → 解析待领 offer 与当次轮换 hash → 扫构建 chunk 定位当前部署的 reportActivity action ID → 页面内逐个上报 + 欢迎积分领取，15 分钟节流防重复；v4.4.0：支持后台 ?autoclaim=1 开页代领（与 claimnow 同等强制语义），清扫后重抓 flight 逐卡复核 isCompleted（1:true 不代表到账）并计入状态，新增 🩺 只读诊断菜单。
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @match        https://rewards.bing.com/*
@@ -294,6 +294,31 @@
                 lastRunReason: reason,
                 lastResult: { ok: accepted, total: offers.length, results, welcomeAccepted: welcome.accepted, actionId: actionId.slice(0, 12), dpl },
             };
+
+            // v4.4.0 清扫后复核：重抓 /earn flight，逐卡核对 isCompleted。
+            // 1:true 仅证明 action 被执行（对已完成 offer 重放同样 1:true，2026-09-26
+            // 复证），是否真到账以 flight 的 isCompleted 为准。入账/未入账都计入
+            // 状态记录：未入账的（offer 出列条件不满足/服务端静默吸收）留给下一轮
+            // 扫描自然重试，不在本页内反复重发。
+            try {
+                await sleep(3000);
+                const verify = await fetchText("https://rewards.bing.com/earn");
+                if (verify.status === 200) {
+                    const live = collectClaimableOffers(concatFlightChunks(verify.text));
+                    const liveDone = new Map();
+                    for (const obj of extractFlightObjects(concatFlightChunks(verify.text), '"offerId"')) {
+                        if (typeof obj.offerId === "string") liveDone.set(obj.offerId, obj.isCompleted === true);
+                    }
+                    for (const r of results) {
+                        r.confirmed = liveDone.get(r.offerId) === true;
+                        if (r.accepted && !r.confirmed) log(`复核未到账: ${r.offerId}（服务端未确认，留给下轮）`);
+                    }
+                    const confirmedCount = results.filter(r => r.confirmed).length;
+                    log(`复核: ${confirmedCount}/${results.length || 0} 个 offer 确认完成`);
+                    rec.lastResult.confirmed = confirmedCount;
+                }
+            } catch (_) { /* 复核失败不影响本次结果记录 */ }
+
             writeState(rec);
             log(`扫描完成: ${accepted}/${offers.length} 个上报受理（到账由后台下一轮复核确认）`);
             return rec.lastResult;
@@ -302,17 +327,20 @@
         }
     };
 
-    // 触发条件：仅 rewards 页 + 常用路径（或 ?claimnow=1 强制）；15 分钟节流。
+    // 触发条件：仅 rewards 页 + 常用路径（或 ?claimnow=1 / ?autoclaim=1 强制）；15 分钟节流。
+    // v4.4.0：autoclaim=1 是后台脚本开页代领的握手参数——语义与 claimnow 相同
+    //（强制执行 + 绕过节流），区别只在触发来源标记。
     const maybeRun = () => {
-        const force = /(?:^|[?&])claimnow=1(?:&|$)/.test(location.search);
+        const forceParam = /(?:^|[?&])(?:claimnow|autoclaim)=1(?:&|$)/.test(location.search);
+        const forceReason = /(?:^|[?&])autoclaim=1(?:&|$)/.test(location.search) ? "autoclaim" : "claimnow";
         const pathname = (location.pathname || "/").replace(/\/+$/, "") || "/";
-        if (!force && !AUTO_PATHS.includes(pathname)) return false;
+        if (!forceParam && !AUTO_PATHS.includes(pathname)) return false;
         const last = Number(readState().lastRunAt || 0);
-        if (!force && Date.now() - last < SWEEP_INTERVAL_MS) return false;
+        if (!forceParam && Date.now() - last < SWEEP_INTERVAL_MS) return false;
         // 先落时间戳再执行：即使本次失败也占住窗口，避免每个页面视图都重扫一遍
-        writeState({ lastRunAt: Date.now(), lastRunReason: force ? "claimnow" : "auto" });
+        writeState({ lastRunAt: Date.now(), lastRunReason: forceParam ? forceReason : "auto" });
         // 等页面自身加载完成后再扫，避免与首屏请求竞争带宽
-        setTimeout(() => { runSweep(force ? "claimnow" : "auto").catch(e => log("扫描异常:", String((e && e.message) || e))); }, force ? 2000 : 6000);
+        setTimeout(() => { runSweep(forceParam ? forceReason : "auto").catch(e => log("扫描异常:", String((e && e.message) || e))); }, forceParam ? 2000 : 6000);
         return true;
     };
 
@@ -322,13 +350,15 @@
             const s = readState();
             const r = s.lastResult || {};
             const ago = s.lastRunAt ? `${Math.max(0, Math.round((Date.now() - s.lastRunAt) / 1000))} 秒前` : "从未";
+            const results = Array.isArray(r.results) ? r.results : [];
             alert([
                 "上下文: rewards 页面（本页脚本已注入）",
                 `最近扫描: ${ago}（触发源: ${s.lastRunReason || "?"}）`,
-                `上次结果: ${r.ok ?? 0}/${r.total ?? 0} 个上报受理${r.welcomeAccepted ? "，欢迎积分已受理" : ""}`,
+                `上次结果: ${r.ok ?? 0}/${r.total ?? 0} 个上报受理${typeof r.confirmed === "number" ? `，复核确认 ${r.confirmed} 个` : ""}${r.welcomeAccepted ? "，欢迎积分已受理" : ""}`,
+                ...results.slice(0, 12).map(x => `  - ${x.offerId}: HTTP ${x.status}${x.accepted ? " 受理" : ""}${x.confirmed === true ? " ✅已入账" : x.accepted ? "（未确认）" : ""}`),
                 r.dpl ? `部署: ${r.dpl}（action ${r.actionId || "?"}…）` : "",
                 "",
-                "仅当本页打开时生效；15 分钟自动节流一次。",
+                "仅当本页打开时生效；15 分钟自动节流一次；?autoclaim=1 为后台代领握手。",
                 "后台脚本下一轮会复核到账并记入完成/放弃账本。",
             ].filter(Boolean).join("\n"));
         });
@@ -337,6 +367,32 @@
             runSweep("manual").then(r => {
                 alert(r ? `完成: ${r.ok}/${r.total} 个上报受理` : "扫描未执行（抓取失败或已有任务在跑）");
             }).catch(e => alert("扫描异常: " + String((e && e.message) || e)));
+        });
+        // v4.4.0：🩺 只读诊断——列出本页视角下的待领 offer/action ID/数据源形态，
+        // 零写操作（不发任何领取请求），与主脚本同名菜单配套使用。
+        GM_registerMenuCommand("🩺 日常卡片诊断（本页）", async () => {
+            const lines = [];
+            try {
+                const [earn, dash] = await Promise.all([
+                    fetchText("https://rewards.bing.com/earn"),
+                    fetchText("https://rewards.bing.com/dashboard"),
+                ]);
+                lines.push(`【页面抓取】earn HTTP ${earn.status}（${earn.text.length}B）, dashboard HTTP ${dash.status}（${dash.text.length}B）`);
+                const combined = concatFlightChunks(earn.text) + concatFlightChunks(dash.text);
+                lines.push(`【flight 流】拼接后 ${combined.length} 字符（0 = 页面结构可能已改版）`);
+                const offers = collectClaimableOffers(combined);
+                lines.push(`【待领 offer】${offers.length} 个`);
+                for (const o of offers.slice(0, 12)) {
+                    lines.push(`  - ${o.offerId} +${o.points}p hash=${o.hash.slice(0, 10)}…`);
+                }
+                const dpl = ((earn.text + dash.text).match(/dpl=([0-9][0-9A-Za-z.\-]*)/) || [])[1] || "";
+                const actionId = await resolveActionId(earn.text + dash.text, dpl);
+                lines.push(`【Action ID】${actionId ? `✅ ${actionId.slice(0, 16)}…（dpl=${dpl || "?"}）` : "❌ 未能解析（将用兜底值，站点改版后会失效）"}`);
+                lines.push("", "— 以上为只读探测，未发送任何领取请求 —");
+            } catch (e) {
+                lines.push(`诊断异常: ${e.message}`);
+            }
+            alert(lines.join("\n"));
         });
     } catch (_) { /* 菜单注册失败不影响自动流程 */ }
 

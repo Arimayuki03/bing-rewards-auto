@@ -4,9 +4,9 @@
 
 **微软积分商城每日签到全家桶 · 后台静默执行 · 多通道消息推送**
 
-[![Version](https://img.shields.io/badge/version-4.3.1-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
+[![Version](https://img.shields.io/badge/version-4.4.0-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
 [![ScriptCat](https://img.shields.io/badge/ScriptCat-%E6%89%A9%E5%B1%95%E8%84%9A%E6%9C%AC-orange)](https://scriptcat.org/)
-[![Tests](https://img.shields.io/badge/tests-146%2F146-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-154%2F154-brightgreen)](#开发与测试)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](#License)
 [![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-%E5%9B%BD%E5%8C%BA%20Microsoft%20Rewards-9cf)](https://rewards.bing.com/)
 [![Stars](https://img.shields.io/github/stars/Arimayuki03/bing-rewards-auto?style=social)](https://github.com/Arimayuki03/bing-rewards-auto/stargazers)
@@ -31,21 +31,21 @@
 | 📰 新闻阅读 | DAPI 接口领取阅读任务，App UA 上报 3 篇（+30 分） | 开 |
 | 🎯 活动卡片 | 自动发现可领 offer，App 上报为主路径，含每日打卡 | 开 |
 | 🔍 PC 搜索 | 随机词 + 4 家热搜 API 补足搜索积分，间隔 ±15 秒抖动 | 开 |
-| 🧩 Quiz 自动答题 | 自动识别问答/拼图类卡片并完成 | 开 |
-| 📅 每日活动 | getuserinfo/flyout 结构化数据 + flight 流三级兜底 | 开 |
+| 🧩 Quiz / 拼图卡片 | 自动识别问答/拼图类卡片并完成上报（拼图实测由 Server Action 入账；问答题无答题器，仅上报领取） | 开 |
+| 📅 每日活动 | getuserinfo/flyout 结构化数据 + flight 流三级兜底，边缘拦截日自动开页代领 | 开 |
 | 🔗 连签检测 | 自动检测搜索连签任务并接续 | 自动 |
 | 🔁 二次扫描 | 复查入账确认，防误报完成 | 自动 |
 | 📲 页面领取组件 | 仅页面上下文可领的锁定卡（如 `WW_Rewards_locked_level2`）在打开 rewards 页时自动领取 | 独立脚本 |
 | 🔔 积分通知 | 企业微信 / 钉钉 / 飞书 / PushMe / Bark，余额变动推送 | 自选 |
 
-**可靠性设计**：轮内请求缓存（同轮零重复请求）· 跨实例运行锁 · 按日期隔离状态 · 随机延迟与 UA 轮换 · 边缘 503 拦截识别与当日放弃账本 · action ID 随部署动态解析 · 空清单早退 · 跨日自愈。
+**可靠性设计**：轮内请求缓存（同轮零重复请求）· 跨实例运行锁 · 按日期隔离状态 · 随机延迟与 UA 轮换 · 边缘 503 拦截识别与当日放弃账本 · action ID 随部署动态解析 · 边缘拦截日自动开页代领（每日限次+冷却）· 清扫后逐卡复核 · 跨日自愈。
 
 ## 🧩 脚本组成
 
 | 文件 | 角色 | 版本 |
 |---|---|---|
-| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.3.1 |
-| [`微软积分商城签到-页面领取.user.js`](微软积分商城签到-页面领取.user.js) | 页面侧组件：仅在用户打开 rewards.bing.com 时自动领取锁定卡 | 4.3.1 |
+| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.4.0 |
+| [`微软积分商城签到-页面领取.user.js`](微软积分商城签到-页面领取.user.js) | 页面侧组件：rewards.bing.com 页面打开时（含后台 `?autoclaim=1` 开页代领）自动领取锁定卡 | 4.4.0 |
 
 > 两个脚本独立工作、互不依赖：主脚本不注入页面，页面组件不依赖跨脚本存储。只装主脚本即可覆盖绝大多数任务；页面组件用于补领主脚本通道拿不到的少量 offer。
 
@@ -91,13 +91,15 @@
 | 🔑 手动授权 / 📋 粘贴授权码 | 首次授权 |
 | 📊 Token状态 | 查看当前授权状态 |
 | 🚀 立即运行 | 手动执行一轮任务 |
+| 🩺 日常卡片诊断 | 只读探测：每日活动/活动卡状态、action ID、cookie 链、代领账本 |
 | 🔁 强制用授权码换取新Token | Token 失效自救 |
 | 🔔 配置通知接口 / 📢 测试通知 | 推送渠道配置与测试 |
 
 | 页面领取脚本（在 rewards.bing.com 页面） | 说明 |
 |---|---|
-| 🧾 页面领取状态（本页） | 查看最近一次扫描结果 |
+| 🧾 页面领取状态（本页） | 查看最近一次扫描结果（含逐卡复核状态） |
 | ▶️ 立即领取（本页） | 跳过 15 分钟节流强制领取 |
+| 🩺 日常卡片诊断（本页） | 只读探测：待领 offer 清单、flight 形态、action ID |
 
 ## ❓ FAQ
 
@@ -122,7 +124,7 @@
 <details>
 <summary><b>「每日活动完成 0/3」或卡片一直不领取？</b></summary>
 
-个别 offer 仅在页面上下文可领（SW 直连会被边缘 503 拦截）。安装配套的**页面领取脚本**，保持 rewards.bing.com 页面打开即可自动补领；也可在页面菜单点 **▶️ 立即领取（本页）**。
+v4.4.0 起主脚本会在被边缘拦截时**自动打开 rewards 页交由页面领取脚本代领**（每日最多 6 次，25 分钟冷却，页面 150 秒后自动关闭），通常无需人工干预。仍异常时用主脚本菜单 **🩺 日常卡片诊断**（或页面的 **🩺 日常卡片诊断（本页）**）逐层查看：cookie 链 → 每日活动清单 → 活动卡状态 → action ID → 代领账本，定位到具体环节。注意「仅限积分商城应用」的卡片（`WW_Moreactivities_RewardsApp_*`）网页端本就不可领取，只能由必应 App 完成。
 </details>
 
 <details>
@@ -140,7 +142,7 @@
 ## 🛠 开发与测试
 
 ```bash
-# 运行全部测试（146 个：主脚本 119 + 页面组件 27）
+# 运行全部测试（154 个：主脚本 124 + 页面组件 30）
 # 注意：必须显式列出文件名——node --test tests/ 在 Windows 下报 MODULE_NOT_FOUND
 node --test "tests/userscript.logic.test.cjs" "tests/page-claim.logic.test.cjs"
 
@@ -153,13 +155,13 @@ node --check "微软积分商城签到-页面领取.user.js"
 
 ```
 bing-rewards-auto/
-├── 微软积分商城签到（全能智能重构版）.user.js   # 主脚本（后台定时任务，4200+ 行）
-├── 微软积分商城签到-页面领取.user.js            # 页面领取组件（350+ 行）
+├── 微软积分商城签到（全能智能重构版）.user.js   # 主脚本（后台定时任务，4300+ 行）
+├── 微软积分商城签到-页面领取.user.js            # 页面领取组件（420+ 行）
 ├── 微软积分商城签到（全能智能重构版）.options.json
 ├── tests/
-│   ├── userscript.logic.test.cjs               # 主脚本逻辑测试（119）
-│   └── page-claim.logic.test.cjs               # 页面组件逻辑测试（27）
-├── 改动与待办记录.md                            # 30 轮迭代完整改动日志
+│   ├── userscript.logic.test.cjs               # 主脚本逻辑测试（124）
+│   └── page-claim.logic.test.cjs               # 页面组件逻辑测试（30）
+├── 改动与待办记录.md                            # 31 轮迭代完整改动日志
 └── 优化分析.md                                  # 初期优化分析与裁定记录
 ```
 
@@ -169,6 +171,7 @@ bing-rewards-auto/
 
 | 版本 | 要点 |
 |---|---|
+| v4.4.0 | 日常任务卡片修复（内置浏览器抓包实证）：边缘拦截日自动开页代领闭环（autoclaim 握手 + 每日限次/冷却 + 自动收页）、页面脚本清扫后逐卡复核、空清单不再假标完成、双脚本新增 🩺 只读诊断菜单；测试 146 → 154 |
 | v4.3.1 | 开源发布至 GitHub，新增 README；功能同 v4.3.0 |
 | v4.3.0 | 三审查报告合并定案 12 项修复：空清单早退、兜底标签页 10s close、renewToken 门槛与 Bearer 畸形头、边缘拦截短路、dailySetFail 当日上限 5、页面脚本补 19 条 skipPatterns 等；测试 121 → 146 |
 | v4.2.1 | `$ACTION_ID_` 40 → {40,64} 位截断修复（P0）、页面提取兄弟嵌套漏提、轮末余额 fresh、日志去 cookie 明文 |

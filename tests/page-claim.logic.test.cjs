@@ -524,6 +524,64 @@ test("maybeRun re-fires after the throttle window elapses", () => {
     assert.equal(h.timers.length, 2);
 });
 
+// ====== v4.4.0：autoclaim=1 后台代领握手 + 清扫后复核 ======
+
+test("maybeRun treats autoclaim=1 as a forced run with its own reason", () => {
+    // 后台开页代领握手：任意 rewards 路径 + autoclaim=1 → 绕过节流强制扫描，
+    // 触发源标记 autoclaim（与 claimnow 同语义、异来源）。
+    const h = createPageHarness({ pathname: "/earn", search: "?autoclaim=1" });
+    assert.equal(h.timers.length, 1, "autoclaim=1 必须强制调度扫描");
+    const state = JSON.parse(h.store.get("bw_page_claim"));
+    assert.equal(state.lastRunReason, "autoclaim");
+});
+
+test("maybeRun still throttles autoclaim=1 within the window after a fresh manual run", () => {
+    // autoclaim 绕过节流的判据是"强制参数"分支本身：fresh 手动扫描刚占住窗口时
+    // （15 分钟内），autoclaim 依旧立即执行——后台编排每次开页都要求清扫，不受限。
+    const h = createPageHarness({ pathname: "/earn", search: "?autoclaim=1" });
+    // 第一次（加载时）已调度；拨回时间戳模拟"窗口内已跑过"再触发，仍必须调度
+    const state = JSON.parse(h.store.get("bw_page_claim"));
+    state.lastRunAt = Date.now() - 60 * 1000;
+    h.store.set("bw_page_claim", JSON.stringify(state));
+    assert.equal(h.maybeRun(), true, "强制参数不受节流窗口约束");
+});
+
+test("runSweep verifies credited offers against a fresh earn flight and records confirmed flags", async () => {
+    // 清扫后复核：POST 受理后重抓 /earn，isCompleted=true 的 offer 标记 confirmed；
+    // 受理但未入账的保持未确认（留待下轮），复核结果计入 lastResult.confirmed。
+    const offerId = "VERIFY_OFFER";
+    const offerJson = JSON.stringify({ offerId, hash: "a".repeat(64), points: 15 });
+    let earnFetches = 0;
+    const h = createPageHarness({
+        pathname: "/earn", search: "",
+        fetchImpl: (url, init) => {
+            if (String(url).startsWith("https://rewards.bing.com/earn") && !String(url).includes("_next")) {
+                if ((init && init.method) === "POST") {
+                    // Server Action 受理形态（真实抓包）
+                    return { status: 200, text: async () => '0:{"a":"$@1","f":"","q":"","i":false}\n1:true\n' };
+                }
+                earnFetches++;
+                if (earnFetches === 1) {
+                    // 首次扫描：offer 未完成
+                    return { status: 200, text: () => flightHtml(`x:[${offerJson}]`) };
+                }
+                // 复核抓取：offer 已完成
+                return { status: 200, text: () => flightHtml(`x:[${JSON.stringify({ offerId, hash: "a".repeat(64), points: 15, isCompleted: true })}]`) };
+            }
+            return null; // 其余走默认空 HTML
+        },
+    });
+    // 隔离加载时的自动扫描
+    h.store.set("bw_page_claim", JSON.stringify({ lastRunAt: Date.now() }));
+    await h.runSweep("manual");
+    const state = JSON.parse(h.store.get("bw_page_claim"));
+    assert.equal(state.lastResult.total, 1, "应有 1 个待领 offer");
+    assert.equal(state.lastResult.ok, 1, "POST 应被受理");
+    assert.equal(state.lastResult.results[0].confirmed, true, "复核应确认该 offer 已入账");
+    assert.equal(state.lastResult.confirmed, 1);
+    assert.ok(earnFetches >= 2, "清扫后必须有一次独立的复核抓取");
+});
+
 // ====== 与主脚本的协作契约 ======
 
 test("page claim script stays self-contained: no cross-script storage, no rescue tab", () => {

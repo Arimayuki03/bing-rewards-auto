@@ -2101,8 +2101,10 @@ test("doDailySet exits early when every item is already complete (empty pending 
     assert.equal(openTabs.length, 0, "空清单不得打开任何标签页");
 });
 
-test("doDailySet exits early when getDailySetItems returns an empty array", async () => {
-    // 另一条空清单路径：items 为空数组（非 null）同样早退，不得误判为"获取失败"。
+test("doDailySet does not fake completion when getDailySetItems returns an empty array (v4.4.0)", async () => {
+    // v4.4.0 行为改写（原 v4.3.0 用例断言空数组早退置完成）：getuserinfo 退役后
+    // 数据源可能整体降级为空清单——假标完成会把当日 3 张卡静默跳过整天。
+    // 新语义：空数组 → 返回 false 交由下轮重试，不置 dailySetDone、零 chunk GET、不开页。
     const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
     RewardsAuto.state.dateNowNum = 20260920;
     Utils.randomDelay = async () => {};
@@ -2115,8 +2117,8 @@ test("doDailySet exits early when getDailySetItems returns an empty array", asyn
 
     const result = await TaskManager.doDailySet();
 
-    assert.equal(result, true);
-    assert.equal(storage.get("Config.dailySetDone"), 20260920);
+    assert.equal(result, false, "空清单（数据源降级形态）必须返回 false 待下轮重试");
+    assert.notEqual(storage.get("Config.dailySetDone"), 20260920, "空清单不得假标当日完成");
     assert.equal(chunkGets, 0);
     assert.equal(openTabs.length, 0);
 });
@@ -2302,6 +2304,82 @@ test("non-edge failures (500) keep trying every pending item without short-circu
 
     assert.equal(RewardsAuto.state.dailySetEdgeBlocked, false, "500 不是边缘拦截，不得置标记");
     assert.equal(posts.length, offerIds.length, "非拦截失败必须逐项尝试（每项 context 形状 1 次）");
+});
+
+// ====== v4.4.0：边缘拦截日开页代领编排（抓包真值 2026-09-26）======
+
+test("_kickPageSweep opens the earn page with autoclaim under daily cap and cooldown", async () => {
+    const { RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+
+    assert.equal(TaskManager._kickPageSweep("测试"), true, "首次开页必须成功");
+    assert.equal(openTabs.length, 1);
+    assert.equal(openTabs[0].url, "https://rewards.bing.com/earn?autoclaim=1", "开页必须携带 autoclaim 握手参数");
+    assert.equal(openTabs[0].opts.active, false, "代领页必须后台打开");
+    const rec = storage.get("Config.pageSweep");
+    assert.deepEqual([rec.date, rec.count], [20260920, 1]);
+
+    // 冷却期内第二次开页被拒
+    assert.equal(TaskManager._kickPageSweep("测试"), false, "冷却期内不得重复开页");
+    assert.equal(openTabs.length, 1);
+});
+
+test("_kickPageSweep stops at PAGE_SWEEP_MAX_PER_DAY for the day", () => {
+    const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    storage.set("Config.pageSweep", { date: 20260920, count: 6, lastAt: 0 });
+
+    assert.equal(TaskManager._kickPageSweep("测试"), false, "当日达上限后不得再开页");
+    assert.equal(openTabs.length, 0);
+});
+
+test("_kickPageSweep ledger resets on a new day", () => {
+    const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260921;
+    storage.set("Config.pageSweep", { date: 20260920, count: 6, lastAt: 0 });
+
+    assert.equal(TaskManager._kickPageSweep("测试"), true, "次日账本重置，可再次开页");
+    assert.equal(openTabs.length, 1);
+    assert.equal(storage.get("Config.pageSweep").date, 20260921);
+});
+
+test("doDailySet kicks the page sweep when edge-blocked instead of silently failing", async () => {
+    // v4.4.0 核心编排：边缘拦截轮必须尝试开页代领（限次+冷却内），不再只留日志空转。
+    const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260920;
+    Utils.randomDelay = async () => {};
+    API.getDailySetItems = async () => [{ offerId: "DS_A", complete: false }];
+    TaskManager._extractDailySetHashes = async () => [{ offerId: "DS_A", hash: "a".repeat(40) }];
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    Utils.xhr = async () => ({ status: 503, body: '<!DOCTYPE html><html xml:lang="en"><head><title>Bing</title></head></html>' });
+
+    const result = await TaskManager.doDailySet();
+
+    assert.equal(result, false, "拦截轮仍返回 false（结果由下轮复核确认）");
+    assert.equal(RewardsAuto.state.dailySetEdgeBlocked, true);
+    assert.equal(openTabs.length, 1, "拦截后必须开页代领");
+    assert.equal(openTabs[0].url, "https://rewards.bing.com/earn?autoclaim=1");
+    assert.equal(storage.get("Config.pageSweep").count, 1);
+});
+
+test("claimCard flags promosEdgeBlocked on edge 503 for the promos orchestration", async () => {
+    const { API, RewardsAuto, Utils } = createHarness();
+    API.appActivity = async () => null;
+    API._resolveReportActivityActionId = async () => "f".repeat(42);
+    Utils.xhr = async options => {
+        if (options.method === "POST") {
+            return { status: 503, body: '<!DOCTYPE html><html xml:lang="en"><head><title>Bing</title></head></html>' };
+        }
+        return "<html></html>";
+    };
+    Utils.fetchPage = async () => "";
+
+    const ok = await API.claimCard({ offerId: "WW_locked", hash: "h1" });
+
+    assert.equal(ok, false);
+    assert.equal(RewardsAuto.state.promosEdgeBlocked, true, "边缘拦截必须置 promos 编排标记");
+    assert.equal(Utils.isEdgeBlockedError(new Error("HTTP 500: x")), false);
 });
 
 // ====== v4.3.0：renewToken 续期门槛 + Bearer null 回归 ======

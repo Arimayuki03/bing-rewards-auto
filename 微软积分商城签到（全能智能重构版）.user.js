@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.3.1
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz、✅拼图、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.2.0：配套《微软积分商城签到-页面领取》脚本——抓包实证 SW 直连 Server Action 被边缘 503、页面上下文同样请求 200+入账，仅页面上下文可领的 offer 交由页面侧脚本在用户打开 rewards 页时自动完成；v4.1.1：锁定等级卡解析层过滤 + 失败卡计入放弃账本；v4.1.0：App 上报为主路径，服务端对 App 目录外 offer 静默 200+p:0）
+// @version      4.4.0
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.0：SW 直发 Server Action 被边缘 503 拦截时自动打开 rewards 页（每日限次+冷却）交由《页面领取》脚本代领并自动收页，页面脚本清扫后逐卡复核；每日活动空清单不再假标完成；新增 🩺 日常卡片诊断菜单；v4.2.0：配套《微软积分商城签到-页面领取》脚本——抓包实证 SW 直连 Server Action 被边缘 503、页面上下文同样请求 200+入账；v4.1.0：App 上报为主路径）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -277,6 +277,9 @@ Notice:
             // 置位，doDailySet 跳过本轮剩余项。仅本轮内存态，doDailySet 入口显式归零
             //（同实例经菜单"立即运行"重复触发 runAll 时也不会跨轮残留）。
             dailySetEdgeBlocked: false,
+            // v4.4.0：claimCard 网页策略被边缘拦截时同样置位（每日集与活动卡共用），
+            // doPromos/runAll 据此决定是否开页代领。仅本轮内存态，runAll 入口归零。
+            promosEdgeBlocked: false,
         }
     };
 
@@ -2361,8 +2364,10 @@ Notice:
 
             // 边缘拦截时不发后台标签页（它同样走 SW/扩展发起的网络栈，无法改变拦截结果），
             // 直接转交页面侧脚本；非拦截性失败仍保留这条原生流程兜底。
+            // v4.4.0：置本轮 promosEdgeBlocked 标记，doPromos 据此开页代领（限次+冷却）。
             if (edgeBlocked) {
-                Utils.log("🟡", `卡片需页面上下文领取(${card.offerId}): SW 直连被边缘拦截（503），已交给《页面领取》脚本——打开任意 rewards.bing.com 页面即可自动完成`);
+                RewardsAuto.state.promosEdgeBlocked = true;
+                Utils.log("🟡", `卡片需页面上下文领取(${card.offerId}): SW 直连被边缘拦截（503），本轮由《页面领取》脚本代领——后台将自动打开 rewards 页完成`);
                 return false;
             }
 
@@ -2588,6 +2593,15 @@ Notice:
     // 放弃（任务返回 true 对齐 promos 放弃语义），以 {date,count} 结构按日自动重置；
     // 放弃不写 Config.dailySetDone，次日自愈逻辑不受影响。
     const DAILY_SET_GIVE_UP_AFTER = 5;
+
+    // v4.4.0 开页编排（抓包真值 2026-09-26：页面点击 → POST /earn next-action 200 + 积分
+    // 真实到账，SW 直发同请求 503）——边缘拦截日的代领链路：后台 GM_openInTab 打开
+    // rewards 页（autoclaim=1）→ 注入该页的《页面领取》脚本自动清扫 → 150 秒后自动收页
+    // → 后台下一轮以 fresh 抓取复核到账（1:true 不代表到账，复核才是唯一判据）。
+    const PAGE_SWEEP_URL = "https://rewards.bing.com/earn?autoclaim=1";
+    const PAGE_SWEEP_MAX_PER_DAY = 6;            // 当日最多开页次数（0-6 点凌晨失败密集期够用）
+    const PAGE_SWEEP_COOLDOWN_MS = 25 * 60 * 1000; // 两次开页最小间隔（> 20 分钟 cron 周期）
+    const PAGE_SWEEP_TAB_LIFETIME_MS = 150 * 1000; // 页面存活时长：页面脚本节流 6s + 扫描/领取间隔足够收尾
 
     // 运行锁参数：运行中心跳每 5 分钟续期一次；过期窗口 20 分钟（> 2 个心跳周期），
     // 既保证活跃长任务不被误判过期，又把实例意外终止（关标签页/SW 被杀）后
@@ -2862,6 +2876,18 @@ Notice:
                 return false;
             }
 
+            // v4.4.0：本轮有卡片被边缘拦截（SW 503）时开页代领——页面脚本的领取
+            // 结果由下轮 doPromos 的 fresh 复核自然确认；限额用尽/冷却中保持失败
+            // 语义（promosTimes++，交由下轮再试），不阻塞本轮其余任务。
+            if (RewardsAuto.state.promosEdgeBlocked) {
+                const kicked = this._kickPageSweep("活动卡片");
+                this.promosTimes++;
+                Utils.log("🟡", kicked
+                    ? "活动卡片被边缘拦截，已开页代领，下轮复核"
+                    : "活动卡片被边缘拦截且开页代领暂不可用（限额/冷却），下轮重试");
+                return false;
+            }
+
             this.promosDate = RewardsAuto.state.dateNowNum;
             this.save();
             if (newlyGivenUp.length > 0) {
@@ -3057,6 +3083,7 @@ Notice:
             const processedIds = new Set(processed.map(p => p.offerId));
             // 同实例重复触发时清掉上一轮的边缘拦截标记，作用域严格限定单轮
             RewardsAuto.state.dailySetEdgeBlocked = false;
+            RewardsAuto.state.promosEdgeBlocked = false;
 
             Utils.log("📅", `开始执行每日活动（已处理 ${processedIds.size} 个）...`);
             await Utils.randomDelay(3000, 8000);
@@ -3103,7 +3130,15 @@ Notice:
             // （最多 16 个 chunk GET 纯浪费）。判定为"本轮无待办"：置当日完成判据、
             // 任务级早退（对齐上方 items 全完成分支的写法；不写 processed 账本，
             // 不伪造任何 offer 的入账记录）。
+            // v4.3.0 空清单早退；v4.4.0 修正：只有"列表非空且全部已完成/已入账出列"
+            // 才算本轮无事可做（置当日完成判据）。items 为空数组（getuserinfo 退役后
+            // 数据源整体降级的形态，2026-09-26 抓包实证页面上下文同样拿不到）时不得
+            // 假标完成——当日 3 张卡会被静默跳过整天，返回 false 交由下轮重试。
             if (pendingItems.length === 0) {
+                if (items.length === 0) {
+                    Utils.log("🟡", "每日活动清单为空（数据源可能降级），不标记完成，下轮重试");
+                    return false;
+                }
                 Utils.log("✅", "每日活动无待办项（列表为空或已全部 App 上报出列）");
                 GM_setValue("Config.dailySetDone", today);
                 return true;
@@ -3155,9 +3190,11 @@ Notice:
                 // 复查完成状态（上报后的状态变化必须绕过缓存）；rnoreward 跳转入账
                 // 有数秒延迟（v3.6.12：4-8 秒实测偏短，出现过 0/3 误报后同轮二次扫描又确认成功）
                 // v4.3.0：本轮已检出边缘拦截时跳过复查——同轮内拦截态不会解除，复查
-                // 必然 503，直接返回 false 交由 runAll 计入当日失败账本。
+                // 必然 503。v4.4.0：此时改为开页代领（当日限次+冷却），页面脚本的
+                // 领取结果由下轮 fresh 复核确认；开页限额用尽/冷却中则维持 false。
                 if (RewardsAuto.state.dailySetEdgeBlocked) {
-                    Utils.log("🟡", "本轮每日活动上报被边缘拦截，跳过复查，下轮重试");
+                    this._kickPageSweep("每日活动");
+                    Utils.log("🟡", "本轮每日活动上报被边缘拦截，转页面代领，下轮复核");
                     return false;
                 }
                 await Utils.randomDelay(8000, 15000);
@@ -3684,6 +3721,28 @@ Notice:
             }
         },
 
+        // v4.4.0：边缘拦截日开页代领编排。当日次数 + 冷却双门槛，超限静默返回
+        // false（不刷日志）。返回 true 表示本轮已开页：调用方应跳过同轮内的
+        // Server Action 重试与复查（拦截态不会在同轮解除），等待下轮复核。
+        _kickPageSweep(reason) {
+            const today = RewardsAuto.state.dateNowNum;
+            const rec = GM_getValue("Config.pageSweep", null);
+            const count = (rec && rec.date === today && Number(rec.count) || 0);
+            if (count >= PAGE_SWEEP_MAX_PER_DAY) return false;
+            const last = (rec && Number(rec.lastAt)) || 0;
+            if (Date.now() - last < PAGE_SWEEP_COOLDOWN_MS) return false;
+            try {
+                GM_setValue("Config.pageSweep", { date: today, count: count + 1, lastAt: Date.now() });
+                const opened = GM_openInTab(PAGE_SWEEP_URL, { active: false, insert: true });
+                setTimeout(() => { try { if (opened && opened.close) opened.close(); } catch (_) {} }, PAGE_SWEEP_TAB_LIFETIME_MS);
+                Utils.log("🟡", `边缘拦截，已开 rewards 页交由《页面领取》脚本代领(${reason})，${Math.round(PAGE_SWEEP_TAB_LIFETIME_MS / 1000)} 秒后自动关闭（今日第 ${count + 1}/${PAGE_SWEEP_MAX_PER_DAY} 次）`);
+                return true;
+            } catch (e) {
+                Utils.log("🟡", `开页代领失败(${reason}): ${e.message}`);
+                return false;
+            }
+        },
+
         // 今日任务是否全部完成（用于空闲短路）。搜索受限日也会被计入"已完成"，
         // 因为受限本身意味着当日停止搜索，避免重复触发风控。
         _isIdle() {
@@ -3790,6 +3849,9 @@ Notice:
                 }
             }, RUN_LOCK_HEARTBEAT_MS);
             RewardsAuto.state.startTime = Utils.getTimestamp();
+            // v4.4.0：边缘拦截开页代领标记为轮内内存态，每轮入口显式归零
+            RewardsAuto.state.dailySetEdgeBlocked = false;
+            RewardsAuto.state.promosEdgeBlocked = false;
             Utils.log("🚀", "启动全能自动化任务...");
             this.init();
 
@@ -4004,6 +4066,7 @@ Notice:
                 logMsg += `阅读\t\t${readOk ? '✅' : '❌'} ${info.readProgress || 0}/${info.readMax || 30}\n`;
                 logMsg += `PC 搜索\t${searchOk ? '✅' : '⏳'} ${info.pc.progress}/${info.pc.max}\n`;
                 logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
+                logMsg += `每日活动\t${GM_getValue("Config.dailySetDone", 0) === RewardsAuto.state.dateNowNum ? '✅' : '❌'}\n`;
                 logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
                 logMsg += `今日获取\t+${earned}\n`;
                 logMsg += `总积分\t\t${info.balance || endBalance}`;
@@ -4152,6 +4215,57 @@ Notice:
         const cur = GM_getValue("Config.debugDailySet", false);
         GM_setValue("Config.debugDailySet", !cur);
         alert(`调试日志已${!cur ? "开启" : "关闭"}`);
+    });
+
+    // v4.4.0：🩺 只读诊断——零写操作，逐层展开"日常卡片完成不了"的判定依据：
+    // 数据源（getuserinfo/flyout/flight）、每日活动清单与状态、action ID 解析链、
+    // cookie 链、开页代领账本。排查时点这个，把弹窗内容/脚本日志贴给维护者即可。
+    GM_registerMenuCommand("🩺 日常卡片诊断", async () => {
+        const lines = [];
+        try {
+            // 1) cookie 链（Server Action 可用性的先决条件）
+            const cookie = await Utils.cookieHeaderFor("https://rewards.bing.com/earn");
+            const names = cookie ? cookie.split(";").map(s => s.trim().split("=")[0]) : [];
+            lines.push(`【Cookie 链】${cookie ? `${names.length} 个（${names.join(", ")}）` : "❌ 空——SW 拿不到登录 cookie，Server Action 必败（检查浏览器是否登录 rewards.bing.com）"}`);
+
+            // 2) 每日活动清单 + 数据源判定
+            const items = await API.getDailySetItems({ fresh: true });
+            if (items === null) {
+                lines.push("【每日活动清单】❌ 获取失败（getuserinfo 已退役且 flight 解析未命中，见脚本日志）");
+            } else if (items.length === 0) {
+                lines.push("【每日活动清单】⚠️ 空清单（getuserinfo 已退役；若 flight 也解析不到则当日无法推进）");
+            } else {
+                const done = items.filter(it => it.complete).length;
+                lines.push(`【每日活动清单】${items.length} 项，已完成 ${done}`);
+                for (const it of items) {
+                    lines.push(`  - ${it.title || it.offerId}: ${it.complete ? "✅已完成" : "⬜未完成"}${it.hash ? ` hash=${String(it.hash).slice(0, 10)}…` : " 无hash"}`);
+                }
+            }
+
+            // 3) /earn 活动卡（flight 直解）
+            const earnHtml = await Utils.fetchPage({ url: "https://rewards.bing.com/earn" }, { fresh: true });
+            const combined = Utils.concatFlightChunks(earnHtml || "");
+            const live = Utils.parseEarnLiveOffers(combined);
+            const entries = Object.entries(live);
+            lines.push(`【/earn 活动卡】flight 解析到 ${entries.length} 张`);
+            for (const [id, o] of entries.slice(0, 12)) {
+                lines.push(`  - ${id}: ${o.isCompleted ? "✅已完成" : o.isLocked ? `🔒锁定(${o.unlockCriteria || "?"})` : "⬜可领取"}${o.hash ? ` hash=${o.hash.slice(0, 10)}…` : " 无hash"}`);
+            }
+
+            // 4) action ID 解析链
+            const resolved = await API._resolveReportActivityActionId();
+            lines.push(`【Action ID】${resolved ? `✅ ${resolved.slice(0, 16)}…` : "❌ 未能从 chunk 解析（将用兜底值，若站点已改版则失效）"} dpl=${API._currentDpl() || "?"}`);
+
+            // 5) 开页代领账本
+            const sweep = GM_getValue("Config.pageSweep", null);
+            const today = RewardsAuto.state.dateNowNum;
+            lines.push(`【开页代领】${sweep && sweep.date === today ? `今日已开 ${sweep.count}/${PAGE_SWEEP_MAX_PER_DAY} 次` : "今日未开页"}；每日活动完成判据: ${GM_getValue("Config.dailySetDone", 0) === today ? "✅" : "❌ 未完成"}`);
+
+            lines.push("", "— 以上为只读探测，未发送任何领取请求 —");
+        } catch (e) {
+            lines.push(`诊断异常: ${e.message}`);
+        }
+        alert(lines.join("\n"));
     });
 
     // 任务全部完成后是否停止循环（开启后：签到/阅读/活动/搜索/每日活动全部完成则不再运行）
