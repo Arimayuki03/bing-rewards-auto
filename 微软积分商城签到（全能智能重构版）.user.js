@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.4.0
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.0：SW 直发 Server Action 被边缘 503 拦截时自动打开 rewards 页（每日限次+冷却）交由《页面领取》脚本代领并自动收页，页面脚本清扫后逐卡复核；每日活动空清单不再假标完成；新增 🩺 日常卡片诊断菜单；v4.2.0：配套《微软积分商城签到-页面领取》脚本——抓包实证 SW 直连 Server Action 被边缘 503、页面上下文同样请求 200+入账；v4.1.0：App 上报为主路径）
+// @version      4.4.1
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.1：放弃账本卡片在开页配额有余时先转页面代领再收账——账本只判 SW 通道失败，不否决页面通道；v4.4.0：SW 直发 Server Action 被边缘 503 拦截时自动打开 rewards 页（每日限次+冷却）交由《页面领取》脚本代领并自动收页，页面脚本清扫后逐卡复核；每日活动空清单不再假标完成；新增 🩺 日常卡片诊断菜单）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2813,9 +2813,20 @@ Notice:
 
             // 当日已连续未确认达上限的卡片（多为"需真实访问才结算"的开放型卡片）
             // 直接跳过本轮上报，避免整天空转；次日日期变更自动清零重试。
+            // v4.4.1：剩余全是放弃账本卡片时不再直接收账——账本判的是 SW 通道的
+            // 失败，不适用于页面代领通道（页面脚本无账本，会重试所有可领 offer，
+            // 2026-09-26 日志实证：offer2 被账本整天跳过后开页代领永远无法触发）。
+            // 开页配额有余则先代领一轮并保 pending，下轮 fresh 复核确认（页面领到
+            // → 卡片 isCompleted 出列 → 无新卡片自然收账）；配额用尽/冷却中维持
+            // 原当日收账语义（次日账本自动清零重试）。
             const giveUpIds = this._givenUpOfferIds();
             const claimable = cards.filter(c => !giveUpIds.has(c.offerId));
             if (claimable.length === 0) {
+                if (giveUpIds.size > 0 && this._kickPageSweep("放弃账本卡片")) {
+                    this.promosTimes++;
+                    Utils.log("🟡", `${giveUpIds.size} 个已放弃卡片转页面代领，下轮复核确认`);
+                    return false;
+                }
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
                 Utils.log("🟡", `其余 ${giveUpIds.size} 个卡片已连续未确认放弃，今日流程结束（次日自动重试）`);

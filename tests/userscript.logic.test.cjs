@@ -2382,6 +2382,59 @@ test("claimCard flags promosEdgeBlocked on edge 503 for the promos orchestration
     assert.equal(Utils.isEdgeBlockedError(new Error("HTTP 500: x")), false);
 });
 
+// ====== v4.4.1：放弃账本卡片转页面代领（2026-09-26 日志实证的编排缺口）======
+
+test("doPromos hands give-up-ledger cards to the page sweep before closing the day", async () => {
+    // 缺口真值：全部剩余卡片都在放弃账本时，旧逻辑直接收账返回 true——没有领取
+    // 尝试就没有边缘拦截，开页代领永远无法触发，offer2 整天卡死。新行为：开页
+    // 配额有余 → 先代领一轮并保 pending（返回 false 交下轮复核）；页面领到后卡片
+    // isCompleted 出列，无新卡片自然收账。
+    const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260926;
+    Utils.randomDelay = async () => {};
+    storage.set("Config.promosUnconfirmed", { date: 20260926, offers: { WW_offer2: 5 } });
+    TaskManager._givenUpOfferIds = TaskManager._givenUpOfferIds.bind(TaskManager);
+    API.discoverCards = async () => [{ offerId: "WW_offer2", title: "健康选择", points: 15, kind: "search", hash: "a".repeat(64), url: "" }];
+    API.claimCard = async () => { throw new Error("must not be reached"); };
+
+    const result = await TaskManager.doPromos();
+
+    assert.equal(result, false, "转页面代领轮必须保持 pending 等待复核");
+    assert.equal(openTabs.length, 1, "必须开页代领");
+    assert.equal(openTabs[0].url, "https://rewards.bing.com/earn?autoclaim=1");
+    assert.notEqual(TaskManager.promosDate, 20260926, "不得落当日完成标记");
+});
+
+test("doPromos still closes the day when the page-sweep quota is exhausted", async () => {
+    // 开页配额用尽/冷却中 → 维持 v4.3.0 收账语义（次日账本清零自动重试）。
+    const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260926;
+    Utils.randomDelay = async () => {};
+    storage.set("Config.promosUnconfirmed", { date: 20260926, offers: { WW_offer2: 5 } });
+    storage.set("Config.pageSweep", { date: 20260926, count: 6, lastAt: 0 });
+    API.discoverCards = async () => [{ offerId: "WW_offer2", title: "健康选择", points: 15, kind: "search", hash: "a".repeat(64), url: "" }];
+
+    const result = await TaskManager.doPromos();
+
+    assert.equal(result, true, "配额用尽时当日收账（对齐放弃语义）");
+    assert.equal(openTabs.length, 0, "不得开页");
+    assert.equal(TaskManager.promosDate, 20260926, "落当日完成标记");
+});
+
+test("doPromos closes the day normally when no cards remain at all", async () => {
+    // 无卡片（扫描成功但全部完成/出列）→ 原收账路径不受影响，零开页。
+    const { API, RewardsAuto, TaskManager, Utils, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260926;
+    Utils.randomDelay = async () => {};
+    API.discoverCards = async () => [];
+
+    const result = await TaskManager.doPromos();
+
+    assert.equal(result, true);
+    assert.equal(openTabs.length, 0);
+    assert.equal(TaskManager.promosDate, 20260926);
+});
+
 // ====== v4.3.0：renewToken 续期门槛 + Bearer null 回归 ======
 
 test("renewToken refreshes the token when any DAPI consumer task is enabled", async () => {

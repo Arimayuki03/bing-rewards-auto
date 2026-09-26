@@ -4,9 +4,9 @@
 
 **微软积分商城每日签到全家桶 · 后台静默执行 · 多通道消息推送**
 
-[![Version](https://img.shields.io/badge/version-4.4.0-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
+[![Version](https://img.shields.io/badge/version-4.4.1-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
 [![ScriptCat](https://img.shields.io/badge/ScriptCat-%E6%89%A9%E5%B1%95%E8%84%9A%E6%9C%AC-orange)](https://scriptcat.org/)
-[![Tests](https://img.shields.io/badge/tests-154%2F154-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-157%2F157-brightgreen)](#开发与测试)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](#License)
 [![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-%E5%9B%BD%E5%8C%BA%20Microsoft%20Rewards-9cf)](https://rewards.bing.com/)
 [![Stars](https://img.shields.io/github/stars/Arimayuki03/bing-rewards-auto?style=social)](https://github.com/Arimayuki03/bing-rewards-auto/stargazers)
@@ -44,7 +44,7 @@
 
 | 文件 | 角色 | 版本 |
 |---|---|---|
-| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.4.0 |
+| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.4.1 |
 | [`微软积分商城签到-页面领取.user.js`](微软积分商城签到-页面领取.user.js) | 页面侧组件：rewards.bing.com 页面打开时（含后台 `?autoclaim=1` 开页代领）自动领取锁定卡 | 4.4.0 |
 
 > 两个脚本独立工作、互不依赖：主脚本不注入页面，页面组件不依赖跨脚本存储。只装主脚本即可覆盖绝大多数任务；页面组件用于补领主脚本通道拿不到的少量 offer。
@@ -171,6 +171,7 @@ bing-rewards-auto/
 
 | 版本 | 要点 |
 |---|---|
+| v4.4.1 | 放弃账本卡片先转页面代领再收账（v4.4.0 上线首日实证的编排缺口：账本只判 SW 通道失败，不否决页面通道）；测试 154 → 157 |
 | v4.4.0 | 日常任务卡片修复（内置浏览器抓包实证）：边缘拦截日自动开页代领闭环（autoclaim 握手 + 每日限次/冷却 + 自动收页）、页面脚本清扫后逐卡复核、空清单不再假标完成、双脚本新增 🩺 只读诊断菜单；测试 146 → 154 |
 | v4.3.1 | 开源发布至 GitHub，新增 README；功能同 v4.3.0 |
 | v4.3.0 | 三审查报告合并定案 12 项修复：空清单早退、兜底标签页 10s close、renewToken 门槛与 Bearer 畸形头、边缘拦截短路、dailySetFail 当日上限 5、页面脚本补 19 条 skipPatterns 等；测试 121 → 146 |
