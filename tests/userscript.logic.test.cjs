@@ -2435,6 +2435,53 @@ test("doPromos closes the day normally when no cards remain at all", async () =>
     assert.equal(TaskManager.promosDate, 20260926);
 });
 
+// ====== v4.4.2：边缘拦截开页检查前移（v4.4.1 日志实证的短路缺口）======
+
+test("doPromos kicks the page sweep before the partial-failure early return", async () => {
+    // 缺口真值（2026-09-26 18:04 日志）：claimCard 撞 503 置 promosEdgeBlocked 后，
+    // 失败卡进 stillPending → "部分失败，稍后重试"早退 return——开页检查永远轮不到，
+    // 两轮"卡片需页面上下文领取"日志后零次"已开 rewards 页"。修复后：拦截优先于
+    // 部分失败早退，立即开页代领并保 pending。
+    const { API, RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260926;
+    Utils.randomDelay = async () => {};
+    API.discoverCards = async () => [{ offerId: "WW_offer2", title: "健康选择", points: 15, kind: "search", hash: "a".repeat(64), url: "" }];
+    API.claimCard = async () => { RewardsAuto.state.promosEdgeBlocked = true; return false; };
+
+    const result = await TaskManager.doPromos();
+
+    assert.equal(result, false, "拦截轮保持 pending 等下轮复核");
+    assert.equal(openTabs.length, 1, "必须在部分失败早退之前开页代领");
+    assert.equal(openTabs[0].url, "https://rewards.bing.com/earn?autoclaim=1");
+    assert.notEqual(TaskManager.promosDate, 20260926);
+});
+
+test("second scan kicks the page sweep when edge-blocked", async () => {
+    // 二次扫描路径同样补检查点：拦截时开页代领并重置 promosDate 等下轮复核。
+    const { API, RewardsAuto, TaskManager, Utils, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260926;
+    Utils.randomDelay = async () => {};
+    API.getBalance = async () => 100;
+    API.checkRegion = async () => true;
+    API.renewToken = async () => true;
+    API.getRewardsInfo = async () => null;
+    API.discoverCards = async () => [{ offerId: "WW_offer2", title: "健康选择", points: 15, kind: "search", hash: "a".repeat(64), url: "" }];
+    API.claimCard = async () => { RewardsAuto.state.promosEdgeBlocked = true; return false; };
+    TaskManager.doSign = async () => true;
+    TaskManager.doRead = async () => true;
+    TaskManager.doPromos = async () => true; // 主路径放行，聚焦二次扫描
+    TaskManager.doSearch = async () => true;
+    TaskManager.doStreak = async () => true;
+    TaskManager.doDailySet = async () => true;
+    TaskManager.doPunchCard = async () => true;
+    TaskManager.doClaimPoints = async () => {};
+
+    await TaskManager.runAll();
+
+    assert.ok(openTabs.some(t => t.url === "https://rewards.bing.com/earn?autoclaim=1"), "二次扫描拦截后必须开页代领");
+    assert.notEqual(TaskManager.promosDate, 20260926, "拦截后必须重置 promosDate 等下轮复核");
+});
+
 // ====== v4.3.0：renewToken 续期门槛 + Bearer null 回归 ======
 
 test("renewToken refreshes the token when any DAPI consumer task is enabled", async () => {

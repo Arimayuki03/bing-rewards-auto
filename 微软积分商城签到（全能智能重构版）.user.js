@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.4.1
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.1：放弃账本卡片在开页配额有余时先转页面代领再收账——账本只判 SW 通道失败，不否决页面通道；v4.4.0：SW 直发 Server Action 被边缘 503 拦截时自动打开 rewards 页（每日限次+冷却）交由《页面领取》脚本代领并自动收页，页面脚本清扫后逐卡复核；每日活动空清单不再假标完成；新增 🩺 日常卡片诊断菜单）
+// @version      4.4.2
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.2：边缘拦截开页检查前移至失败落账后、部分失败早退之前——v4.4.1 日志实证 claimCard 置标记后走"部分失败"早退导致开页代领永远轮不到；二次扫描路径同步补检查点；v4.4.1：放弃账本卡片在开页配额有余时先转页面代领再收账；v4.4.0：SW 直发 Server Action 被边缘 503 拦截时自动打开 rewards 页（每日限次+冷却）交由《页面领取》脚本代领并自动收页，页面脚本清扫后逐卡复核；每日活动空清单不再假标完成；新增 🩺 日常卡片诊断菜单）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2857,6 +2857,20 @@ Notice:
             // 达上限的卡片当日放弃，下轮扫描起不再出列。
             const newlyGivenUp = this._recordFailedClaims(failed);
 
+            // v4.4.2：边缘拦截优先于"部分失败"早退——claimCard 在领取循环内置位
+            // promosEdgeBlocked 后，若先走下方 stillPending 早退，开页代领永远轮不到
+            //（2026-09-26 18:04 日志实证：两轮"卡片需页面上下文领取"日志后均无一次
+            // "已开 rewards 页"）。此处立即开页代领并保 pending，下轮 fresh 复核确认；
+            // 限额用尽/冷却中保持失败语义交由下轮再试。
+            if (RewardsAuto.state.promosEdgeBlocked) {
+                const kicked = this._kickPageSweep("活动卡片");
+                this.promosTimes++;
+                Utils.log("🟡", kicked
+                    ? "活动卡片被边缘拦截，已开页代领，下轮复核"
+                    : "活动卡片被边缘拦截且开页代领暂不可用（限额/冷却），下轮重试");
+                return false;
+            }
+
             // 仍有失败但未达放弃上限的卡片 → 保持 pending，下轮仅重试这些卡片
             //（与旧"部分失败"语义一致；复核只对"本轮失败卡全部收口"的轮次执行，省请求数）。
             const stillPending = failed.filter(id => !newlyGivenUp.includes(id));
@@ -2890,6 +2904,9 @@ Notice:
             // v4.4.0：本轮有卡片被边缘拦截（SW 503）时开页代领——页面脚本的领取
             // 结果由下轮 doPromos 的 fresh 复核自然确认；限额用尽/冷却中保持失败
             // 语义（promosTimes++，交由下轮再试），不阻塞本轮其余任务。
+            // （v4.4.2 起主检查点前移至失败落账后；此处兜底覆盖无失败但被拦截的
+            // 罕见路径，正常轮 promosEdgeBlocked 已在上方消费并归零语义，不会双开页——
+            // _kickPageSweep 自带冷却/限次门。）
             if (RewardsAuto.state.promosEdgeBlocked) {
                 const kicked = this._kickPageSweep("活动卡片");
                 this.promosTimes++;
@@ -4028,6 +4045,16 @@ Notice:
                 // v4.1.1：与 doPromos 同语义——失败卡计入放弃账本；仍有失败且未达
                 // 上限的卡片时重置 promosDate（下轮重试），达上限的当日放弃、不再阻塞落账。
                 const secondGivenUp = this._recordFailedClaims(failedIds);
+                // v4.4.2：二次扫描同样边缘拦截优先——与 doPromos 主路径同款开页代领，
+                // 否则拦截轮在此处静默收尾（18:04 日志的"二次扫描完成: 0成功/1失败"）。
+                if (RewardsAuto.state.promosEdgeBlocked) {
+                    const kicked = this._kickPageSweep("二次扫描");
+                    if (kicked) {
+                        this.promosDate = 0;
+                        this.save();
+                        Utils.log("🟡", "二次扫描被边缘拦截，已开页代领，下轮复核");
+                    }
+                }
                 const secondPending = failedIds.filter(id => !secondGivenUp.includes(id));
                 if (secondPending.length > 0) {
                     this.promosDate = 0;
