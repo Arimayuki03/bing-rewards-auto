@@ -1,4 +1,5 @@
-// 页面领取脚本（微软积分商城签到-页面领取.user.js）的逻辑测试。
+// 页面诊断组件（微软积分商城签到-页面领取.user.js.bak，v4.5.0 起退役为可选工具）的逻辑测试。
+// 测试仍指向 .bak 文件：组件的 flight/offer 解析函数保留，供将来恢复时验证。
 // 该脚本无 GM 依赖，用最小 vm 环境加载后经 globalThis.__pageClaim 断言内部函数。
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
@@ -6,7 +7,7 @@ const path = require("node:path");
 const test = require("node:test");
 const vm = require("node:vm");
 
-const pageScriptPath = path.resolve(__dirname, "..", "微软积分商城签到-页面领取.user.js");
+const pageScriptPath = path.resolve(__dirname, "..", "微软积分商城签到-页面领取.user.js.bak");
 
 // 与主测试 harness 同构的 flight 构造：把 payload 串成 self.__next_f.push 分片
 function flightHtml(...payloads) {

@@ -17,3 +17,6 @@ node_modules/
 
 # ZCode 工作目录（本次会话的实测探针脚本等临时产物）
 .v2c/
+
+# ScriptCat 本机安装元数据（含安装 UUID，每台设备不同，无需入库）
+*.options.json
