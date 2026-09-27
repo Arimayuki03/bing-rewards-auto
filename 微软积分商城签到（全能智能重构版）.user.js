@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.4.5
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.5：页面信号基线记录下沉到 _kickPageSweep——v4.4.4 日志实证"放弃账本卡片"触发路径未记基线致信号诊断无声；v4.4.4：页面清扫信号 cookie + 开页账本双写防丢；v4.4.3：修复粘贴授权码保存；v4.4.2：拦截检查前移；v4.4.1：放弃卡片转代领；v4.4.0：边缘 503 自动开页代领闭环）
+// @version      4.4.6
+// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.6：信号基线持久化到存储（原内存跨 SW 轮即失致诊断从未发声）+ 限额用尽日无信号每天点名一次"页面脚本未安装/未执行"；v4.4.5：基线覆盖全触发路径；v4.4.4：页面清扫信号 cookie+账本双写；v4.4.3：修复粘贴授权码保存；v4.4.0-4.4.2：边缘 503 开页代领闭环编排）
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -2827,14 +2827,17 @@ Notice:
             Utils.log("🧩", "扫描活动卡片...");
             const cards = await API.discoverCards();
 
-            // v4.4.4：上一轮开页代领后的信号解读——上轮拦截开过页、本轮卡片仍在
-            // 可领清单（页面没领到）时，检查页面脚本的执行信号并点名断点，避免
-            // "开页成功但页面侧什么都没发生"的静默空转。
-            if (cards && cards.length > 0 && RewardsAuto.state.pageClaimSeenBaseline !== undefined) {
-                const seen = await this._readPageClaimSeenCookie();
-                const hint = this._pageClaimSignalHint(seen, RewardsAuto.state.pageClaimSeenBaseline);
-                if (hint) Utils.log("🟡", hint);
-                RewardsAuto.state.pageClaimSeenBaseline = undefined;
+            // v4.4.6：上一轮开页代领后的信号解读（基线持久化在存储，消费即清）——
+            // 上轮开过页、本轮卡片仍在可领清单（页面没领到）时，按信号三态点名断点，
+            // 避免"开页成功但页面侧什么都没发生"的静默空转。
+            if (cards && cards.length > 0) {
+                const baseline = GM_getValue("Config.pageClaimBaseline", null);
+                if (baseline && Number(baseline.kickedAt) > 0) {
+                    GM_setValue("Config.pageClaimBaseline", null); // 消费即清，一次开页只诊断一轮
+                    const seen = await this._readPageClaimSeenCookie();
+                    const hint = this._pageClaimSignalHint(seen, Number(baseline.kickedAt));
+                    if (hint) Utils.log("🟡", hint);
+                }
             }
 
             if (cards === null) {
@@ -3802,11 +3805,28 @@ Notice:
             const rec = GM_getValue("Config.pageSweep", null);
             const bak = GM_getValue("Config.pageSweepBak", null);
             const count = Math.max(pick(rec), pick(bak));
-            if (count >= PAGE_SWEEP_MAX_PER_DAY) return false;
             const last = Math.max((rec && Number(rec.lastAt)) || 0, (bak && Number(bak.lastAt)) || 0);
-            if (Date.now() - last < PAGE_SWEEP_COOLDOWN_MS) return false;
+            // v4.4.6：限额拒绝路径也要诊断发声——配额用尽当天若无任何页面领取信号，
+            // 每天点名一次"页面脚本未安装/未执行"（SW 每轮重启，若不在此处发声，
+            // 配额烧完的日子诊断永远轮不到）。冷却拒绝保持静默（近期开页可能在途）。
+            if (count >= PAGE_SWEEP_MAX_PER_DAY || Date.now() - last < PAGE_SWEEP_COOLDOWN_MS) {
+                if (count >= PAGE_SWEEP_MAX_PER_DAY) {
+                    const hintShown = GM_getValue("Config.pageClaimHintShown", null);
+                    if (!(hintShown && hintShown.date === today)) {
+                        const seen = await this._readPageClaimSeenCookie();
+                        if (!seen) {
+                            GM_setValue("Config.pageClaimHintShown", { date: today });
+                            Utils.log("🟡", "⚠️ 开页代领已达当日上限且从未检测到《页面领取》脚本的执行信号——该脚本很可能未安装/未启用。请在 rewards.bing.com 页面确认脚本猫菜单含「🧾 页面领取状态（本页）」，没有则安装《微软积分商城签到-页面领取》v4.4.0+");
+                        }
+                    }
+                }
+                return false;
+            }
             try {
-                RewardsAuto.state.pageClaimSeenBaseline = await this._readPageClaimSeenCookie();
+                // v4.4.6：信号基线持久化到存储——此前存内存，SW 每轮 cron 都是全新
+                // 实例，基线跨轮即失，信号诊断从未发声（v4.4.4/v4.4.5 设计缺陷）。
+                const baselineSeen = await this._readPageClaimSeenCookie();
+                GM_setValue("Config.pageClaimBaseline", { seen: baselineSeen, kickedAt: Date.now() });
                 const next = { date: today, count: count + 1, lastAt: Date.now() };
                 GM_setValue("Config.pageSweep", next);
                 GM_setValue("Config.pageSweepBak", next);
@@ -3840,6 +3860,8 @@ Notice:
         },
 
         // v4.4.4：解读页面脚本活动信号——闭环断点定位。返回提示文案，null = 信号正常。
+        // v4.4.6：preKickLastAt 语义改为"上次开页时刻"（kickedAt）——信号时间戳晚于
+        // 开页时刻即视为页面脚本在上次开页后执行过（正常），早于则点名断点。
         _pageClaimSignalHint(seen, preKickLastAt) {
             if (!seen) {
                 return "⚠️ 未检测到《页面领取》脚本的执行信号——后台开页代领依赖它完成页面内领取。请确认已安装并启用《微软积分商城签到-页面领取》v4.4.0+；可在 rewards.bing.com 页面菜单「🧾 页面领取状态（本页）」查看是否注入";

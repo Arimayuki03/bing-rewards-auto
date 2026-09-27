@@ -2361,16 +2361,33 @@ test("_kickPageSweep writes both ledger keys and verifies the primary readback",
 });
 
 test("_kickPageSweep records the page-claim signal baseline on every trigger path", async () => {
-    // v4.4.5：基线记录下沉到 _kickPageSweep——"放弃账本卡片"等非边缘拦截触发路径
-    // 同样必须记录（v4.4.4 的 20:54 日志实证该路径无声，下一轮诊断缺据）。
-    const { RewardsAuto, TaskManager, Utils, openTabs } = createHarness();
+    // v4.4.6：基线持久化到存储（原内存跨 SW 轮即失，诊断从未发声）——任意触发路径
+    // 开页前必须写入 Config.pageClaimBaseline。
+    const { RewardsAuto, TaskManager, Utils, storage, openTabs } = createHarness();
     RewardsAuto.state.dateNowNum = 20260926;
     Utils.randomDelay = async () => {};
     // SW 测试环境 GM_cookie 默认回调空列表 → _readPageClaimSeenCookie 返回 0
 
     assert.equal(await TaskManager._kickPageSweep("放弃账本卡片"), true);
-    assert.equal(RewardsAuto.state.pageClaimSeenBaseline, 0, "开页前必须记录信号基线（本环境为 0）");
+    const baseline = storage.get("Config.pageClaimBaseline");
+    assert.ok(baseline && baseline.kickedAt > 0, "开页前必须持久化信号基线");
+    assert.equal(baseline.seen, 0, "本环境无信号 cookie，基线 seen=0");
     assert.equal(openTabs.length, 1);
+});
+
+test("_kickPageSweep names the missing page script once a day when quota is exhausted without signal", async () => {
+    // v4.4.6：配额用尽日 + 全天无页面信号 → 每天点名一次（否则配额烧完的日子
+    // 诊断永远无声，2026-09-27 18:55 日志实证整天只有"限额/冷却"无人指出断点）。
+    const { RewardsAuto, TaskManager, storage, openTabs } = createHarness();
+    RewardsAuto.state.dateNowNum = 20260927;
+    storage.set("Config.pageSweep", { date: 20260927, count: 6, lastAt: 0 });
+
+    assert.equal(await TaskManager._kickPageSweep("测试"), false, "配额用尽不得开页");
+    assert.equal(openTabs.length, 0);
+    assert.equal(storage.get("Config.pageClaimHintShown")?.date, 20260927, "当日点名标记必须落账");
+
+    // 同日第二次不重复刷（提示已发过）
+    assert.equal(await TaskManager._kickPageSweep("测试"), false);
 });
 
 test("_pageClaimSignalHint names the broken link for each signal state", () => {
