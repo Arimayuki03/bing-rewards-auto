@@ -6,7 +6,7 @@
 
 [![Version](https://img.shields.io/badge/version-4.4.6-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
 [![ScriptCat](https://img.shields.io/badge/ScriptCat-%E6%89%A9%E5%B1%95%E8%84%9A%E6%9C%AC-orange)](https://scriptcat.org/)
-[![Tests](https://img.shields.io/badge/tests-169%2F169-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-108%2F108-brightgreen)](#开发与测试)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](#License)
 [![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-%E5%9B%BD%E5%8C%BA%20Microsoft%20Rewards-9cf)](https://rewards.bing.com/)
 [![Stars](https://img.shields.io/github/stars/Arimayuki03/bing-rewards-auto?style=social)](https://github.com/Arimayuki03/bing-rewards-auto/stargazers)
@@ -17,9 +17,9 @@
 
 ## 📖 简介
 
-基于 [ScriptCat（脚本猫）](https://scriptcat.org/) 的 Microsoft Rewards 自动任务脚本，每天在浏览器后台**静默完成签到、阅读、活动、搜索、Quiz、拼图**等任务赚取积分，支持**企业微信 / 钉钉 / 飞书 / PushMe / Bark** 五种推送渠道通知积分变动。
+基于 [ScriptCat（脚本猫）](https://scriptcat.org/) 的 Microsoft Rewards 自动任务脚本，每天在浏览器后台**静默完成签到、阅读、搜索、每日活动**等任务赚取积分，活动卡片与欢迎积分**发现可领取时当日提醒一次**、手动打开页面领取，支持**企业微信 / 钉钉 / 飞书 / PushMe / Bark** 五种推送渠道通知积分变动。
 
-项目经过 30 轮真实抓包实证迭代：签到走 **App 静默通道**（Bing App UA 上报）、阅读走 **DAPI Token 通道**、活动卡领取按 offer 类型自动选择 **App 上报 / 页面上报**路径，并配套一个**页面领取组件**处理仅能在页面上下文领取的锁定卡。内置轮内缓存、跨实例运行锁、随机延迟、边缘拦截识别与多级兜底账本，长期无人值守运行稳定。
+项目经过 37 轮真实抓包实证迭代：签到走 **App 静默通道**（Bing App UA 上报）、阅读走 **DAPI Token 通道**、每日活动走 **DAPI App 上报**自动完成；活动卡片与欢迎积分因 Server Action 被 SW 边缘 503 结构性拦截（v4.2.0 实证）改为**提醒模式**。内置轮内缓存、跨实例运行锁、随机延迟与当日一次提醒去重，长期无人值守运行稳定。
 
 > ⚠️ 本项目仅限个人学习交流使用，请自行承担账号风险。不适用于中国大陆以外地区（内置国区锁定检测，非大陆 IP 自动停止）。
 
@@ -29,13 +29,13 @@
 |---|---|---|
 | ✅ 每日签入 | PC + App 双通道静默签入（+3 分/次） | 开 |
 | 📰 新闻阅读 | DAPI 接口领取阅读任务，App UA 上报 3 篇（+30 分） | 开 |
-| 🎯 活动卡片 | 自动发现可领 offer，App 上报为主路径，含每日打卡 | 开 |
+| 🎯 活动卡片 | 自动发现可领 offer，**当日提醒一次**，手动领取（v4.5.0） | 开 |
 | 🔍 PC 搜索 | 随机词 + 4 家热搜 API 补足搜索积分，间隔 ±15 秒抖动 | 开 |
-| 🧩 Quiz / 拼图卡片 | 自动识别问答/拼图类卡片并完成上报（拼图实测由 Server Action 入账；问答题无答题器，仅上报领取） | 开 |
+| 🧩 Quiz / 拼图卡片 | 随活动卡片扫描，可领时一并提醒（无答题器） | 开 |
 | 📅 每日活动 | getuserinfo/flyout 结构化数据 + flight 流三级兜底，边缘拦截日自动开页代领 | 开 |
 | 🔗 连签检测 | 自动检测搜索连签任务并接续 | 自动 |
 | 🔁 二次扫描 | 复查入账确认，防误报完成 | 自动 |
-| 📲 页面领取组件 | 仅页面上下文可领的锁定卡（如 `WW_Rewards_locked_level2`）在打开 rewards 页时自动领取 | 独立脚本 |
+| 🩺 页面诊断组件 | rewards 页打开时提供只读诊断：flight 数据形态、待领 offer 清单、action ID 解析链 | 独立脚本 |
 | 🔔 积分通知 | 企业微信 / 钉钉 / 飞书 / PushMe / Bark，余额变动推送 | 自选 |
 
 **可靠性设计**：轮内请求缓存（同轮零重复请求）· 跨实例运行锁 · 按日期隔离状态 · 随机延迟与 UA 轮换 · 边缘 503 拦截识别与当日放弃账本 · action ID 随部署动态解析 · 边缘拦截日自动开页代领（每日限次+冷却）· 清扫后逐卡复核 · 跨日自愈。
@@ -45,7 +45,7 @@
 | 文件 | 角色 | 版本 |
 |---|---|---|
 | [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.4.6 |
-| [`微软积分商城签到-页面领取.user.js`](微软积分商城签到-页面领取.user.js) | 页面侧组件：rewards.bing.com 页面打开时（含后台 `?autoclaim=1` 开页代领）自动领取锁定卡 | 4.4.4 |
+| [`微软积分商城签到-页面领取.user.js`](微软积分商城签到-页面领取.user.js) | 页面侧组件：rewards.bing.com 页面的只读诊断工具（v4.5.0 起不再自动领取） | 4.5.0 |
 
 > 两个脚本独立工作、互不依赖：主脚本不注入页面，页面组件不依赖跨脚本存储。只装主脚本即可覆盖绝大多数任务；页面组件用于补领主脚本通道拿不到的少量 offer。
 
@@ -122,9 +122,9 @@
 </details>
 
 <details>
-<summary><b>「每日活动完成 0/3」或卡片一直不领取？</b></summary>
+<summary><b>每日活动/活动卡片/欢迎积分是怎么完成的？</b></summary>
 
-v4.4.0 起主脚本会在被边缘拦截时**自动打开 rewards 页交由页面领取脚本代领**（每日最多 6 次，25 分钟冷却，页面 150 秒后自动关闭），通常无需人工干预。仍异常时用主脚本菜单 **🩺 日常卡片诊断**（或页面的 **🩺 日常卡片诊断（本页）**）逐层查看：cookie 链 → 每日活动清单 → 活动卡状态 → action ID → 代领账本，定位到具体环节。注意「仅限积分商城应用」的卡片（`WW_Moreactivities_RewardsApp_*`）网页端本就不可领取，只能由必应 App 完成。
+v4.5.0 起分两条链路：**每日活动集**（dashboard 上 3 张 Gamification_DailySet 卡）由脚本经 DAPI App 通道**自动完成**；**活动卡片**（/earn 日常任务区）与**欢迎积分**因服务端对后台请求的结构性拦截改为**提醒模式**——发现可领取时当日推送一次通知（含明细），打开 rewards.bing.com 手动点卡片领取即可。「仅限积分商城应用」的卡片只能由必应 App 完成。有疑问时用主脚本菜单 **🩺 日常卡片诊断**（或页面的 **🩺 日常卡片诊断（本页）**）逐层查看。
 </details>
 
 <details>
@@ -142,7 +142,7 @@ v4.4.0 起主脚本会在被边缘拦截时**自动打开 rewards 页交由页�
 ## 🛠 开发与测试
 
 ```bash
-# 运行全部测试（154 个：主脚本 124 + 页面组件 30）
+# 运行全部测试（108 个：主脚本 77 + 页面组件 31）
 # 注意：必须显式列出文件名——node --test tests/ 在 Windows 下报 MODULE_NOT_FOUND
 node --test "tests/userscript.logic.test.cjs" "tests/page-claim.logic.test.cjs"
 
@@ -171,6 +171,7 @@ bing-rewards-auto/
 
 | 版本 | 要点 |
 |---|---|
+| v4.5.0 | 提醒模式：/earn 活动卡片与 dashboard 欢迎积分不再自动领取（SW 503 结构性拦截 + 开页代领环境制约），改为当日一次提醒通知、用户手动领取；每日活动集保留 DAPI App 通道自动完成；页面组件转为只读诊断；测试 169 → 108（退役用例删除） |
 | v4.4.6 | 信号基线持久化到存储（原内存跨 SW 轮即失致诊断无声）+ 限额用尽日无信号每天点名一次页面脚本缺失；测试 168 → 169 |
 | v4.4.5 | 信号基线记录下沉到 _kickPageSweep，覆盖全部开页触发路径（放弃账本/每日活动/二次扫描/活动卡片）；测试 167 → 168 |
 | v4.4.4 | 开页代领闭环断点定位：页面脚本清扫后写信号 cookie（后台可读），开页账本双写防 SW 存储丢写，🩺 诊断显示信号状态；测试 163 → 167 |

@@ -168,8 +168,9 @@ test("pageCollector filters the points-gate-evading and locked-wording skip patt
         "skip 模式命中的卡必须出列，即便 points 数值伪装为正");
 });
 
-test("pageCollector keeps only the clean card in a mixed batch", async () => {
-    // 综合场景：同一批 offer 混有正常卡与多张命中不同 skip 模式的卡
+test("pageCollector keeps only the clean card in a mixed batch", () => {
+    // 综合场景：同一批 offer 混有正常卡与多张命中不同 skip 模式的卡（v4.5.0：过滤
+    // 逻辑保留在解析层，供诊断展示与未来复用，不再驱动自动领取）
     const offers = [
         { offerId: "A_REFERRAL_PROMO", hash: "a".repeat(64), points: 10, title: "Invite friends" },
         { offerId: "B", hash: "b".repeat(64), points: 20, title: "Daily search bonus" },
@@ -177,35 +178,13 @@ test("pageCollector keeps only the clean card in a mixed batch", async () => {
         { offerId: "D_REWARDS EXTENSION", hash: "d".repeat(64), points: 40, title: "One click claim" },
         { offerId: "E", hash: "e".repeat(64), points: 50, title: "Redeem points" },
         { offerId: "F", hash: "f".repeat(64), points: 60, title: "Shop To Earn cashback" },
-    ];
-    const chunk = `createServerReference("${"0".repeat(40)}",t.callServer,void 0,t.findSourceMapURL,"reportActivity")`;
-    const posts = [];
-    const { runSweep } = createPageHarness({
-        seedState: { lastRunAt: Date.now() },
-        fetchImpl: async (url, init) => {
-            if (init && init.method === "POST") {
-                posts.push({ url, body: init.body });
-                return { status: 200, text: async () => "0:{}\n1:true\n" };
-            }
-            if (url.includes("/_next/static/chunks/")) return { status: 200, text: async () => chunk };
-            if (url.endsWith("/earn")) {
-                return { status: 200, text: async () => flightHtml(JSON.stringify({ activityCards: offers }))
-                    .replace("</body>", '<script src="/_next/static/chunks/x.js?dpl=20260920-1"></script></body>') };
-            }
-            return { status: 200, text: async () => "<html></html>" };
-        },
-    });
+    ].map(o => JSON.stringify(o)).join(",");
 
-    const result = await runSweep("test");
+    const { collectClaimableOffers } = createPageHarness();
+    const kept = collectClaimableOffers(offers);
 
-    assert.equal(result.ok, 2, "仅 B/E 两张干净卡应上报受理");
-    assert.equal(result.total, 2);
-    const claimed = posts.filter(p => p.url.endsWith("/earn"))
-        .map(p => JSON.parse(p.body)[2].offerid);
-    assert.deepEqual(claimed.sort(), ["B", "E"], "命中各 skip 模式的卡均不得发出领取请求");
+    assert.deepEqual(Array.from(kept, o => o.offerId).sort(), ["B", "E"], "命中各 skip 模式的卡均不得入列");
 });
-
-// ====== v4.3.0:$undefined 归一 ======
 
 test("pageCollector falls back to pointProgressMax when points is the $undefined sentinel", () => {
     // v4.3.0：非 nullish 哨兵 "$undefined" 会使 Number(...) 变 NaN、卡被 points 门
@@ -355,251 +334,6 @@ test("postServerAction sends credentials and the deployment header", async () =>
 });
 
 // ====== 端到端扫描 ======
-
-test("runSweep posts every claimable offer with its current hash and reports accepted counts", async () => {
-    const offers = [
-        { offerId: "A", hash: "a".repeat(64), points: 15 },
-        { offerId: "B", hash: "b".repeat(64), points: 10 },
-    ];
-    const chunk = `createServerReference("${"c".repeat(40)}",t.callServer,void 0,t.findSourceMapURL,"reportActivity")`;
-    const posts = [];
-    const { runSweep } = createPageHarness({
-        // 占住节流窗口，隔离脚本加载时的自动扫描
-        seedState: { lastRunAt: Date.now() },
-        fetchImpl: async (url, init) => {
-            if (init && init.method === "POST") {
-                posts.push({ url, body: init.body, headers: init.headers });
-                return { status: 200, text: async () => "0:{}\n1:true\n" };
-            }
-            if (url.includes("/_next/static/chunks/")) return { status: 200, text: async () => chunk };
-            if (url.endsWith("/earn")) {
-                // 真实页面 HTML 同时含 flight 分片与 chunk 引用，action ID 靠后者定位
-                return { status: 200, text: async () => flightHtml(JSON.stringify({ activityCards: offers }))
-                    .replace("</body>", '<script src="/_next/static/chunks/x.js?dpl=20260916-2"></script></body>') };
-            }
-            return { status: 200, text: async () => "<html></html>" };
-        },
-    });
-
-    const result = await runSweep("test");
-
-    assert.equal(result.ok, 2, "两个 offer 均应上报受理");
-    assert.equal(result.total, 2);
-    const offerPosts = posts.filter(p => p.url.endsWith("/earn"));
-    assert.equal(offerPosts.length, 2);
-    const first = JSON.parse(offerPosts[0].body);
-    assert.equal(first[0], "a".repeat(64), "必须用当次 flight 的轮换 hash");
-    assert.equal(first[1], 11);
-    assert.equal(first[2].offerid, "A");
-    assert.equal(offerPosts[0].headers["next-action"], "c".repeat(40), "action ID 必须来自 chunk 扫描");
-});
-
-test("runSweep sends the page's 42-char $ACTION_ID_ to dashboard in full", async () => {
-    // v4.2.0 回归：{40} 把 42 位 claim ID 截成无效前缀，且截断后候选数仍为 1、
-    // 反而优先于正确的 42 位兜底常量被采用——恰在有积分可领时确定性失败。
-    const REAL_CLAIM = "00491296f1d668ad46b65342c95cb9d72a62c1fa9d";
-    assert.equal(REAL_CLAIM.length, 42, "抓包实测长度前提");
-    const posts = [];
-    const { runSweep } = createPageHarness({
-        seedState: { lastRunAt: Date.now() },
-        fetchImpl: async (url, init) => {
-            if (init && init.method === "POST") { posts.push({ url, headers: init.headers }); return { status: 200, text: async () => "0:{}\n1:true\n" }; }
-            if (url.endsWith("/dashboard")) return { status: 200, text: async () => `<html>x $ACTION_ID_${REAL_CLAIM} y</html>` };
-            return { status: 200, text: async () => "<html></html>" };
-        },
-    });
-
-    const result = await runSweep("test");
-
-    const dashPost = posts.find(p => p.url.endsWith("/dashboard"));
-    assert.ok(dashPost, "欢迎积分 POST 必须发出");
-    assert.equal(dashPost.headers["next-action"], REAL_CLAIM, "42 位 $ACTION_ID_ 必须完整传给 next-action，不得截成 40 位");
-    assert.equal(result.welcomeAccepted, true);
-});
-
-test("runSweep skips the welcome POST when the page sends no unique $ACTION_ID_", async () => {
-    // v4.2.1：$ACTION_ID_ 仅当页面存在待领项时随 flight 下发 = 待领信号；无信号时
-    // POST 旧 ID 必不被受理，直接跳过（原兜底常量路径随之退役）
-    const posts = [];
-    const { runSweep } = createPageHarness({
-        seedState: { lastRunAt: Date.now() },
-        fetchImpl: async (url, init) => {
-            if (init && init.method === "POST") { posts.push({ url, headers: init.headers }); return { status: 200, text: async () => "1:true" }; }
-            return { status: 200, text: async () => "<html></html>" };
-        },
-    });
-
-    const result = await runSweep("test");
-
-    assert.equal(posts.filter(p => p.url.endsWith("/dashboard")).length, 0, "无待领信号不得发欢迎积分 POST");
-    assert.equal(result.welcomeAccepted, false);
-});
-
-test("runSweep skips the welcome POST when $ACTION_ID_ candidates are ambiguous", async () => {
-    const posts = [];
-    const { runSweep } = createPageHarness({
-        seedState: { lastRunAt: Date.now() },
-        fetchImpl: async (url, init) => {
-            if (init && init.method === "POST") { posts.push({ url, headers: init.headers }); return { status: 200, text: async () => "1:true" }; }
-            if (url.endsWith("/dashboard")) return { status: 200, text: async () => `<html>$ACTION_ID_${"a".repeat(42)} $ACTION_ID_${"b".repeat(42)}</html>` };
-            return { status: 200, text: async () => "<html></html>" };
-        },
-    });
-
-    await runSweep("test");
-
-    assert.equal(posts.filter(p => p.url.endsWith("/dashboard")).length, 0, "候选歧义时不得猜一个 action 发请求");
-});
-
-test("resolveActionId caches the scanned action ID per dpl across rounds", async () => {
-    // action ID 只随部署轮换：同一 dpl 复用扫描结果（省最多 24 个 chunk 的重抓与
-    // 2-6 秒延迟），dpl 变化必须立即失效、绝不把旧部署 ID 用在新部署上
-    const chunk = `createServerReference("${"d".repeat(42)}",t.callServer,void 0,t.findSourceMapURL,"reportActivity")`;
-    let chunkFetches = 0;
-    const { resolveActionId } = createPageHarness({
-        fetchImpl: async (url) => {
-            if (url.includes("/_next/static/chunks/")) { chunkFetches++; return { status: 200, text: async () => chunk }; }
-            return { status: 200, text: async () => "" };
-        },
-    });
-    const html = `<script src="/_next/static/chunks/abc.js"></script>`;
-
-    const id1 = await resolveActionId(html, "20260916-2");
-    const fetchesAfterFirst = chunkFetches;
-    const id2 = await resolveActionId(html, "20260916-2");
-    assert.equal(id1, "d".repeat(42));
-    assert.equal(id2, "d".repeat(42), "同一 dpl 命中缓存，返回同一 ID");
-    assert.equal(chunkFetches, fetchesAfterFirst, "第二次调用不得重抓 chunk");
-
-    const id3 = await resolveActionId(html, "20260917-9");
-    assert.equal(chunkFetches, fetchesAfterFirst + 1, "dpl 轮换后必须重扫");
-    assert.equal(id3, "d".repeat(42));
-});
-
-test("runSweep skips entirely when both page fetches fail", async () => {
-    const posts = [];
-    const { runSweep } = createPageHarness({
-        fetchImpl: async (url, init) => {
-            if (init && init.method === "POST") { posts.push(url); return { status: 200, text: async () => "1:true" }; }
-            return { status: 503, text: async () => "<!DOCTYPE html>" };
-        },
-    });
-
-    const result = await runSweep("test");
-
-    assert.equal(result, null);
-    assert.equal(posts.length, 0, "页面抓取失败时不得发出任何上报");
-});
-
-// ====== 触发与节流 ======
-
-test("maybeRun only fires on rewards paths and throttles repeated runs", () => {
-    // 脚本加载时自身会调用一次 maybeRun()：/earn 属常用路径，应自动调度一次
-    const { maybeRun, store, timers } = createPageHarness({ pathname: "/earn", search: "" });
-
-    assert.equal(timers.length, 1, "进入 earn 页应自动调度一次扫描");
-    assert.ok(Number(JSON.parse(store.get("bw_page_claim")).lastRunAt) > 0, "时间戳必须先落地占住窗口");
-
-    assert.equal(maybeRun(), false, "15 分钟窗口内不得重复扫描");
-    assert.equal(timers.length, 1);
-});
-
-test("maybeRun ignores unrelated paths but claimnow=1 forces a run", () => {
-    // 非常用路径：加载时不调度
-    const unrelated = createPageHarness({ pathname: "/redeem", search: "" });
-    assert.equal(unrelated.timers.length, 0, "非常用路径不自动扫描");
-    assert.equal(unrelated.maybeRun(), false);
-    assert.equal(unrelated.timers.length, 0);
-
-    // claimnow=1 强制：任何 rewards 路径都调度
-    const forced = createPageHarness({ pathname: "/redeem", search: "?claimnow=1" });
-    assert.equal(forced.timers.length, 1, "claimnow=1 在任意 rewards 路径强制扫描");
-    assert.equal(JSON.parse(forced.store.get("bw_page_claim")).lastRunReason, "claimnow");
-});
-
-test("maybeRun re-fires after the throttle window elapses", () => {
-    const h = createPageHarness({ pathname: "/dashboard", search: "" });
-    assert.equal(h.timers.length, 1);
-
-    // 手动把时间戳拨回 16 分钟前
-    const state = JSON.parse(h.store.get("bw_page_claim"));
-    state.lastRunAt = Date.now() - 16 * 60 * 1000;
-    h.store.set("bw_page_claim", JSON.stringify(state));
-
-    assert.equal(h.maybeRun(), true, "节流窗口过后应重新扫描");
-    assert.equal(h.timers.length, 2);
-});
-
-// ====== v4.4.0：autoclaim=1 后台代领握手 + 清扫后复核 ======
-
-test("maybeRun treats autoclaim=1 as a forced run with its own reason", () => {
-    // 后台开页代领握手：任意 rewards 路径 + autoclaim=1 → 绕过节流强制扫描，
-    // 触发源标记 autoclaim（与 claimnow 同语义、异来源）。
-    const h = createPageHarness({ pathname: "/earn", search: "?autoclaim=1" });
-    assert.equal(h.timers.length, 1, "autoclaim=1 必须强制调度扫描");
-    const state = JSON.parse(h.store.get("bw_page_claim"));
-    assert.equal(state.lastRunReason, "autoclaim");
-});
-
-test("maybeRun still throttles autoclaim=1 within the window after a fresh manual run", () => {
-    // autoclaim 绕过节流的判据是"强制参数"分支本身：fresh 手动扫描刚占住窗口时
-    // （15 分钟内），autoclaim 依旧立即执行——后台编排每次开页都要求清扫，不受限。
-    const h = createPageHarness({ pathname: "/earn", search: "?autoclaim=1" });
-    // 第一次（加载时）已调度；拨回时间戳模拟"窗口内已跑过"再触发，仍必须调度
-    const state = JSON.parse(h.store.get("bw_page_claim"));
-    state.lastRunAt = Date.now() - 60 * 1000;
-    h.store.set("bw_page_claim", JSON.stringify(state));
-    assert.equal(h.maybeRun(), true, "强制参数不受节流窗口约束");
-});
-
-test("runSweep verifies credited offers against a fresh earn flight and records confirmed flags", async () => {
-    // 清扫后复核：POST 受理后重抓 /earn，isCompleted=true 的 offer 标记 confirmed；
-    // 受理但未入账的保持未确认（留待下轮），复核结果计入 lastResult.confirmed。
-    const offerId = "VERIFY_OFFER";
-    const offerJson = JSON.stringify({ offerId, hash: "a".repeat(64), points: 15 });
-    let earnFetches = 0;
-    const h = createPageHarness({
-        pathname: "/earn", search: "",
-        fetchImpl: (url, init) => {
-            if (String(url).startsWith("https://rewards.bing.com/earn") && !String(url).includes("_next")) {
-                if ((init && init.method) === "POST") {
-                    // Server Action 受理形态（真实抓包）
-                    return { status: 200, text: async () => '0:{"a":"$@1","f":"","q":"","i":false}\n1:true\n' };
-                }
-                earnFetches++;
-                if (earnFetches === 1) {
-                    // 首次扫描：offer 未完成
-                    return { status: 200, text: () => flightHtml(`x:[${offerJson}]`) };
-                }
-                // 复核抓取：offer 已完成
-                return { status: 200, text: () => flightHtml(`x:[${JSON.stringify({ offerId, hash: "a".repeat(64), points: 15, isCompleted: true })}]`) };
-            }
-            return null; // 其余走默认空 HTML
-        },
-    });
-    // 隔离加载时的自动扫描
-    h.store.set("bw_page_claim", JSON.stringify({ lastRunAt: Date.now() }));
-    await h.runSweep("manual");
-    const state = JSON.parse(h.store.get("bw_page_claim"));
-    assert.equal(state.lastResult.total, 1, "应有 1 个待领 offer");
-    assert.equal(state.lastResult.ok, 1, "POST 应被受理");
-    assert.equal(state.lastResult.results[0].confirmed, true, "复核应确认该 offer 已入账");
-    assert.equal(state.lastResult.confirmed, 1);
-    assert.ok(earnFetches >= 2, "清扫后必须有一次独立的复核抓取");
-});
-
-// ====== 与主脚本的协作契约 ======
-
-test("page script writes the claim-seen cookie after a completed sweep", async () => {
-    // v4.4.4 后台断点定位的回传通道：清扫完成（含复核）后必须写 bw_page_claim_seen
-    // 信号 cookie（10 分钟有效），后台 SW 经 GM_cookie 读取判定"开页后页面侧是否执行"。
-    const h = createPageHarness({ pathname: "/earn", search: "" });
-    h.store.set("bw_page_claim", JSON.stringify({ lastRunAt: Date.now() }));
-    await h.runSweep("manual");
-
-    assert.match(h.context.document.cookie, /bw_page_claim_seen=\d+/, "清扫完成后必须写信号 cookie");
-    assert.match(h.context.document.cookie, /max-age=600/, "信号必须带 10 分钟有效期");
-});
 
 test("page claim script stays self-contained: no cross-script storage, no rescue tab", () => {
     const source = fs.readFileSync(pageScriptPath, "utf8");
