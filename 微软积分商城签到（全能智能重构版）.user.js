@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.4.6
-// @description  每天在后台自动完成 Microsoft Rewards 任务获取积分奖励，✅签入(PC+App静默)、✅阅读、✅活动、✅搜索、✅Quiz/拼图卡片上报、✅热搜API、✅二次扫描、✅积分通知、✅连签任务检测、✅每日活动自动上报（v4.4.6：信号基线持久化到存储（原内存跨 SW 轮即失致诊断从未发声）+ 限额用尽日无信号每天点名一次"页面脚本未安装/未执行"；v4.4.5：基线覆盖全触发路径；v4.4.4：页面清扫信号 cookie+账本双写；v4.4.3：修复粘贴授权码保存；v4.4.0-4.4.2：边缘 503 开页代领闭环编排）
+// @version      4.5.1
+// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅搜索、✅每日活动自动完成（DAPI App 上报）、✅连签检测、✅积分通知；v4.5.1：/earn 活动卡片与 dashboard 欢迎积分改为提醒模式——发现可领取时当日提醒一次（浏览器通知+webhook），由用户打开 rewards.bing.com 手动领取（SW 直发 Server Action 被边缘 503 结构性拦截，自动领取退役）；单脚本文件，无页面领取组件；历史缺陷修复记录见改动与待办记录.md
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -270,16 +270,12 @@ Notice:
             restrictedTimes: 0,
             _rvTokenCache: null,
             reportActionId: null,   // 轮内缓存的 reportActivity action ID（每次部署轮换，需动态解析）
+            // 本轮"边缘拦截（503+Bing 错误页）"标记：_sendDailySetAction 检出时置位，
+            // doDailySet 跳过本轮剩余项。仅本轮内存态，doDailySet 入口显式归零。
+            dailySetEdgeBlocked: false,
             ip: "",
             ipInfo: "",
             startTime: 0,
-            // 本轮"边缘拦截（503+Bing 错误页）"标记：_sendDailySetAction 首次检出时
-            // 置位，doDailySet 跳过本轮剩余项。仅本轮内存态，doDailySet 入口显式归零
-            //（同实例经菜单"立即运行"重复触发 runAll 时也不会跨轮残留）。
-            dailySetEdgeBlocked: false,
-            // v4.4.0：claimCard 网页策略被边缘拦截时同样置位（每日集与活动卡共用），
-            // doPromos/runAll 据此决定是否开页代领。仅本轮内存态，runAll 入口归零。
-            promosEdgeBlocked: false,
         }
     };
 
@@ -555,7 +551,7 @@ Notice:
 
         // 动态提取 next-action（discoverCards / 每日活动提取等 3 处共用，避免各自维护同一组正则）。
         // raw 为原始 HTML/RSC，fallback 为反斜杠转义后的版本（不同序列化格式命中不同分支）。
-        // 命中即写入 RewardsAuto._nextAction 并返回，供 claimCard / Server Action 复用。
+        // 命中即写入 RewardsAuto._nextAction 并返回（v4.5.0 起仅供诊断参考）。
         extractNextAction(raw, fallback = "", label = "") {
             const naMatch = (raw && raw.match(/name":"next-action"[^}]*"value":"([a-f0-9]{40,})"/))
                 || (raw && raw.match(/next-action["']\s*:\s*["']([a-f0-9]{40,})["']/))
@@ -571,7 +567,7 @@ Notice:
         // SW 直连 rewards 的 Server Action 一律 503 + Bing 边缘错误页 HTML；页面上下文
         // 同 payload、同 action ID 返回 200 + `1:true` 并真实入账（余额 +15 实测）。
         // 该形态是结构性拦截，与本轮 hash/ cookie 链 / payload 形状无关——据此跳过同轮
-        // 冗余策略，转交页面侧《页面领取》脚本。
+        // 冗余策略；可领取项改由提醒模式转用户手动领取。
         isEdgeBlockedError(err) {
             const msg = String((err && err.message) || err || "");
             return /^HTTP 503/.test(msg) && /<!DOCTYPE html>|<html[\s>]/i.test(msg);
@@ -1972,7 +1968,7 @@ Notice:
                 // unescape 版本供 RSC 解析使用
                 const clean = html.replace(/\\"/g, '"');
 
-                // ---------- 动态提取 next-action（供 claimCard 使用） ----------
+                // ---------- 动态提取 next-action（v4.5.0 起仅供诊断参考） ----------
                 Utils.extractNextAction(html, clean);
 
                 const pushCard = (card) => {
@@ -2224,198 +2220,7 @@ Notice:
             return "";
         },
 
-        // 欢迎页“可领取 N”积分的真实领取（2026-09-14 登录态抓包实证：+6 分到账）：
-        // POST https://rewards.bing.com/dashboard，body 为空参数数组 []，
-        // next-action 为 claim 专用 ID（独立于 reportActivity，随部署轮换，且仅在
-        // 页面存在可领取项时随 flight 下发 "$ACTION_ID_xxx"）。成功响应包含 `1:true`。
-        // v4.3.0：action ID 来源收敛为 页面 $ACTION_ID_ 唯一候选 → Config.claimActionId
-        // 覆盖值。页面未下发唯一 $ACTION_ID_ 信号（候选 0 个=无待领、≥2 个=结构歧义）
-        // 时拿旧 ID POST 必不被受理，直接跳过本轮；抓包兜底常量已过期（2026-09-14），
-        // 与页面侧《页面领取》脚本同款退役——保留只会产出误导性的失败日志。
-        async claimPendingPoints() {
-            const DASH = "https://rewards.bing.com/dashboard";
-            // 长度必须用 {40,64} 宽区间：现网 action ID 实测 42 位，
-            // 写死 {40} 会把用户按日志指引填回的正确 42 位覆盖值拒掉。
-            let actionId = String(GM_getValue("Config.claimActionId", "") || "");
-            if (!/^[a-f0-9]{40,64}$/.test(actionId)) actionId = "";
-            try {
-                const html = await Utils.fetchPage({ url: DASH, headers: { "user-agent": RewardsAuto.ua.pc } }, { fresh: true });
-                if (html) {
-                    // {40,64} 宽区间：现网 $ACTION_ID_ 实测 42 位，写死 {40} 会截出
-                    // 无效前缀且"候选数仍为 1"——截断值反而优先于正确候选被采用
-                    const ids = new Set(
-                        (String(html).match(/\$ACTION_ID_([a-f0-9]{40,64})/g) || [])
-                            .concat((Utils.concatFlightChunks(html).match(/\$ACTION_ID_([a-f0-9]{40,64})/g) || []))
-                            .map(s => s.slice(11)));
-                    if (ids.size === 1) actionId = [...ids][0];
-                }
-            } catch (_) { /* 拿不到页面信号时仅依赖覆盖值 */ }
-            if (!actionId) {
-                // 用户显式配置的 Config.claimActionId 覆盖值仍会走到下方 POST；
-                // 此处仅拦截"既无页面信号也无覆盖值"的轮次。
-                Utils.log("🟡", "欢迎积分无待领信号（页面未下发唯一 $ACTION_ID_，且无有效 Config.claimActionId 覆盖值），跳过领取");
-                return false;
-            }
-            const dpl = this._currentDpl();
-            const headers = {
-                "accept": "text/x-component",
-                "content-type": "text/plain;charset=UTF-8",
-                "next-action": actionId,
-                "next-router-state-tree": Utils.routerStateTree(DASH),
-                ...(dpl ? { "x-deployment-id": dpl } : {}),
-                "sec-fetch-site": "same-origin",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-dest": "empty",
-            };
-            const cookie = await Utils.cookieHeaderFor(DASH);
-            if (cookie) headers.cookie = cookie;
-            try {
-                const res = await Utils.xhr({ method: "POST", url: DASH, headers, data: "[]" });
-                if (typeof res === "string" && res.includes("1:true")) return true;
-                // 2xx 无 1:true：action 未被执行（cookie 链缺失/ID 不被受理），非响应结构损坏
-                Utils.log("🟡", `欢迎积分领取未确认（2xx 响应无 1:true，action 可能未执行）: ${String(typeof res === "string" ? res : (res && res.status) || "?").slice(0, 80)}`);
-                return false;
-            } catch (e) {
-                Utils.log("🟡", `欢迎积分领取失败（action id 可能已轮换，可更新 Config.claimActionId）: ${e.message}`);
-                return false;
-            }
-        },
 
-        // 领取卡片奖励（2026-09-14 登录态抓包重写）
-        // 浏览器点击日常任务卡的真实契约：POST https://rewards.bing.com/earn（卡片墙
-        // 所在页自身），context 形状 body [本次earnFlightHash, 11,
-        // {offerid, isPromotional, timezoneOffset}]，next-action=reportActivity 动态 ID。
-        // 200 即上报受理；earn 响应是 RSC 流、不含 `1:true`，是否入账交由调用方的
-        // "复核 + 连续 N 轮放弃"机制判定，此处不看响应文本。
-        async claimCard(card) {
-            // 策略0（主路径）：DAPI App 上报 type 101 + offerid——Bearer 鉴权、
-            // 无 cookie/Origin 依赖，SW 直连实测真实入账（2026-09-15：Child3 +10p，
-            // balance 4118→4128）。isDuplicate:true 即同 activity id 幂等确认，同样成功。
-            // v4.1.0 实测标定（2026-09-16）：服务端对 App 目录外/锁定/未开始的 offer
-            // 一律静默 200 + p:0 + isDuplicate:false（WW_Rewards_locked_level2 与已完成
-            // Child3 换 id 重报均为 p:0）——这类响应不代表入账，必须视为"App 上报未受理"，
-            // 落到下方网页策略兜底，绝不能当成功短路。
-            const appRes = await this.appActivity(101, card.offerId, true);
-            if (appRes && (appRes.points > 0 || appRes.isDuplicate)) {
-                Utils.log("📲", `App上报入账(${card.offerId}): +${appRes.points}p${appRes.isDuplicate ? "（已入账，幂等确认）" : ""}`);
-                return true;
-            }
-
-            // 新版构建下页面 flight 流不再内嵌可用的 next-action 引用，
-            // 优先用 chunk 扫描出的 reportActivity ID，避免误用页面其他 action 的 ID
-            const nextAction = await this._resolveReportActivityActionId()
-                || RewardsAuto._nextAction || RewardsAuto.fallbackActionId;
-            const EARN = "https://rewards.bing.com/earn";
-
-            // v3.7.0 抓包实证（2026-09-15 登录态页面）：action 成功的唯一判据是响应含
-            // `1:true`——缺 cookie 链的请求同样 200，但服务端只重渲染页面、action 不执行
-            // （无 `1:true`）；半截链则 500。此前"任何 2xx 即成功"把这两类假成功当入账，
-            // 是"已上报未到账"空转的直接来源。显式链可用时加 anonymous 关掉 SW 自动附带
-            // 的 SameSite=None 碎片 cookie，避免与显式链合并出重复/半认证头（500 嫌疑）。
-            const postEarnAction = async (hash, shape) => {
-                const dpl = this._currentDpl();
-                const headers = {
-                    "accept": "text/x-component",
-                    "content-type": "text/plain;charset=UTF-8",
-                    "next-action": nextAction,
-                    "next-router-state-tree": Utils.routerStateTree(EARN),
-                    "origin": "https://rewards.bing.com",
-                    "referer": EARN,
-                    "user-agent": RewardsAuto.ua.pc,
-                    ...(dpl ? { "x-deployment-id": dpl } : {}),
-                    "sec-fetch-site": "same-origin",
-                    "sec-fetch-mode": "cors",
-                    "sec-fetch-dest": "empty",
-                };
-                const cookie = await Utils.cookieHeaderFor(EARN);
-                if (cookie) headers.cookie = cookie;
-                const res = await Utils.xhr({
-                    method: "POST", url: EARN, headers,
-                    anonymous: !!cookie,
-                    acceptErrorBody: true,
-                    data: JSON.stringify(shape === "impression"
-                        ? [hash, 11, { offerid: card.offerId, form: card.form || "$undefined" }]
-                        : [hash, 11, {
-                            offerid: card.offerId,
-                            isPromotional: "$undefined",
-                            timezoneOffset: Utils.jsTimezoneOffset(),
-                        }]),
-                });
-                if (typeof res === "string" && res.includes("1:true")) return;
-                const detail = typeof res === "string"
-                    ? `2xx 无 1:true（cookie 链缺失特征）: ${res.slice(0, 100)}`
-                    : `HTTP ${res && res.status}: ${String((res && res.body) || "").slice(0, 140)}`;
-                throw new Error(detail);
-            };
-
-            // 策略1: context 形 + live hash（discoverCards 已用本次 earn flight 覆盖）
-            // v4.2.0：边缘拦截（503 + Bing 错误页）是结构性拒绝，逐条重试其余形状/路由
-            // 只会重复同一失败。实测标定见 isEdgeBlockedError 注释；此处短路交给页面侧脚本。
-            let edgeBlocked = false;
-            if (card.hash) {
-                try { await postEarnAction(card.hash); return true; }
-                catch (e) {
-                    edgeBlocked = Utils.isEdgeBlockedError(e);
-                    Utils.log("🟡", `Earn 同源上报失败(${card.offerId}): ${e.message}`);
-                }
-            }
-
-            // 策略2: 强制刷新 earn 页再取一次 live hash——卡片来自 getuserinfo 静态源
-            // 或 discoverCards 合并未命中时，旧 hash 大概率正是失败原因（服务端按当次
-            // 页面加载校验）。顺带用权威 live 状态短路：已入账返回成功，锁定直接放弃。
-            try {
-                const html = await Utils.fetchPage({ url: EARN }, { fresh: true });
-                const live = Utils.parseEarnLiveOffers(Utils.concatFlightChunks(html || ""));
-                const o = live && live[card.offerId];
-                if (o && o.isCompleted) return true;
-                if (o && o.isLocked) {
-                    Utils.log("🔒", `卡片锁定（${o.unlockCriteria || "?"}），网页端不可领取: ${card.offerId}`);
-                    return false;
-                }
-                if (o && o.hash && o.hash !== card.hash) {
-                    await postEarnAction(o.hash);
-                    return true;
-                }
-            } catch (e2) {
-                edgeBlocked = edgeBlocked || Utils.isEdgeBlockedError(e2);
-                Utils.log("🟡", `Live hash 重试失败(${card.offerId}): ${e2.message}`);
-            }
-
-            // 策略3: impression 形（改版前旧 payload，兼容仍引用旧构建的区域）
-            if (!edgeBlocked && card.hash) {
-                try { await postEarnAction(card.hash, "impression"); return true; }
-                catch (e3) { Utils.log("🟡", `Server Action(impression) 失败: ${card.offerId}`); }
-            }
-
-            // （原 legacy /api/reportactivity 策略删除：2026-09-14 实测该端点已被服务端
-            //   下线——真实登录页面同样 401、页面已无 RequestVerificationToken，保留只会
-            //   为每张失败卡片白白多打 3 个请求。）
-
-            // 边缘拦截时不发后台标签页（它同样走 SW/扩展发起的网络栈，无法改变拦截结果），
-            // 直接转交页面侧脚本；非拦截性失败仍保留这条原生流程兜底。
-            // v4.4.0：置本轮 promosEdgeBlocked 标记，doPromos 据此开页代领（限次+冷却）。
-            if (edgeBlocked) {
-                RewardsAuto.state.promosEdgeBlocked = true;
-                Utils.log("🟡", `卡片需页面上下文领取(${card.offerId}): SW 直连被边缘拦截（503），本轮由《页面领取》脚本代领——后台将自动打开 rewards 页完成`);
-                return false;
-            }
-
-            // 策略5（v3.7.0 重写）：XHR GET 活动链接已证无入账效果——入账只发生在
-            // rewards 页的 Server Action（实测 Child2 无任何 bing 访问即入账），且裸 GET
-            // 曾把"访问成功"谎报为"领取成功"。改为开真实后台标签页走浏览器原生流程
-            //（个别 bingredirect 类卡片可能由 bing 侧结算），10 秒后自动关闭；
-            // 本策略不返回成功，是否入账交由领取后复核与放弃账本判定。
-            if (card.url && /^https?:\/\/[^/]*bing\.com/i.test(card.url)) {
-                try {
-                    const opened = GM_openInTab(card.url, { active: false });
-                    Utils.log("🔵", `已开后台标签页走原生流程(${card.offerId})，10 秒后自动关闭`);
-                    setTimeout(() => { try { if (opened && opened.close) opened.close(); } catch (_) {} }, 10000);
-                } catch (_) { /* 开页失败不影响结果 */ }
-            }
-
-            Utils.log("🟡", `卡片领取失败(${card.offerId}): 所有策略均失败`);
-            return false;
-        },
 
         async getSearchPage(query, isMobile = false) {
             const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
@@ -2613,24 +2418,9 @@ Notice:
         }
     };
 
-    // 活动卡片"连续未确认"放弃上限：某卡片服务端连续 N 次复核仍未确认完成时，
-    // 当日不再重复上报（多为需真实访问才结算的开放型卡片），次日按日期清零重试。
-    const PROMOS_GIVE_UP_AFTER = 5;
-
-    // 每日活动"当日连续失败"放弃上限（v4.3.0）：Config.dailySetFail 此前只计数无
-    // 上限，接口异常/边缘拦截日每 20 分钟轮次都会全量重试。当日失败达上限即当日
-    // 放弃（任务返回 true 对齐 promos 放弃语义），以 {date,count} 结构按日自动重置；
-    // 放弃不写 Config.dailySetDone，次日自愈逻辑不受影响。
+    // 每日活动"当日连续失败"放弃上限：接口异常/边缘拦截日每 20 分钟轮次全量重试
+    // 会放大请求量，当日失败达上限即当日放弃，次日按日期自动重置。
     const DAILY_SET_GIVE_UP_AFTER = 5;
-
-    // v4.4.0 开页编排（抓包真值 2026-09-26：页面点击 → POST /earn next-action 200 + 积分
-    // 真实到账，SW 直发同请求 503）——边缘拦截日的代领链路：后台 GM_openInTab 打开
-    // rewards 页（autoclaim=1）→ 注入该页的《页面领取》脚本自动清扫 → 150 秒后自动收页
-    // → 后台下一轮以 fresh 抓取复核到账（1:true 不代表到账，复核才是唯一判据）。
-    const PAGE_SWEEP_URL = "https://rewards.bing.com/earn?autoclaim=1";
-    const PAGE_SWEEP_MAX_PER_DAY = 6;            // 当日最多开页次数（0-6 点凌晨失败密集期够用）
-    const PAGE_SWEEP_COOLDOWN_MS = 25 * 60 * 1000; // 两次开页最小间隔（> 20 分钟 cron 周期）
-    const PAGE_SWEEP_TAB_LIFETIME_MS = 150 * 1000; // 页面存活时长：页面脚本节流 6s + 扫描/领取间隔足够收尾
 
     // 运行锁参数：运行中心跳每 5 分钟续期一次；过期窗口 20 分钟（> 2 个心跳周期），
     // 既保证活跃长任务不被误判过期，又把实例意外终止（关标签页/SW 被杀）后
@@ -2817,28 +2607,18 @@ Notice:
         },
 
         async doPromos() {
+            // v4.5.0：活动卡片从"自动领取"改为"当日一次提醒"——SW 直发 Server Action
+            // 被边缘 503 结构性拦截（v4.2.0 实证），自动领取链路整体退役；卡片积分
+            // 改由用户打开 rewards.bing.com 手动领取，脚本只负责发现可领项并当日
+            // 提醒一次；上报/账本/复核链路已退役。
             if (!GM_getValue("Tasks.promos", true)) { Utils.log("🟡", "活动卡片任务已关闭，跳过"); return true; }
-            if (this.promosTimes > 2) { Utils.log("🟡", "活动卡片重试次数已用完，稍后由下次运行处理"); return false; }
             if (this.promosDate === RewardsAuto.state.dateNowNum) {
-                Utils.log("✅", "活动卡片已完成");
+                Utils.log("✅", "活动卡片已提醒/无待领");
                 return true;
             }
 
             Utils.log("🧩", "扫描活动卡片...");
             const cards = await API.discoverCards();
-
-            // v4.4.6：上一轮开页代领后的信号解读（基线持久化在存储，消费即清）——
-            // 上轮开过页、本轮卡片仍在可领清单（页面没领到）时，按信号三态点名断点，
-            // 避免"开页成功但页面侧什么都没发生"的静默空转。
-            if (cards && cards.length > 0) {
-                const baseline = GM_getValue("Config.pageClaimBaseline", null);
-                if (baseline && Number(baseline.kickedAt) > 0) {
-                    GM_setValue("Config.pageClaimBaseline", null); // 消费即清，一次开页只诊断一轮
-                    const seen = await this._readPageClaimSeenCookie();
-                    const hint = this._pageClaimSignalHint(seen, Number(baseline.kickedAt));
-                    if (hint) Utils.log("🟡", hint);
-                }
-            }
 
             if (cards === null) {
                 this.promosTimes++;
@@ -2853,186 +2633,22 @@ Notice:
                 return true;
             }
 
-            // 当日已连续未确认达上限的卡片（多为"需真实访问才结算"的开放型卡片）
-            // 直接跳过本轮上报，避免整天空转；次日日期变更自动清零重试。
-            // v4.4.1：剩余全是放弃账本卡片时不再直接收账——账本判的是 SW 通道的
-            // 失败，不适用于页面代领通道（页面脚本无账本，会重试所有可领 offer，
-            // 2026-09-26 日志实证：offer2 被账本整天跳过后开页代领永远无法触发）。
-            // 开页配额有余则先代领一轮并保 pending，下轮 fresh 复核确认（页面领到
-            // → 卡片 isCompleted 出列 → 无新卡片自然收账）；配额用尽/冷却中维持
-            // 原当日收账语义（次日账本自动清零重试）。
-            const giveUpIds = this._givenUpOfferIds();
-            const claimable = cards.filter(c => !giveUpIds.has(c.offerId));
+            // 当日一次提醒（quiz 卡尊重 Tasks.quiz 开关——关闭则不提醒该类卡）
+            const claimable = cards.filter(c => !(c.kind === "quiz" && !GM_getValue("Tasks.quiz", true)));
             if (claimable.length === 0) {
-                if (giveUpIds.size > 0 && await this._kickPageSweep("放弃账本卡片")) {
-                    this.promosTimes++;
-                    Utils.log("🟡", `${giveUpIds.size} 个已放弃卡片转页面代领，下轮复核确认`);
-                    return false;
-                }
                 this.promosDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                Utils.log("🟡", `其余 ${giveUpIds.size} 个卡片已连续未确认放弃，今日流程结束（次日自动重试）`);
+                Utils.log("✅", "可领卡片均为已关闭的 Quiz 类，跳过提醒");
                 return true;
             }
-
-            Utils.log("🧩", `发现 ${claimable.length} 个可领取卡片`);
-            let ok = 0, fail = 0;
-            const claimed = new Set();
-            const failed = [];
-
-            for (const card of claimable) {
-                Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
-
-                // Quiz 任务需要单独处理（可选开启）
-                if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
-
-                // 【防封号】领取卡片前随机延迟
-                await Utils.randomDelay(3000, 8000);
-                const result = await API.claimCard(card);
-                result ? ok++ : fail++;
-                if (result) claimed.add(card.offerId);
-                else failed.push(card.offerId);
-            }
-
-            // v4.1.1：领取失败的卡片同样计入放弃账本（此前只统计"上报成功但未确认"，
-            // 锁定等级/时间窗卡每轮全策略失败却永远进不了账本，阻塞 promosDate 整日 ❌）。
-            // 达上限的卡片当日放弃，下轮扫描起不再出列。
-            const newlyGivenUp = this._recordFailedClaims(failed);
-
-            // v4.4.2：边缘拦截优先于"部分失败"早退——claimCard 在领取循环内置位
-            // promosEdgeBlocked 后，若先走下方 stillPending 早退，开页代领永远轮不到
-            //（2026-09-26 18:04 日志实证：两轮"卡片需页面上下文领取"日志后均无一次
-            // "已开 rewards 页"）。此处立即开页代领并保 pending，下轮 fresh 复核确认；
-            // 限额用尽/冷却中保持失败语义交由下轮再试。
-            if (RewardsAuto.state.promosEdgeBlocked) {
-                // v4.4.5：信号基线由 _kickPageSweep 内部统一记录（覆盖全部触发路径）
-                const kicked = await this._kickPageSweep("活动卡片");
-                this.promosTimes++;
-                Utils.log("🟡", kicked
-                    ? "活动卡片被边缘拦截，已开页代领，下轮复核"
-                    : "活动卡片被边缘拦截且开页代领暂不可用（限额/冷却），下轮重试");
-                return false;
-            }
-
-            // 仍有失败但未达放弃上限的卡片 → 保持 pending，下轮仅重试这些卡片
-            //（与旧"部分失败"语义一致；复核只对"本轮失败卡全部收口"的轮次执行，省请求数）。
-            const stillPending = failed.filter(id => !newlyGivenUp.includes(id));
-            if (stillPending.length > 0) {
-                this.promosTimes++;
-                Utils.log("🟡", `活动卡片部分失败（${ok} 成功/${fail} 失败），稍后重试`);
-                return false;
-            }
-
-            // 领取后复核：上报成功≠积分到账（v4.1.0 实测：App 目录外 offer 会被
-            // 静默吸收、网页 2xx 可能只是页面重渲染）。
-            // 未确认卡片按 offerId 累计连续失败次数，达上限后当日放弃（_countUnconfirmed），
-            // 本轮没有任何卡片上报成功（如全部是已关闭的 quiz）时跳过复核，省掉 2 次请求。
-            let unconfirmed = [];
-            if (claimed.size > 0) {
-                await Utils.randomDelay(4000, 8000);
-                // 复核必须绕过轮内缓存（fresh），否则刚上报的卡片永远"未确认"
-                const recheck = await API.discoverCards({ fresh: true });
-                if (Array.isArray(recheck)) {
-                    unconfirmed = this._countUnconfirmed(recheck, claimed).retryable;
-                }
-            }
-
-            // 全部卡片收口（领取成功、复核确认完成、或达上限当日放弃）才落账 ✅
-            if (unconfirmed.length > 0) {
-                this.promosTimes++;
-                Utils.log("🟡", `已上报但 ${unconfirmed.length} 个卡片服务端未确认（${unconfirmed.join(",")}），下轮重试`);
-                return false;
-            }
-
-            // v4.4.0：本轮有卡片被边缘拦截（SW 503）时开页代领——页面脚本的领取
-            // 结果由下轮 doPromos 的 fresh 复核自然确认；限额用尽/冷却中保持失败
-            // 语义（promosTimes++，交由下轮再试），不阻塞本轮其余任务。
-            // （v4.4.2 起主检查点前移至失败落账后；此处兜底覆盖无失败但被拦截的
-            // 罕见路径，正常轮 promosEdgeBlocked 已在上方消费并归零语义，不会双开页——
-            // _kickPageSweep 自带冷却/限次门。）
-            if (RewardsAuto.state.promosEdgeBlocked) {
-                const kicked = await this._kickPageSweep("活动卡片");
-                this.promosTimes++;
-                Utils.log("🟡", kicked
-                    ? "活动卡片被边缘拦截，已开页代领，下轮复核"
-                    : "活动卡片被边缘拦截且开页代领暂不可用（限额/冷却），下轮重试");
-                return false;
-            }            this.promosDate = RewardsAuto.state.dateNowNum;
+            await this.notifyClaimables("活动卡片", claimable);
+            this.promosDate = RewardsAuto.state.dateNowNum;
             this.save();
-            if (newlyGivenUp.length > 0) {
-                Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败（含 ${newlyGivenUp.length} 个当日放弃）`, true);
-            } else {
-                Utils.log("🔵", `活动完成: ${ok}成功/${fail}失败`, true);
-            }
             return true;
         },
 
-        // 当日已达"连续未确认放弃"上限的卡片 offerId 集合（次日按日期自动清零）
-        _givenUpOfferIds(giveUpAfter = PROMOS_GIVE_UP_AFTER) {
-            const rec = GM_getValue("Config.promosUnconfirmed", null);
-            if (!rec || rec.date !== RewardsAuto.state.dateNowNum || typeof rec.offers !== "object") {
-                return new Set();
-            }
-            return new Set(Object.entries(rec.offers)
-                .filter(([, count]) => count >= giveUpAfter)
-                .map(([offerId]) => offerId));
-        },
 
-        // 统计刚领取但服务端未确认的卡片：按 offerId 累计当日连续失败次数，
-        // 达上限的进入 givenUp（当日放弃、本轮不再计数），未达上限的进入 retryable（下轮重试）。
-        _countUnconfirmed(recheckCards, claimedOfferIds, giveUpAfter = PROMOS_GIVE_UP_AFTER) {
-            const today = RewardsAuto.state.dateNowNum;
-            const key = "Config.promosUnconfirmed";
-            let rec = GM_getValue(key, null);
-            if (!rec || rec.date !== today || typeof rec.offers !== "object") {
-                rec = { date: today, offers: {} };
-            }
 
-            const retryable = [];
-            const givenUp = [];
-            for (const card of recheckCards) {
-                if (!claimedOfferIds.has(card.offerId)) continue;
-                const count = (rec.offers[card.offerId] || 0) + 1;
-                rec.offers[card.offerId] = count;
-                if (count >= giveUpAfter) {
-                    givenUp.push(card.offerId);
-                } else {
-                    retryable.push(card.offerId);
-                }
-            }
-            GM_setValue(key, rec);
-
-            if (givenUp.length > 0) {
-                Utils.log("🟡", `卡片服务端连续 ${giveUpAfter} 次未确认，当日放弃（次日自动重试）: ${givenUp.join(",")}`);
-            }
-            return { retryable, givenUp };
-        },
-
-        // v4.1.1：把"领取直接失败"（所有策略均失败/锁定拒绝）的卡片同样计入放弃账本。
-        // 此前账本只覆盖"上报成功但复核未确认"的卡片，而锁定等级/时间窗卡每轮全策略
-        // 失败却永远进不了账本 → fail>0 阻塞 promosDate，摘要"活动卡片"整日 ❌ 空转。
-        // 返回当日已达放弃上限的 offerId 列表（达上限即从待办出列）。
-        _recordFailedClaims(failedOfferIds, giveUpAfter = PROMOS_GIVE_UP_AFTER) {
-            const ids = [...new Set(failedOfferIds)].filter(Boolean);
-            if (ids.length === 0) return [];
-            const today = RewardsAuto.state.dateNowNum;
-            const key = "Config.promosUnconfirmed";
-            let rec = GM_getValue(key, null);
-            if (!rec || rec.date !== today || typeof rec.offers !== "object") {
-                rec = { date: today, offers: {} };
-            }
-            const givenUp = [];
-            for (const id of ids) {
-                const count = (rec.offers[id] || 0) + 1;
-                rec.offers[id] = count;
-                if (count >= giveUpAfter) givenUp.push(id);
-            }
-            GM_setValue(key, rec);
-            if (givenUp.length > 0) {
-                Utils.log("🟡", `卡片连续 ${giveUpAfter} 次领取失败，当日放弃（次日自动重试）: ${givenUp.join(",")}`);
-            }
-            return givenUp;
-        },
 
         async doSearch() {
             if (!GM_getValue("Tasks.search", true)) { Utils.log("🟡", "搜索任务已关闭，跳过"); return true; }
@@ -3152,7 +2768,6 @@ Notice:
             const processedIds = new Set(processed.map(p => p.offerId));
             // 同实例重复触发时清掉上一轮的边缘拦截标记，作用域严格限定单轮
             RewardsAuto.state.dailySetEdgeBlocked = false;
-            RewardsAuto.state.promosEdgeBlocked = false;
 
             Utils.log("📅", `开始执行每日活动（已处理 ${processedIds.size} 个）...`);
             await Utils.randomDelay(3000, 8000);
@@ -3224,7 +2839,7 @@ Notice:
                     // 冗余请求。标记为本轮内存态（RewardsAuto.state.dailySetEdgeBlocked），
                     // 不跨轮残留。
                     if (RewardsAuto.state.dailySetEdgeBlocked) {
-                        Utils.log("🟡", `边缘拦截已检出，跳过剩余每日活动上报（含 ${h.offerId}），转交《页面领取》脚本`);
+                        Utils.log("🟡", `边缘拦截已检出，跳过剩余每日活动上报（含 ${h.offerId}），下轮重试`);
                         break;
                     }
                     Utils.log("📅", `完成每日活动: ${h.offerId}`);
@@ -3259,11 +2874,9 @@ Notice:
                 // 复查完成状态（上报后的状态变化必须绕过缓存）；rnoreward 跳转入账
                 // 有数秒延迟（v3.6.12：4-8 秒实测偏短，出现过 0/3 误报后同轮二次扫描又确认成功）
                 // v4.3.0：本轮已检出边缘拦截时跳过复查——同轮内拦截态不会解除，复查
-                // 必然 503。v4.4.0：此时改为开页代领（当日限次+冷却），页面脚本的
-                // 领取结果由下轮 fresh 复核确认；开页限额用尽/冷却中则维持 false。
+                // 必然 503；留待下轮重试（每日活动仍可自动重试，不受提醒模式影响）。
                 if (RewardsAuto.state.dailySetEdgeBlocked) {
-                    await this._kickPageSweep("每日活动");
-                    Utils.log("🟡", "本轮每日活动上报被边缘拦截，转页面代领，下轮复核");
+                    Utils.log("🟡", "本轮每日活动上报被边缘拦截，跳过复查，下轮重试");
                     return false;
                 }
                 await Utils.randomDelay(8000, 15000);
@@ -3304,8 +2917,8 @@ Notice:
             let tabCount = 0;
             for (let i = 0; i < urls.length; i++) {
                 try {
-                    // 接句柄并 10 秒后关闭（与 claimCard 策略5 同款模式）：此前不接句柄
-                    // 是全脚本唯一不管理生命周期的开页点，泄漏随 20 分钟轮次累积。
+                    // 接句柄并 10 秒后关闭：此前不接句柄是全脚本唯一不管理生命周期
+                    // 的开页点，泄漏随 20 分钟轮次累积。
                     const opened = GM_openInTab(urls[i], { active: false, insert: true });
                     setTimeout(() => { try { if (opened && opened.close) opened.close(); } catch (_) {} }, 10000);
                     tabCount++;
@@ -3333,7 +2946,6 @@ Notice:
             Utils.log("🔵", `每日活动完成 ${completed.length}/${afterOpen.length} 个`, true);
             return true;
         },
-
         // 打卡任务（后台模式）：从 dashboard 发现打卡页 → 提取子任务链接 → 逐个 XHR 模拟点击
         async doPunchCard() {
             const today = RewardsAuto.state.dateNowNum;
@@ -3448,7 +3060,55 @@ Notice:
             }
         },
 
-        // 从 dashboard HTML 中提取每日活动真实链接（rnoreward=1）
+
+
+
+
+        // v4.5.0：可领取项当日一次提醒（替代原自动领取）。独立于 pushDedupe 的
+        // 通知账本——用户手动领取后第二天才会再提醒；同日新增可领项合并进当日
+        // 已发内容（key 聚合），不重复弹窗。
+        async notifyClaimables(kind, items) {
+            if (!Array.isArray(items) || items.length === 0) return false;
+            const today = RewardsAuto.state.dateNowNum;
+            let rec = GM_getValue("Config.claimNotify", null);
+            if (!rec || rec.date !== today) rec = { date: today, kinds: {} };
+            const prev = rec.kinds[kind] || "";
+            // 同类目当日已提醒过则不再打扰（即便清单变化——用户进页面自会看到全部可领项）
+            if (prev) return false;
+            rec.kinds[kind] = items.map(x => x.title || x.offerId).join("、").slice(0, 200);
+            GM_setValue("Config.claimNotify", rec);
+            const lines = items.map(x => `  - ${x.title || x.offerId} +${x.points ?? "?"}分`).join("\n");
+            Utils.log("🔔", `${kind}可领取（${items.length} 项，当日仅提醒一次）：\n${lines}\n  请打开 rewards.bing.com 手动领取`, true);
+            return true;
+        },
+
+        async doClaimPoints() {
+            // v4.5.0：欢迎积分改为当日一次提醒，不再自动领取——SW 直发 Server Action
+            // 被边缘 503 拦截（v4.2.0 实证）且 1:true 判据有假阳性，自动领取链路退役。
+            try {
+                const dashboardHtml = await Utils.fetchPage({ url: "https://rewards.bing.com/dashboard" });
+                if (!dashboardHtml) {
+                    Utils.log("🟡", "无法获取 dashboard 页面");
+                    return;
+                }
+
+                const claimableMatch = dashboardHtml.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
+                if (!claimableMatch) {
+                    Utils.log("✅", "无可领取积分");
+                    return;
+                }
+
+                const amount = parseInt(claimableMatch[1].replace(/,/g, '')) || 0;
+                if (amount > 0) {
+                    await this.notifyClaimables("欢迎积分", [{ title: `${amount} 分待领取积分`, points: amount }]);
+                } else {
+                    Utils.log("✅", "可领取积分为 0");
+                }
+            } catch (e) {
+                Utils.log("🟡", `检测可领取积分失败: ${e.message}`);
+            }
+        },
+
         async _extractDailySetUrls() {
             const urls = [];
             try {
@@ -3635,7 +3295,7 @@ Notice:
                 acceptErrorBody: true
             };
             // 显式 Cookie 头：补齐 SW 跨源子请求不自动携带的 SameSite 登录 cookie；
-            // 链可用时同时关掉自动附带（v3.7.0，与 claimCard 同理）
+            // 链可用时同时关掉自动附带（v3.7.0）
             const cookie = await Utils.cookieHeaderFor(reqOptions.url);
             if (cookie) { reqOptions.headers.cookie = cookie; reqOptions.anonymous = true; }
             if (GM_getValue("Config.debugDailySet", false)) {
@@ -3647,7 +3307,7 @@ Notice:
                     cookies: cookie ? cookie.split("; ").length : 0
                 })}`);
             }
-            // v3.7.0：与 claimCard 同款严格判据——2xx 且含 `1:true` 才算 action 执行；
+            // v3.7.0：严格判据——2xx 且含 `1:true` 才算 action 执行；
             // 缺 cookie 链的 200 是页面重渲染（action 未执行），不得视为上报成功。
             // 显式链可用时 anonymous 关掉 SW 自动附带的碎片 cookie（防重复/半认证头）。
             try {
@@ -3657,13 +3317,13 @@ Notice:
                     Utils.log("🟡", `Server Action ${shape} 未执行(${offerId}): 2xx 无 1:true（cookie 链缺失特征）: ${res.slice(0, 100)}`);
                 } else {
                     // v4.3.0：acceptErrorBody 下 503+Bing 错误页走的是 resolve（非 reject），
-                    // 只在 catch 判 isEdgeBlockedError 会静默失效（claimCard 走的是抛错
-                    // 路径）。此处合成同构消息 "HTTP <status>: <body>" 后判定，检出即置
-                    // 本轮标记，doDailySet 据此跳过本轮剩余项（结构性拦截对全体 offer 成立）。
+                    // 只在 catch 判 isEdgeBlockedError 会静默失效。此处合成同构消息
+                    // "HTTP <status>: <body>" 后判定，检出即置本轮标记，doDailySet
+                    // 据此跳过本轮剩余项（结构性拦截对全体 offer 成立）。
                     const detail = `HTTP ${res && res.status ? res.status : "?"}: ${String(res && res.body || "")}`;
                     if (Utils.isEdgeBlockedError(detail)) {
                         RewardsAuto.state.dailySetEdgeBlocked = true;
-                        Utils.log("🟡", `Server Action ${shape} 被边缘拦截(${offerId}): SW 直连被 503 拦截，本轮剩余项跳过，转交《页面领取》脚本`);
+                        Utils.log("🟡", `Server Action ${shape} 被边缘拦截(${offerId}): SW 直连被 503 拦截，本轮剩余项跳过，下轮重试`);
                         return false;
                     }
                     Utils.log("🟡", `Server Action ${shape} 失败(${offerId}): ${detail.slice(0, 240)}`);
@@ -3698,37 +3358,6 @@ Notice:
             }
         },
 
-        async doClaimPoints() {
-            // 通过 XHR 检测可领取积分（兼容 service worker）；轮内缓存与 doPunchCard 共用抓取
-            try {
-                const dashboardHtml = await Utils.fetchPage({ url: "https://rewards.bing.com/dashboard" });
-                if (!dashboardHtml) {
-                    Utils.log("✅", "无法获取 dashboard 页面");
-                    return;
-                }
-
-                const claimableMatch = dashboardHtml.match(/alt="可领取"[^>]*>[\s\S]*?(\d[\d,]*)/i);
-                if (!claimableMatch) {
-                    Utils.log("✅", "无可领取积分");
-                    return;
-                }
-
-                const amount = parseInt(claimableMatch[1].replace(/,/g, '')) || 0;
-                if (amount > 0) {
-                    // v3.6.11：不再只提醒，直接走实测契约领取（SW 直连）
-                    const ok = await API.claimPendingPoints();
-                    if (ok) {
-                        Utils.log("🎁", `已领取 ${amount} 待领取积分`, true);
-                    } else {
-                        Utils.log("🟡", `${amount} 积分领取失败（打开 dashboard 时前台仍会自动领取）`);
-                    }
-                } else {
-                    Utils.log("✅", "可领取积分为 0");
-                }
-            } catch (e) {
-                Utils.log("🟡", `检测可领取积分失败: ${e.message}`);
-            }
-        },
 
         // ====== 连签任务检测（通过 XHR 获取 earn 页面信息） ======
         async doStreak() {
@@ -3781,7 +3410,7 @@ Notice:
                     Utils.log("📅", `连签奖励印章进度: ${stampMatch[1]}/12`);
                 }
 
-                // 连签任务的实际完成由 doPromos() 的 discoverCards + claimCard 统一处理
+                // 连签任务未完成项由用户在 rewards 页手动完成（v4.5.0 提醒模式）
                 Utils.log("📅", "连签任务检测完成，未完成任务将由活动卡片模块处理");
                 return true;
             } catch (e) {
@@ -3790,87 +3419,8 @@ Notice:
             }
         },
 
-        // v4.4.0：边缘拦截日开页代领编排。当日次数 + 冷却双门槛，超限静默返回
-        // false（不刷日志）。返回 true 表示本轮已开页：调用方应跳过同轮内的
-        // Server Action 重试与复查（拦截态不会在同轮解除），等待下轮复核。
-        // v4.4.4：账本双写（主键+备份）+ 写后回读校验——2026-09-26 20:10/20:20
-        // 日志实证 ScriptCat SW 存储偶发丢写（20:10 写 count=2，20:20 读仍 1，
-        // 冷却门随之失效），双写取最大值把丢写概率压到最低，回读异常显式报日志。
-        // v4.4.5：页面信号基线记录下沉到本函数——20:54 日志实证"放弃账本卡片"
-        // 触发路径未记基线，下一轮信号诊断缺据无声。所有触发路径统一在开页前
-        // 记录当前信号值，下一轮 doPromos 扫描据此三态定位断点。
-        async _kickPageSweep(reason) {
-            const today = RewardsAuto.state.dateNowNum;
-            const pick = (r) => (r && r.date === today && Number(r.count) || 0);
-            const rec = GM_getValue("Config.pageSweep", null);
-            const bak = GM_getValue("Config.pageSweepBak", null);
-            const count = Math.max(pick(rec), pick(bak));
-            const last = Math.max((rec && Number(rec.lastAt)) || 0, (bak && Number(bak.lastAt)) || 0);
-            // v4.4.6：限额拒绝路径也要诊断发声——配额用尽当天若无任何页面领取信号，
-            // 每天点名一次"页面脚本未安装/未执行"（SW 每轮重启，若不在此处发声，
-            // 配额烧完的日子诊断永远轮不到）。冷却拒绝保持静默（近期开页可能在途）。
-            if (count >= PAGE_SWEEP_MAX_PER_DAY || Date.now() - last < PAGE_SWEEP_COOLDOWN_MS) {
-                if (count >= PAGE_SWEEP_MAX_PER_DAY) {
-                    const hintShown = GM_getValue("Config.pageClaimHintShown", null);
-                    if (!(hintShown && hintShown.date === today)) {
-                        const seen = await this._readPageClaimSeenCookie();
-                        if (!seen) {
-                            GM_setValue("Config.pageClaimHintShown", { date: today });
-                            Utils.log("🟡", "⚠️ 开页代领已达当日上限且从未检测到《页面领取》脚本的执行信号——该脚本很可能未安装/未启用。请在 rewards.bing.com 页面确认脚本猫菜单含「🧾 页面领取状态（本页）」，没有则安装《微软积分商城签到-页面领取》v4.4.0+");
-                        }
-                    }
-                }
-                return false;
-            }
-            try {
-                // v4.4.6：信号基线持久化到存储——此前存内存，SW 每轮 cron 都是全新
-                // 实例，基线跨轮即失，信号诊断从未发声（v4.4.4/v4.4.5 设计缺陷）。
-                const baselineSeen = await this._readPageClaimSeenCookie();
-                GM_setValue("Config.pageClaimBaseline", { seen: baselineSeen, kickedAt: Date.now() });
-                const next = { date: today, count: count + 1, lastAt: Date.now() };
-                GM_setValue("Config.pageSweep", next);
-                GM_setValue("Config.pageSweepBak", next);
-                const after = GM_getValue("Config.pageSweep", null);
-                if (!after || Number(after.count) !== next.count) {
-                    Utils.log("🟡", `开页代领账本回读异常（期望 count=${next.count}，实际=${after && after.count}）——存储写入未持久化，限次/冷却门可能失效`);
-                }
-                const opened = GM_openInTab(PAGE_SWEEP_URL, { active: false, insert: true });
-                setTimeout(() => { try { if (opened && opened.close) opened.close(); } catch (_) {} }, PAGE_SWEEP_TAB_LIFETIME_MS);
-                Utils.log("🟡", `边缘拦截，已开 rewards 页交由《页面领取》脚本代领(${reason})，${Math.round(PAGE_SWEEP_TAB_LIFETIME_MS / 1000)} 秒后自动关闭（今日第 ${next.count}/${PAGE_SWEEP_MAX_PER_DAY} 次）`);
-                return true;
-            } catch (e) {
-                Utils.log("🟡", `开页代领失败(${reason}): ${e.message}`);
-                return false;
-            }
-        },
 
-        // v4.4.4：读取页面领取脚本的活动信号 cookie（页面脚本每次清扫后写
-        // bw_page_claim_seen=<ts>；cookie 同源共享、不依赖跨脚本存储桥，是
-        // 后台 SW 唯一能读到的页面侧执行凭证）。无信号返回 0。
-        _readPageClaimSeenCookie() {
-            return new Promise(resolve => {
-                try {
-                    GM_cookie("list", { url: "https://rewards.bing.com/" }, (cookies) => {
-                        const list = Array.isArray(cookies) ? cookies : (cookies && cookies.cookies) || [];
-                        const hit = list.find(c => c && c.name === "bw_page_claim_seen");
-                        resolve(hit ? (Number(hit.value) || 0) : 0);
-                    });
-                } catch (_) { resolve(0); }
-            });
-        },
 
-        // v4.4.4：解读页面脚本活动信号——闭环断点定位。返回提示文案，null = 信号正常。
-        // v4.4.6：preKickLastAt 语义改为"上次开页时刻"（kickedAt）——信号时间戳晚于
-        // 开页时刻即视为页面脚本在上次开页后执行过（正常），早于则点名断点。
-        _pageClaimSignalHint(seen, preKickLastAt) {
-            if (!seen) {
-                return "⚠️ 未检测到《页面领取》脚本的执行信号——后台开页代领依赖它完成页面内领取。请确认已安装并启用《微软积分商城签到-页面领取》v4.4.0+；可在 rewards.bing.com 页面菜单「🧾 页面领取状态（本页）」查看是否注入";
-            }
-            if (preKickLastAt && seen < preKickLastAt) {
-                return "⚠️ 上次开页后页面领取脚本未再执行（活动信号早于上次开页）——标签页可能被浏览器节流或脚本已停用；可在 rewards 页手动点「▶️ 立即领取（本页）」验证";
-            }
-            return null;
-        },
 
         // 今日任务是否全部完成（用于空闲短路）。搜索受限日也会被计入"已完成"，
         // 因为受限本身意味着当日停止搜索，避免重复触发风控。
@@ -3978,9 +3528,6 @@ Notice:
                 }
             }, RUN_LOCK_HEARTBEAT_MS);
             RewardsAuto.state.startTime = Utils.getTimestamp();
-            // v4.4.0：边缘拦截开页代领标记为轮内内存态，每轮入口显式归零
-            RewardsAuto.state.dailySetEdgeBlocked = false;
-            RewardsAuto.state.promosEdgeBlocked = false;
             Utils.log("🚀", "启动全能自动化任务...");
             this.init();
 
@@ -4074,8 +3621,7 @@ Notice:
                 await Utils.randomDelay();
             }
 
-            // doPromos 也走 runOnce：其失败语义（扫描失败/部分未确认）由"连续 N 次放弃"计数
-            // 跨轮次处理，一轮内 withRetry 会把放弃计数单轮冲到 3 并对未确认卡片重复全量上报。
+            // v4.5.0：doPromos 为提醒模式（扫描→当日一次提醒），失败仅扫描失败下轮重试。
             await runOnce(() => this.doPromos(), "活动卡片");
             await Utils.randomDelay();
 
@@ -4089,9 +3635,7 @@ Notice:
             const dailySetOk = await runOnce(() => this.doDailySet(), "每日活动");
             if (dailySetOk === false) {
                 // 记录跨轮次失败次数用于诊断，但不伪造"已完成"状态。
-                // v4.3.0：结构改为 {date, count}（以当日 dateNowNum 为键，跨日自动重置），
-                // 当日连续失败达 DAILY_SET_GIVE_UP_AFTER 时当日放弃（下一轮
-                // doDailySet 入口门直接返回 true），不再每 20 分钟全量重试。
+                // {date, count} 以当日 dateNowNum 为键跨日自动重置；达上限当日放弃。
                 const savedFailRec = GM_getValue("Config.dailySetFail", null);
                 const failRec = savedFailRec && typeof savedFailRec === "object"
                     ? savedFailRec
@@ -4104,8 +3648,7 @@ Notice:
                     Utils.log("🟡", `每日活动本轮未能确认完成（连续 ${fails} 轮），保留待重试状态`);
                 }
             } else if (dailySetOk === true) {
-                // 成功清零，对齐 {date, count} 结构（含 doDailySet 入口放弃门返回 true
-                // 的情形——保持记录日期为当日，不影响次日重置判定）
+                // 成功清零（对齐 {date, count} 结构）
                 GM_setValue("Config.dailySetFail", { date: RewardsAuto.state.dateNowNum, count: 0 });
             }
 
@@ -4120,67 +3663,43 @@ Notice:
                 Utils.log("🟡", `领取积分执行异常: ${e.message}`);
             }
 
-            // 二次扫描机制（来自Python版）：完成一轮任务后再次扫描新解锁的卡片
-            Utils.log("🔄", "二次扫描：检查是否有新解锁的卡片...");
+            // v4.5.0：二次扫描仅自动领取每日活动卡（Gamification_DailySet，DAPI
+            // App 上报通道正常）；活动卡/欢迎积分已改提醒模式，不再领取。
+            // v4.5.1：claimCard 已随活动卡自动领取一并退役，改走 doDailySet 的
+            // DAPI App 上报通道（appActivity(101, offerId)），与主路径同一判据——
+            // p:0 + isDuplicate:false 为服务端静默吸收（非入账），不算成功。
+            Utils.log("🔄", "二次扫描：检查是否有新解锁的每日活动...");
             await Utils.randomDelay(3000, 8000);
             const newCards = await API.discoverCards();
             if (newCards === null) {
                 Utils.log("🟡", "二次扫描失败，稍后由下次运行继续检查");
-            } else if (newCards.length > 0) {
-                Utils.log("🧩", `二次扫描发现 ${newCards.length} 个新卡片`);
-                let ok = 0, fail = 0;
-                const claimedIds = new Set();
-                const failedIds = [];
-                // 与 doPromos 一致：当日已放弃的卡片不再重复上报
-                const giveUpIds = this._givenUpOfferIds();
-                for (const card of newCards) {
-                    if (giveUpIds.has(card.offerId)) continue;
-                    Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
-                    if (card.kind === "quiz" && !GM_getValue("Tasks.quiz", true)) continue;
-                    await Utils.randomDelay(3000, 8000);
-                    const result = await API.claimCard(card);
-                    result ? ok++ : fail++;
-                    if (result) claimedIds.add(card.offerId);
-                    else failedIds.push(card.offerId);
-                }
-                // v4.1.1：与 doPromos 同语义——失败卡计入放弃账本；仍有失败且未达
-                // 上限的卡片时重置 promosDate（下轮重试），达上限的当日放弃、不再阻塞落账。
-                const secondGivenUp = this._recordFailedClaims(failedIds);
-                // v4.4.2：二次扫描同样边缘拦截优先——与 doPromos 主路径同款开页代领，
-                // 否则拦截轮在此处静默收尾（18:04 日志的"二次扫描完成: 0成功/1失败"）。
-                if (RewardsAuto.state.promosEdgeBlocked) {
-                    const kicked = await this._kickPageSweep("二次扫描");
-                    if (kicked) {
-                        this.promosDate = 0;
-                        this.save();
-                        Utils.log("🟡", "二次扫描被边缘拦截，已开页代领，下轮复核");
-                    }
-                }
-                const secondPending = failedIds.filter(id => !secondGivenUp.includes(id));
-                if (secondPending.length > 0) {
-                    this.promosDate = 0;
-                    this.save();
-                }
-                // 与 doPromos 相同的领取后复核：2xx 不等于到账。
-                // 未确认卡片计入放弃计数；仅当仍有未达上限的未确认卡时才重置 promosDate
-                //（交回 doPromos 的重试/放弃机制处理），达上限的当日放弃、不再阻塞落账，
-                // 避免"二次扫描领取未到账→当日被永久跳过"的缺口。
-                if (claimedIds.size > 0) {
-                    await Utils.randomDelay(4000, 8000);
-                    // 复核必须绕过轮内缓存（fresh），同 doPromos
-                    const recheck = await API.discoverCards({ fresh: true });
-                    if (Array.isArray(recheck)) {
-                        const { retryable } = this._countUnconfirmed(recheck, claimedIds);
-                        if (retryable.length > 0) {
-                            this.promosDate = 0;
-                            this.save();
-                        }
-                    }
-                }
-                Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
             } else {
-                Utils.log("✅", "二次扫描：无新卡片");
+                const dailyCards = newCards.filter(c => /^Gamification_DailySet/i.test(c.offerId));
+                if (dailyCards.length > 0) {
+                    Utils.log("🧩", `二次扫描发现 ${dailyCards.length} 个每日活动卡`);
+                    let ok = 0, fail = 0;
+                    if (RewardsAuto.state.token) {
+                        for (const card of dailyCards) {
+                            Utils.log("  ", `[${card.kind}] ${card.title} +${card.points}p`);
+                            await Utils.randomDelay(2000, 4000);
+                            const r = await API.appActivity(101, card.offerId, true);
+                            if (r && (r.points > 0 || r.isDuplicate)) {
+                                Utils.log("📅", `每日活动 App上报: ${card.offerId} +${r.points}p${r.isDuplicate ? "（已入账）" : ""}`);
+                                ok++;
+                            } else {
+                                fail++;
+                            }
+                        }
+                    } else {
+                        fail = dailyCards.length;
+                        Utils.log("🟡", "无 Token，二次扫描每日活动无法 App 上报，下轮重试");
+                    }
+                    Utils.log("🔵", `二次扫描完成: ${ok}成功/${fail}失败`);
+                } else {
+                    Utils.log("✅", "二次扫描：无新每日活动卡");
+                }
             }
+
 
             // 任务完成汇总
             const endTime = Utils.getTimestamp();
@@ -4242,7 +3761,7 @@ Notice:
             // SW 环境 / 用户取消：无法区分，统一给出面板指引通知
             try {
                 GM_notification({
-                    text: "后台界面无法弹输入框。请在 ScriptCat 脚本设置的「授权码链接」文本框粘贴 login.live.com 跳转后的完整 URL 并保存；或在浏览器打开授权页完成授权（页面脚本会自动捕获）。",
+                    text: "后台界面无法弹输入框。请在 ScriptCat 脚本设置的「授权码链接」文本框粘贴 login.live.com 跳转后的完整 URL 并保存，或在浏览器打开授权页完成授权后粘贴跳转 URL。",
                     title: "📋 粘贴授权码指引", timeout: 0
                 });
             } catch (_) {}
@@ -4392,8 +3911,8 @@ Notice:
     });
 
     // v4.4.0：🩺 只读诊断——零写操作，逐层展开"日常卡片完成不了"的判定依据：
-    // 数据源（getuserinfo/flyout/flight）、每日活动清单与状态、action ID 解析链、
-    // cookie 链、开页代领账本。排查时点这个，把弹窗内容/脚本日志贴给维护者即可。
+    // 数据源（getuserinfo/flyout/flight）、每日活动清单与状态、cookie 链、
+    // 提醒账本。排查时点这个，把弹窗内容/脚本日志贴给维护者即可。
     GM_registerMenuCommand("🩺 日常卡片诊断", async () => {
         const lines = [];
         try {
@@ -4426,31 +3945,13 @@ Notice:
                 lines.push(`  - ${id}: ${o.isCompleted ? "✅已完成" : o.isLocked ? `🔒锁定(${o.unlockCriteria || "?"})` : "⬜可领取"}${o.hash ? ` hash=${o.hash.slice(0, 10)}…` : " 无hash"}`);
             }
 
-            // 4) action ID 解析链
-            const resolved = await API._resolveReportActivityActionId();
-            lines.push(`【Action ID】${resolved ? `✅ ${resolved.slice(0, 16)}…` : "❌ 未能从 chunk 解析（将用兜底值，若站点已改版则失效）"} dpl=${API._currentDpl() || "?"}`);
+            // 4) 领取方式说明（v4.5.1 提醒模式）
+            lines.push("【领取方式】v4.5.1 起活动卡/欢迎积分为提醒模式（当日一次），请打开 rewards.bing.com 手动领取；每日活动仍自动完成；本诊断不再解析 action ID");
 
-            // 5) 开页代领账本 + 页面脚本执行信号
-            const sweep = GM_getValue("Config.pageSweep", null);
-            const sweepBak = GM_getValue("Config.pageSweepBak", null);
+            // 5) 提醒账本状态（v4.5.1）
             const today = RewardsAuto.state.dateNowNum;
-            const sweepCount = Math.max((sweep && sweep.date === today && Number(sweep.count)) || 0, (sweepBak && sweepBak.date === today && Number(sweepBak.count)) || 0);
-            lines.push(`【开页代领】今日已开 ${sweepCount}/${PAGE_SWEEP_MAX_PER_DAY} 次；每日活动完成判据: ${GM_getValue("Config.dailySetDone", 0) === today ? "✅" : "❌ 未完成"}`);
-            try {
-                const seen = await new Promise(resolve => {
-                    try {
-                        GM_cookie("list", { url: "https://rewards.bing.com/" }, (cookies) => {
-                            const list = Array.isArray(cookies) ? cookies : (cookies && cookies.cookies) || [];
-                            const hit = list.find(c => c && c.name === "bw_page_claim_seen");
-                            resolve(hit ? (Number(hit.value) || 0) : 0);
-                        });
-                    } catch (_) { resolve(0); }
-                });
-                const agoMin = seen ? Math.max(0, Math.round((Date.now() - seen) / 60000)) : -1;
-                lines.push(`【页面领取信号】${seen ? `✅ ${agoMin} 分钟前执行过清扫（cookie 10 分钟有效）` : "❌ 无信号——《页面领取》脚本未安装/未启用，或 10 分钟内未在 rewards 页执行过清扫"}（v4.4.4+）`);
-            } catch (_) {
-                lines.push("【页面领取信号】（此环境无法读取 cookie，跳过）");
-            }
+            const notify = GM_getValue("Config.claimNotify", null);
+            lines.push(`【提醒账本】${notify && notify.date === today ? `今日已提醒：${Object.keys(notify.kinds || {}).join("、") || "（无类目）"}` : "今日尚未提醒"}；每日活动完成判据: ${GM_getValue("Config.dailySetDone", 0) === today ? "✅" : "❌ 未完成"}`);
 
             lines.push("", "— 以上为只读探测，未发送任何领取请求 —");
         } catch (e) {
