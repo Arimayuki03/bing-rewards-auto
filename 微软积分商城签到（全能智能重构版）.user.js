@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.5.1
-// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅搜索、✅每日活动自动完成（DAPI App 上报）、✅连签检测、✅积分通知；v4.5.1：/earn 活动卡片与 dashboard 欢迎积分改为提醒模式——发现可领取时当日提醒一次（浏览器通知+webhook），由用户打开 rewards.bing.com 手动领取（SW 直发 Server Action 被边缘 503 结构性拦截，自动领取退役）；单脚本文件，无页面领取组件；历史缺陷修复记录见改动与待办记录.md
+// @version      4.5.4
+// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅搜索、✅每日活动自动完成（DAPI App 上报）、✅连签检测、✅积分通知；v4.5.1：/earn 活动卡片与 dashboard 欢迎积分改为提醒模式——发现可领取时当日提醒一次（浏览器通知+webhook），由用户打开 rewards.bing.com 手动领取（SW 直发 Server Action 被边缘 503 结构性拦截，自动领取退役）；v4.5.4：修复设置面板「授权码链接」输入框在授权码用掉后变空——Config.code 曾同时充当"输入框显示值"与"待消费一次性凭据"，后者按设计必须在换取后清空，输入框因此必然跟着被清空；现改为 Config.code 只作显示值永久保留，"是否已用过"另存指纹 Config.codeUsed，同一份授权码不会被反复重试（顺带根治 v4.5.0 每 20 分钟重演的 Token 死循环）；v4.5.3：修复每日活动卡未完成被静默剔除不提醒——自动通道放弃后降级为手动领取提醒、等待期不提前结账；二次扫描改 fresh 抓取修复同轮缓存重报误报；修复 give-up 计数被成功分支误清零；单脚本文件，无页面领取组件；历史缺陷修复记录见改动与待办记录.md
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -76,7 +76,8 @@ Config:
     code:
         title: 授权码链接
         type: textarea
-        description: 粘贴 login.live.com 跳转后的完整URL
+        description: 粘贴 login.live.com 跳转后的完整URL（换取成功后仍保留，可随时查看/重贴）
+        rows: 3
 Tasks:
     sign:
         title: 每日签入
@@ -859,6 +860,49 @@ Notice:
         }
     };
 
+    // 授权码凭据管理（v4.5.4）
+    //
+    // 「设置面板输入框里看不到自己粘贴的授权码」的根因不是渲染，而是键的语义混用：
+    // `Config.code` 同时被当成"用户输入框的显示值"和"待消费的一次性凭据"，而一次性
+    // 凭据按设计必须在换取成功后清空——于是输入框必然跟着变空。消费与显示两个互不
+    // 相容的诉求压在同一个键上，谁都满足不了。
+    //
+    // 解法：把"凭据是否已用过"这件事从值本身剥离，另存一份指纹。
+    //   - `Config.code` 永远保留用户粘贴的原文（输入框始终可见，可自查、可复用）；
+    //   - `Config.codeUsed` 只存"已用过凭据的指纹"，不再动 `Config.code` 本身。
+    // 由此：输入框不再被清空（本轮缺陷）；同一份死授权码不会每 20 分钟被重试一次
+    //（v4.5.0 死循环的根因，回滚到 v4.4.6 后一直未修）；用户换了新授权码时指纹随之
+    // 变化，不会被旧记录误拦；想让同一份再试一次，用「🔁 强制用授权码换取新Token」
+    // 清掉指纹即可。
+    const AuthCode = {
+        // 指纹取解析后的授权码本体：同一个 code 无论以完整 URL 还是纯值形态粘贴，
+        // 指纹都一致，不会因为粘贴形态不同而绕过"已用过"判据。
+        fingerprint(rawCode) {
+            const parsed = Utils.parseAuthCode(rawCode);
+            return parsed ? parsed.code : "";
+        },
+
+        isConsumed(rawCode) {
+            const fp = this.fingerprint(rawCode);
+            return !!fp && GM_getValue("Config.codeUsed", "") === fp;
+        },
+
+        // 登记"这份凭据已经用掉了"。注意动的只是指纹记录，`Config.code` 原文保留——
+        // 输入框继续显示用户粘贴的内容，这是本轮修复的核心。
+        markConsumed(rawCode) {
+            const fp = this.fingerprint(rawCode);
+            if (fp) GM_setValue("Config.codeUsed", fp);
+        },
+
+        // 给诊断/菜单用的可读状态
+        status() {
+            const raw = GM_getValue("Config.code", "");
+            if (!raw) return "无";
+            if (!Utils.parseAuthCode(raw)) return "有（无法解析——请重新粘贴完整跳转 URL）";
+            return this.isConsumed(raw) ? "有（已用过，请重新授权）" : "有（可解析）";
+        },
+    };
+
     const API = {
         async getToken(tokenParams, maxRetries = 3) {
             for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -1136,18 +1180,23 @@ Notice:
                 Utils.log("🟡", `${msg}，尝试获取授权码...`);
 
                 // 优先检查用户是否已提前粘贴授权码（脚本设置或授权页自动捕获），有则直接用
-                // v4.4.3：不再预清空 Config.code——预清空在"用户刚在设置面板保存、
-                // 后台轮次先启动"的竞态里会把刚保存的值抹掉（"粘贴后提示已保存，回
-                // 头一看没了"的直接来源）。无效值留着无害：所有消费点都经
-                // parseAuthCode 校验，换取成功后由唯一清理点收走。
+                // v4.5.4：凭据的"是否已消费"由 AuthCode 的指纹判定，不再靠清空
+                // Config.code 表达——输入框因此始终保留用户粘贴的原文。同一份已消费
+                // 的授权码不会被反复重试（v4.5.0 死循环根因）。
                 const existing = GM_getValue("Config.code", "");
                 if (existing) {
-                    const parsed = Utils.parseAuthCode(existing);
-                    if (parsed) {
-                        Utils.log("🟢", "检测到已保存的授权码，直接使用");
-                        return parsed.code;
+                    if (AuthCode.isConsumed(existing)) {
+                        Utils.log("🟡", "已保存的授权码已用过，等待新的授权码");
+                    } else {
+                        const parsed = Utils.parseAuthCode(existing);
+                        if (parsed) {
+                            Utils.log("🟢", "检测到已保存的授权码，直接使用");
+                            // 连同原始输入一并返回：换取结果只应给这份原文记指纹，
+                            // 不能误伤用户在请求在途时重新粘贴的新值。
+                            return { code: parsed.code, raw: existing };
+                        }
+                        Utils.log("🟡", "已保存的授权码无法解析，等待重新粘贴");
                     }
-                    Utils.log("🟡", "已保存的授权码无法解析，等待重新粘贴");
                 }
 
                 if (!isBackground) {
@@ -1166,7 +1215,7 @@ Notice:
                         const code = new URL(res.finalUrl || "").searchParams.get("code");
                         if (code) {
                             Utils.log("🟢", "自动获取授权码成功");
-                            return code;
+                            return { code, raw: code };
                         }
                     } catch (e) {
                         Utils.log("🟡", `自动获取失败: ${e.message}`);
@@ -1188,14 +1237,16 @@ Notice:
                 }
 
                 // 等待用户粘贴或授权页自动捕获授权码（最长 90 秒，避免 crontab 超时被终止）
+                // v4.5.4：跳过"已用过"的授权码——用户换填新授权码时指纹不同，1 秒内即可被接受。
                 for (let i = 0; i < 90; i++) {
                     await Utils.delay(1000);
                     const raw = GM_getValue("Config.code", "");
                     if (!raw) continue;
+                    if (AuthCode.isConsumed(raw)) continue;
                     const parsed = Utils.parseAuthCode(raw);
                     if (parsed) {
                         Utils.log("🟢", "授权码获取成功");
-                        return parsed.code;
+                        return { code: parsed.code, raw };
                     }
                 }
                 Utils.log("🔴", "授权码获取超时", true);
@@ -1237,8 +1288,9 @@ Notice:
                 }
 
                 // 无 refreshToken，通过授权码换取 token
-                const code = await fetchCode(attempt === 0 ? "需要授权码" : "上次授权码已失效，请重新授权");
-                if (!code) return false;
+                const got = await fetchCode(attempt === 0 ? "需要授权码" : "上次授权码已失效，请重新授权");
+                if (!got) return false;
+                const { code, raw: rawCode } = got;
 
                 const params = {
                     client_id: "0000000040170455",
@@ -1247,19 +1299,21 @@ Notice:
                     grant_type: "authorization_code"
                 };
                 if (await this.getToken(params)) {
-                    // 一次性授权码已消费，及时清理明文残留。v4.4.3：仅当存储值仍是
-                    // 本轮消费的这份（或已空）才清——用户在换取期间重新粘贴的新值
-                    // 不得被旧轮次的清理抹掉。
-                    const cur = GM_getValue("Config.code", "");
-                    if (!cur || cur === code || (cur.includes("code=") && Utils.parseAuthCode(cur)?.code === code)) {
-                        GM_setValue("Config.code", "");
-                    }
+                    // v4.5.4：换取成功只给"本轮真正消费的这份"记指纹，绝不清空
+                    // Config.code——那个键是设置面板输入框的显示值，清掉就是
+                    // "粘贴后回头一看没了"。凭据不会被二次使用的保证由指纹承担。
+                    // 记 rawCode（本轮读到的原文）而非当前存储值：换取在途时用户
+                    // 重新粘贴的新值不得被误标为已用过。
+                    AuthCode.markConsumed(rawCode);
                     Utils.log("🟢", "Token获取成功！", true);
                     return true;
                 }
-                // 授权码失效。v4.4.3：不再无条件清空 Config.code——失效的可能是
-                // refresh_token（grant 无关），且无法区分"这份 code 坏了"与"用户
-                // 刚粘贴了新值"；保留下次重新解析/由用户覆盖，Token 状态菜单可见。
+                // 换取失败：把这份授权码标记为已用过。v4.5.0 死循环的直接成因就是
+                // 失败后仍保留同一份死值、每 20 分钟重演一遍「检测到已保存的授权码」
+                // → invalid_grant。标记后本轮后续 attempt 与后续轮次都不会再拿它重试，
+                // 转而打开授权页请用户重新授权；用户换填新授权码时指纹不同，立即生效。
+                // Config.code 原文依旧保留不动。
+                AuthCode.markConsumed(rawCode);
                 GM_setValue("Config.token", false);
             }
 
@@ -2037,7 +2091,10 @@ Notice:
 
                 // ---------- 方法0: getuserinfo 结构化数据 ----------
                 try {
-                    const data = await this._getUserInfo();
+                    // v4.5.3：透传 fetchOpts——二次扫描传 fresh 时 getuserinfo 也必须
+                    // 绕过轮内缓存，否则读到的仍是 App 上报前的完成状态快照
+                    //（flyout 兜底本就透传，此处对齐）。
+                    const data = await this._getUserInfo(fetchOpts);
                     if (data) {
                         const dashboard = data.dashboard || data;
                         const todayKeys = new Set(Utils.dateKeysFromRunDay(RewardsAuto.state.dateNowNum));
@@ -2641,8 +2698,45 @@ Notice:
                 Utils.log("✅", "可领卡片均为已关闭的 Quiz 类，跳过提醒");
                 return true;
             }
-            await this.notifyClaimables("活动卡片", claimable);
-            this.promosDate = RewardsAuto.state.dateNowNum;
+            // v4.5.2：每日活动卡（Gamification_DailySet_*）由 doDailySet 与二次扫描
+            // 的 DAPI App 通道自动完成，不属于用户手动领取范围——从提醒清单剔除，
+            // 判据与二次扫描 filter 同一正则（2026-10-01 00:21 实测：6 项提醒中
+            // 3 项正是随后 App 上报完成的每日活动，混入提醒误导用户）。
+            // v4.5.3：剔除不得连带当日结账——自动通道依赖 Token/DAPI，可能整日
+            // 失败（2026-10-02 00:03 实测：扫描时 3 张每日活动卡未完成即被剔除并
+            // 结账，promosDate 此后每轮跳过重扫；一旦 App 上报链路失败到当日放弃，
+            // 卡片静默丢失整天、零提醒）。改为按自动通道状态分流：
+            //   已完成（Config.dailySetDone，DAPI fresh 复核）→ 剔除并结账；
+            //   当日放弃（fails ≥ DAILY_SET_GIVE_UP_AFTER）→ 降级为"每日活动"类目
+            //     手动领取提醒（独立 key，避免被"活动卡片"同类目当日去重吞掉）；
+            //   仍在重试 → 暂不提醒也不结账，promosDate 保持打开，下轮重扫——
+            //     卡片入账后 isCompleted 过滤使其自然从扫描中消失，届时正常结账；
+            //     手动卡的重复提醒由 notifyClaimables 同类目当日去重兜住。
+            const today = RewardsAuto.state.dateNowNum;
+            const dailySet = claimable.filter(c => /^Gamification_DailySet/i.test(c.offerId));
+            const manual = claimable.filter(c => !/^Gamification_DailySet/i.test(c.offerId));
+            let dailyWait = false;
+            if (dailySet.length > 0) {
+                if (GM_getValue("Config.dailySetDone", 0) === today) {
+                    Utils.log("🧩", `${dailySet.length} 个每日活动卡已由脚本自动完成（DAPI 复核），不进提醒清单`);
+                } else {
+                    const failRec = GM_getValue("Config.dailySetFail", null);
+                    const fails = failRec && typeof failRec === "object" && failRec.date === today
+                        ? (Number(failRec.count) || 0) : 0;
+                    if (fails >= DAILY_SET_GIVE_UP_AFTER) {
+                        Utils.log("🟡", `每日活动自动完成当日已连续失败 ${fails} 轮（达上限），降级为手动领取提醒`);
+                        await this.notifyClaimables("每日活动", dailySet);
+                    } else {
+                        dailyWait = true;
+                        Utils.log("🧩", `${dailySet.length} 个每日活动卡待脚本自动完成（自动通道第 ${fails + 1} 轮），暂不提醒，下轮复核`);
+                    }
+                }
+            }
+            if (manual.length > 0) {
+                await this.notifyClaimables("活动卡片", manual);
+            }
+            if (dailyWait) return true; // 每日活动待自动完成：不结账，下轮重扫
+            this.promosDate = today;
             this.save();
             return true;
         },
@@ -3625,6 +3719,18 @@ Notice:
             await runOnce(() => this.doPromos(), "活动卡片");
             await Utils.randomDelay();
 
+            // v4.5.2：欢迎积分提醒从管线末尾（打卡之后）前移至此——原来它是 runAll
+            // 最后一个任务，其 claimNotify 账本写入落在运行尾段；SW 被回收时 finally
+            // 都未执行（2026-10-01 实测：运行锁直到 20 分钟后仍显示未释放），尾段写入
+            // 随实例一起丢失，下一轮重复提醒。前移后写入远离丢失窗口，且与 promosDate
+            // 一样处于轮中段（实测跨轮完好）。
+            try {
+                await this.doClaimPoints();
+            } catch (e) {
+                Utils.log("🟡", `欢迎积分检测异常: ${e.message}`);
+            }
+            await Utils.randomDelay();
+
             await runOnce(() => this.doSearch(), "搜索");
 
             // 连签任务检测
@@ -3648,20 +3754,23 @@ Notice:
                     Utils.log("🟡", `每日活动本轮未能确认完成（连续 ${fails} 轮），保留待重试状态`);
                 }
             } else if (dailySetOk === true) {
-                // 成功清零（对齐 {date, count} 结构）
-                GM_setValue("Config.dailySetFail", { date: RewardsAuto.state.dateNowNum, count: 0 });
+                // 成功清零（对齐 {date, count} 结构）。
+                // v4.5.3：give-up 分支同样返回 true（放弃语义），不得触发清零——
+                // 否则"当日放弃"被撤销、下一轮重新全量重试，5 轮失败→放弃→清零
+                // 循环往复，doPromos 的降级提醒判据（fails ≥ 上限）随之失效。
+                const failRec = GM_getValue("Config.dailySetFail", null);
+                const givingUp = !!(failRec && typeof failRec === "object" &&
+                    failRec.date === RewardsAuto.state.dateNowNum &&
+                    (Number(failRec.count) || 0) >= DAILY_SET_GIVE_UP_AFTER);
+                if (!givingUp) GM_setValue("Config.dailySetFail", { date: RewardsAuto.state.dateNowNum, count: 0 });
             }
 
             // 打卡任务（后台 XHR 模拟点击子任务链接）
             await Utils.randomDelay();
             await runOnce(() => this.doPunchCard(), "打卡任务");
 
-            // 领取待领取积分
-            try {
-                await this.doClaimPoints();
-            } catch (e) {
-                Utils.log("🟡", `领取积分执行异常: ${e.message}`);
-            }
+            // v4.5.2：doClaimPoints 已前移至搜索前——尾段写入会随 SW 回收一起丢失，
+            // 导致 claimNotify 账本漏记、欢迎积分下一轮重复提醒。
 
             // v4.5.0：二次扫描仅自动领取每日活动卡（Gamification_DailySet，DAPI
             // App 上报通道正常）；活动卡/欢迎积分已改提醒模式，不再领取。
@@ -3670,7 +3779,11 @@ Notice:
             // p:0 + isDuplicate:false 为服务端静默吸收（非入账），不算成功。
             Utils.log("🔄", "二次扫描：检查是否有新解锁的每日活动...");
             await Utils.randomDelay(3000, 8000);
-            const newCards = await API.discoverCards();
+            // v4.5.3：必须 fresh——同一轮内 doDailySet 刚完成 App 上报，getuserinfo
+            // 与 /earn 的轮内缓存仍是上报前快照，会把刚入账的卡再扫出来重报
+            //（2026-10-02 00:07 实测：00:07:13 三卡已 +10p 入账，00:07:28 二次扫描
+            // 仍命中 3 张并全部重报，误报"0成功/3失败"）。
+            const newCards = await API.discoverCards({ fresh: true });
             if (newCards === null) {
                 Utils.log("🟡", "二次扫描失败，稍后由下次运行继续检查");
             } else {
@@ -3774,6 +3887,8 @@ Notice:
                 return;
             }
             GM_setValue("Config.code", code.trim());
+            // v4.5.4：清掉"已用过"指纹，让刚粘贴的这份立即可用（含重粘同一份的情形）。
+            GM_setValue("Config.codeUsed", "");
             try { alert("已保存！（后台将在需要时自动换取）"); } catch (_) {}
         }
     });
@@ -3794,9 +3909,9 @@ Notice:
             ageStr = parts.join("");
         }
         const tokenDate = time > 0 ? new Date(time).toLocaleString("zh-CN") : "未知";
-        // v4.4.3：授权码显示"有/无 + 可解析性"，排查"粘贴了但没生效"
-        const rawCode = GM_getValue("Config.code", "");
-        const codeStatus = !rawCode ? "无" : (Utils.parseAuthCode(rawCode) ? "有（可解析）" : "有（无法解析——请重新粘贴完整跳转 URL）");
+        // v4.5.4：授权码改为指纹状态——输入框保留原文不变，是否已用过由
+        // AuthCode.status() 判定（"已用过"说明需重新走一遍授权）。
+        const codeStatus = AuthCode.status();
         try {
             alert(`Token: ${token ? "已保存" : "无"}\n获取时间: ${tokenDate}\n已过: ${ageStr}\n授权码: ${codeStatus}`);
         } catch (_) {
@@ -3822,7 +3937,10 @@ Notice:
             return;
         }
         GM_setValue("Config.token", false);
-        Utils.log("🟡", "已清除旧 Token，下一轮将使用粘贴的授权码重新换取（也可点「🚀 立即运行」马上执行）");
+        // v4.5.4：同时清掉"已用过"指纹——否则用户重粘同一份授权码（或想让已用过的
+        // 那份再试一次）会被指纹判据挡住，而输入框又不会变成空的，看不出为什么没生效。
+        GM_setValue("Config.codeUsed", "");
+        Utils.log("🟡", "已清除旧 Token 与授权码使用记录，下一轮将用它重新换取（也可点「🚀 立即运行」马上执行）");
     });
 
     // 通知接口配置菜单
