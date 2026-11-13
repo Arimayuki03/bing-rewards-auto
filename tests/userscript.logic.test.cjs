@@ -333,7 +333,8 @@ test("pointsCounters parsing avoids redundant quota fallbacks", async () => {
     assert.equal(fallbackCalls, 0);
 });
 
-test("pointsCounters without a PC quota still uses the fallback", async () => {
+test("pointsCounters with a mobile-only quota keeps it without a PC fallback", async () => {
+    // v4.6.0：移动端配额是独立积分来源，不能因为 PC 配额缺失就整份丢弃。
     const { API, Utils } = createHarness();
     Utils.xhr = async () => '<script>"pointsCounters":{"mobile":{"max":30,"progress":5}}</script>';
     let fallbackCalls = 0;
@@ -345,9 +346,11 @@ test("pointsCounters without a PC quota still uses the fallback", async () => {
 
     const info = await API.getRewardsInfo(1);
 
-    assert.equal(info.pc.progress, 7);
-    assert.equal(info.pc.max, 60);
-    assert.equal(fallbackCalls, 1);
+    assert.equal(info.pc.progress, 0);
+    assert.equal(info.pc.max, 0, "PC 段缺失时不得伪造 60 分配额，否则 doSearch 会继续跑无效 PC 搜索");
+    assert.equal(info.mobile.progress, 5);
+    assert.equal(info.mobile.max, 30);
+    assert.equal(fallbackCalls, 0, "HTML 已给出移动配额时不得回退并覆盖它");
 });
 
 test("a partial reading batch waits for the next run instead of immediate retry", async () => {
@@ -2135,4 +2138,405 @@ test("init short-circuits without scheduling when everything including the punch
     init();
 
     assert.equal(scheduled.length, 0, "全部完成（含打卡当日）必须短路，零调度");
+});
+
+// ====== v4.6.0：移动搜索 / 真实 IG / 搜索奖励 / Flyout 自动领取 ======
+
+test("extractSearchIg reads the real SERP IG from all observed shapes", () => {
+    const { Utils } = createHarness();
+    const ig = "A1B2C3D4E5F60718293A4B5C6D7E8F90";
+    assert.equal(Utils.extractSearchIg(`<script>IG:"${ig}"</script>`), ig);
+    assert.equal(Utils.extractSearchIg(`<a href="/search?q=x&amp;IG=${ig}">x</a>`), ig);
+    assert.equal(Utils.extractSearchIg(`{"IG":"${ig}"}`), ig);
+    assert.equal(Utils.extractSearchIg("<html></html>"), "");
+});
+
+test("reportSearch uses the SERP IG and parses the ModernRewards receipt", async () => {
+    const { API, Utils } = createHarness();
+    const ig = "A1B2C3D4E5F60718293A4B5C6D7E8F90";
+    const cvid = "B1B2C3D4E5F60718293A4B5C6D7E8F90";
+    const requests = [];
+    Utils.xhr = async options => {
+        requests.push(options);
+        return 'ModernRewards.ReportActivity({"RewardsSessionData":{"Balance":123,"PreviousBalance":120,"DailySearchPointsEarned":7,"DailySearchPointsLimit":60}});';
+    };
+
+    const result = await API.reportSearch("weather today", false, { ig, cvid });
+
+    assert.equal(result.ok, true);
+    assert.equal(result.pointsEarned, 7);
+    assert.equal(result.pointsLimit, 60);
+    const report = requests.find(r => r.url.includes("/reportActivity"));
+    assert.ok(report, "must POST reportActivity");
+    assert.match(report.url, new RegExp("IG=" + ig));
+    assert.match(report.url, new RegExp("cvid=" + cvid));
+    // params 内已 encodeURIComponent 一次，外层再次编码后是 %2520；接受两种形态。
+    assert.match(report.data, /weather(%20|%2520)today/);
+});
+
+test("doSearch completes the mobile quota after PC is already full (v4.6.0)", async () => {
+    const today = 20261113;
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness({
+        "Tasks.search": true,
+        "Tasks.mobile": true,
+        "Tasks.bonus": false,
+    });
+    RewardsAuto.state.dateNowNum = today;
+    const calls = [];
+    API.getRewardsInfo = async (retries, opts) => opts && opts.fresh
+        ? { pc: { progress: 60, max: 60 }, mobile: { progress: 30, max: 30 } }
+        : { pc: { progress: 60, max: 60 }, mobile: { progress: 0, max: 30 } };
+    API.checkSearchRestricted = async () => false;
+    API.getSearchPage = async (q, isMobile, opts) => {
+        calls.push({ kind: "page", isMobile, opts });
+        return `<html>IG:"${"A".repeat(32)}"</html>`;
+    };
+    API.reportSearch = async (q, isMobile, opts) => {
+        calls.push({ kind: "report", isMobile, opts });
+        return { ok: true, pointsEarned: 1, pointsLimit: 30 };
+    };
+    Utils.randomRange = () => 4;
+    Utils.delay = async () => {};
+
+    const result = await TaskManager.doSearch();
+
+    assert.equal(result, true);
+    const mobileReports = calls.filter(c => c.kind === "report" && c.isMobile);
+    assert.equal(mobileReports.length, 4, "PC 已满时必须继续跑移动配额");
+    assert.ok(mobileReports.every(c => c.opts.ig === "A".repeat(32)), "必须原样透传 SERP 返回的真实 IG，而不是随机 UUID");
+    assert.equal(TaskManager.searchDate, today);
+});
+
+test("doSearch runs both PC and mobile quotas in one round", async () => {
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness({
+        "Tasks.search": true,
+        "Tasks.mobile": true,
+        "Tasks.bonus": false,
+    });
+    RewardsAuto.state.dateNowNum = 20261113;
+    const platforms = [];
+    API.getRewardsInfo = async () => ({ pc: { progress: 0, max: 2 }, mobile: { progress: 0, max: 2 } });
+    API.checkSearchRestricted = async () => false;
+    API.getSearchPage = async (q, isMobile) => { platforms.push(isMobile); return "<html></html>"; };
+    API.reportSearch = async () => true;
+    Utils.randomRange = min => min;
+    Utils.delay = async () => {};
+
+    const result = await TaskManager.doSearch();
+
+    assert.equal(result, false);
+    assert.ok(platforms.includes(false), "PC 搜索必须执行");
+    assert.ok(platforms.includes(true), "移动搜索必须执行");
+});
+
+test("getSearchBonusOffers only accepts URLReward cards pointing at bare Bing", async () => {
+    const { API } = createHarness();
+    API._getUserInfo = async () => ({
+        dashboard: {
+            morePromotions: [
+                { offerId: "bonus", title: "搜索3次", pointProgress: 0, pointProgressMax: 3, promotionType: "URLReward", destinationUrl: "https://www.bing.com/?form=QBLH" },
+                { offerId: "done", title: "已完成", pointProgress: 3, pointProgressMax: 3, promotionType: "URLReward", destinationUrl: "https://www.bing.com/" },
+                { offerId: "nonbare", title: "搜索页", pointProgress: 0, pointProgressMax: 3, promotionType: "URLReward", destinationUrl: "https://www.bing.com/search?q=x" },
+                { offerId: "notreward", title: "测验", pointProgress: 0, pointProgressMax: 3, promotionType: "quiz", destinationUrl: "https://www.bing.com/" },
+                { offerId: "locked", title: "仅App", pointProgress: 0, pointProgressMax: 3, promotionType: "URLReward", isLocked: true, destinationUrl: "https://www.bing.com/" },
+                // 跨池重复：morePromotions 里缺 promotionType，promotionalItems 里完整。
+                // 旧实现先 seen.add 会把完整条目吞掉；v4.6.0 改为过滤通过后再去重。
+                { offerId: "split", title: "跨池卡", pointProgress: 0, pointProgressMax: 2, destinationUrl: "https://www.bing.com/" },
+            ],
+            promotionalItems: [
+                { offerId: "split", title: "跨池卡", pointProgress: 0, pointProgressMax: 2, promotionType: "URLReward", destinationUrl: "https://www.bing.com/" },
+            ],
+        },
+    });
+
+    const offers = await API.getSearchBonusOffers();
+
+    assert.equal(offers.map(o => o.offerId).join(","), "bonus,split");
+    assert.equal(offers[0].points, 3);
+    assert.ok(!offers.some(o => o.offerId === "locked"), "锁定卡无法通过网页搜索推进，必须排除");
+});
+
+test("getSearchBonusOffers keeps null when the dashboard exposes no promotion containers (v4.6.0)", async () => {
+    const { API } = createHarness();
+    API._getUserInfo = async () => ({ dashboard: { userStatus: { availablePoints: 10 } } });
+
+    assert.equal(await API.getSearchBonusOffers(), null, "无任何 promotion 容器时必须保持不可用语义");
+});
+
+test("doSearch runs bonus searches when the main quotas are already complete", async () => {
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness({
+        "Tasks.search": true,
+        "Tasks.mobile": false,
+        "Tasks.bonus": true,
+    });
+    RewardsAuto.state.dateNowNum = 20261113;
+    let bonusChecks = 0;
+    let searches = 0;
+    API.getRewardsInfo = async () => ({ pc: { progress: 60, max: 60 }, mobile: { progress: 0, max: 0 } });
+    API.getSearchBonusOffers = async () => {
+        bonusChecks++;
+        return bonusChecks === 1
+            ? [{ offerId: "bonus", title: "搜索3次", progress: 0, max: 2, points: 2 }]
+            : [];
+    };
+    API.getSearchPage = async () => { searches++; return "<html></html>"; };
+    API.reportSearch = async () => true;
+    Utils.randomRange = min => min;
+    Utils.delay = async () => {};
+    Utils.randomDelay = async () => {};
+
+    const result = await TaskManager.doSearch();
+
+    assert.equal(result, true);
+    assert.equal(searches, 2, "搜索奖励按缺口补搜；单卡上限 4 次、单轮上限 6 次");
+    assert.equal(TaskManager.searchDate, 20261113);
+});
+
+test("extractJsonObjectAfter parses the nested flyout view model", () => {
+    const { Utils } = createHarness();
+    const html = '<script>window.flyoutViewModel = {"userId":"u1","channel":"BingFlyout","flyoutResult":{"morePromotions":[{"offerId":"card1","hash":"h1","note":"a } b"}]}};</script>';
+    const model = Utils.extractJsonObjectAfter(html, "window.flyoutViewModel");
+    assert.equal(model.userId, "u1");
+    assert.equal(model.flyoutResult.morePromotions[0].hash, "h1");
+});
+
+test("claimCardViaFlyout posts the flyout card AuthKey and user id", async () => {
+    const { API, Utils } = createHarness();
+    let request;
+    Utils.cookieHeaderFor = async () => "MUID=cookie-value";
+    Utils.xhr = async options => {
+        request = options;
+        return JSON.stringify({ ErrorDetail: { ErrorCode: 0 }, OfferComplete: true, EarnedCredits: 15 });
+    };
+    const model = {
+        userId: "user-1",
+        channel: "BingFlyout",
+        partnerId: "BingRewards",
+        flyoutResult: { morePromotions: [{ offerId: "card1", hash: "flyout-hash", activityType: "bingredirect", promotionSubtype: "sub" }] },
+    };
+
+    const result = await API.claimCardViaFlyout({ offerId: "card1", hash: "old-hash", points: 15, title: "卡片" }, model);
+
+    assert.equal(result.ok, true);
+    assert.equal(result.complete, true);
+    assert.equal(result.points, 15);
+    assert.equal(request.url, "https://www.bing.com/msrewards/api/v1/reportactivity");
+    const body = JSON.parse(request.data);
+    assert.equal(body.AuthKey, "flyout-hash", "必须使用 flyout 本次渲染的 AuthKey，而不是 earn 页旧 hash");
+    assert.equal(body.UserId, "user-1");
+    assert.equal(body.Channel, "BingFlyout");
+    assert.equal(request.headers.cookie, "MUID=cookie-value");
+});
+
+test("doPromos auto-claims via Flyout and only reminds the leftovers (v4.6.0)", async () => {
+    const { API, RewardsAuto, TaskManager, Utils, storage } = createHarness({
+        "Tasks.promos": true,
+        "Config.flyoutClaim": true,
+    });
+    RewardsAuto.state.dateNowNum = 20261113;
+    Utils.randomDelay = async () => {};
+    API.discoverCards = async () => [
+        { offerId: "a", hash: "ha", points: 10, kind: "open_only", title: "自动卡" },
+        { offerId: "b", hash: "hb", points: 5, kind: "quiz", title: "失败卡" },
+    ];
+    API.getFlyoutViewModel = async () => ({ userId: "u1", flyoutResult: {} });
+    const attempted = [];
+    API.claimCardViaFlyout = async card => {
+        attempted.push(card.offerId);
+        return card.offerId === "a"
+            ? { ok: true, complete: true, points: 10 }
+            : { ok: false, complete: false, points: 0 };
+    };
+
+    const result = await TaskManager.doPromos();
+
+    assert.equal(result, true);
+    assert.deepEqual(attempted, ["a", "b"]);
+    const rec = storage.get("Config.claimNotify");
+    assert.ok(rec.kinds["活动卡片"].includes("失败卡"), "未领取成功的卡必须保留当日提醒");
+    assert.ok(!rec.kinds["活动卡片"].includes("自动卡"), "已自动领取的卡不应再提醒");
+});
+
+test("mobile-only search keeps the search task active in idle detection (v4.6.0)", () => {
+    const today = 20261113;
+    const { RewardsAuto, TaskManager } = createHarness({
+        "Tasks.search": false,
+        "Tasks.mobile": true,
+        "Config.dailySetDone": today,
+        "Config.punchCardBgDone": today,
+    });
+    RewardsAuto.state.dateNowNum = today;
+    TaskManager.signDate = today;
+    TaskManager.readDate = today;
+    TaskManager.promosDate = today;
+    TaskManager.searchDate = 0;
+
+    assert.equal(TaskManager._isIdle(), false, "只开移动搜索时 searchDate 未完成不能判定空闲");
+
+    TaskManager.searchDate = today;
+    assert.equal(TaskManager._isIdle(), true);
+});
+
+test("doSearch runs mobile even when the PC switch is off (v4.6.0)", async () => {
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness({
+        "Tasks.search": false,
+        "Tasks.mobile": true,
+        "Tasks.bonus": false,
+    });
+    RewardsAuto.state.dateNowNum = 20261113;
+    const platforms = [];
+    API.getRewardsInfo = async (retries, opts) => opts && opts.fresh
+        ? { pc: { progress: 0, max: 60 }, mobile: { progress: 30, max: 30 } }
+        : { pc: { progress: 0, max: 60 }, mobile: { progress: 0, max: 30 } };
+    API.checkSearchRestricted = async () => false;
+    API.getSearchPage = async (q, isMobile) => { platforms.push(isMobile); return "<html></html>"; };
+    API.reportSearch = async () => true;
+    Utils.randomRange = min => min;
+    Utils.delay = async () => {};
+
+    const result = await TaskManager.doSearch();
+
+    assert.equal(result, true);
+    assert.ok(platforms.length > 0 && platforms.every(v => v === true), "PC 开关关闭后不得再发 PC 搜索");
+});
+
+// ====== v4.6.0：审查修复回归 ======
+
+test("reportSearch marks a response without the ModernRewards receipt as unconfirmed (v4.6.0)", async () => {
+    const { API, Utils } = createHarness();
+    Utils.xhr = async () => "<html><body>captcha</body></html>";
+
+    const result = await API.reportSearch("weather", false, { ig: "A".repeat(32), cvid: "C".repeat(32) });
+
+    assert.equal(result.ok, false, "空响应/验证码页不得当作上报成功");
+    assert.equal(result.parsed, false);
+});
+
+test("_runSearchQueries does not count an unconfirmed report as quota progress (v4.6.0)", async () => {
+    const { API, RewardsAuto, TaskManager, Utils } = createHarness();
+    RewardsAuto.state.dateNowNum = 20261113;
+    RewardsAuto.state.pcMax = 2;
+    RewardsAuto.state.pcProgress = 0;
+    API.getSearchPage = async () => `<html>IG:"${"A".repeat(32)}"</html>`;
+    API.reportSearch = async () => ({ ok: false, parsed: false });
+    Utils.delay = async () => {};
+    Utils.randomRange = () => 0;
+
+    const result = await TaskManager._runSearchQueries(false, 2);
+
+    assert.equal(result.performed, 0);
+    assert.equal(result.attempted, 2);
+    assert.equal(RewardsAuto.state.pcProgress, 0, "未确认的上报不得本地累加配额");
+});
+
+test("_runSearchBonus treats an unavailable bonus data source as unconfirmed (v4.6.0)", async () => {
+    const { API, RewardsAuto, TaskManager } = createHarness({ "Tasks.bonus": true });
+    RewardsAuto.state.dateNowNum = 20261113;
+    API.getSearchBonusOffers = async () => null;
+
+    assert.equal(await TaskManager._runSearchBonus(), false);
+});
+
+test("doSearch keeps searchDate open when the bonus data source is unavailable (v4.6.0)", async () => {
+    const { API, RewardsAuto, TaskManager } = createHarness({
+        "Tasks.search": true,
+        "Tasks.mobile": false,
+        "Tasks.bonus": true,
+    });
+    RewardsAuto.state.dateNowNum = 20261113;
+    API.getRewardsInfo = async () => ({ pc: { progress: 60, max: 60 }, mobile: { progress: 0, max: 0 } });
+    API.getSearchBonusOffers = async () => null;
+
+    const result = await TaskManager.doSearch();
+
+    assert.equal(result, false);
+    assert.equal(TaskManager.searchDate, 0, "数据源不可用不得当日结账，下轮必须重试");
+});
+
+test("claimCardViaFlyout refuses the stale earn hash when flyout lacks the card (v4.6.0)", async () => {
+    const { API, Utils } = createHarness();
+    let called = false;
+    Utils.xhr = async () => { called = true; return "{}"; };
+    const model = { userId: "u1", flyoutResult: { morePromotions: [{ offerId: "other", hash: "h" }] } };
+
+    const result = await API.claimCardViaFlyout({ offerId: "card1", hash: "old-hash", points: 5 }, model);
+
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "missing-flyout-card");
+    assert.equal(called, false, "flyout 未渲染该卡时不得用 earn 页旧 hash 发请求");
+});
+
+test("claimCardViaFlyout matches a numeric flyout offerId to a string card id (v4.6.0)", async () => {
+    const { API, Utils } = createHarness();
+    let request;
+    Utils.cookieHeaderFor = async () => "";
+    Utils.xhr = async options => {
+        request = options;
+        return JSON.stringify({ ErrorDetail: { ErrorCode: 0 }, OfferComplete: true, EarnedCredits: 5 });
+    };
+    const model = { userId: "u1", flyoutResult: { morePromotions: [{ offerId: 123, hash: "flyout-hash" }] } };
+
+    const result = await API.claimCardViaFlyout({ offerId: "123", hash: "old", points: 5 }, model);
+
+    assert.equal(result.complete, true);
+    assert.equal(JSON.parse(request.data).AuthKey, "flyout-hash");
+});
+
+test("search bonus stops after the daily attempt budget (v4.6.0)", async () => {
+    const today = 20261113;
+    const { API, RewardsAuto, TaskManager } = createHarness({
+        "Tasks.bonus": true,
+        "Config.searchBonusTried": { date: today, count: 18 },
+    });
+    RewardsAuto.state.dateNowNum = today;
+    let checks = 0;
+    API.getSearchBonusOffers = async () => {
+        checks++;
+        return [{ offerId: "bonus", progress: 0, max: 3, points: 3 }];
+    };
+
+    assert.equal(await TaskManager._runSearchBonus(), true);
+    assert.equal(checks, 0, "达到当日上限后不得再发起发现/补搜");
+});
+
+test("search bonus records actual attempts in the daily ledger (v4.6.0)", async () => {
+    const today = 20261113;
+    const { API, RewardsAuto, TaskManager, Utils, storage } = createHarness({
+        "Tasks.bonus": true,
+        "Tasks.search": true,
+    });
+    RewardsAuto.state.dateNowNum = today;
+    let checks = 0;
+    API.getSearchBonusOffers = async () => {
+        checks++;
+        return checks === 1 ? [{ offerId: "bonus", progress: 0, max: 2, points: 2 }] : [];
+    };
+    API.getSearchPage = async () => "<html></html>";
+    API.reportSearch = async () => true;
+    Utils.randomRange = () => 0;
+    Utils.delay = async () => {};
+    Utils.randomDelay = async () => {};
+
+    assert.equal(await TaskManager._runSearchBonus(), true);
+    assert.equal(storage.get("Config.searchBonusTried").count, 2, "按实际发出的搜索次数记账");
+});
+
+test("init keeps scheduling when only mobile search is incomplete (keep=false, v4.6.0)", () => {
+    const today = Utils_getTodayNumForInit();
+    const scheduled = [];
+    const { init } = createHarness({
+        "Config.keep": false,
+        "Tasks.search": false,
+        "Tasks.mobile": true,
+        "Config.tasks": { sign: today, read: today, promos: today, search: 0, streakDays: 0 },
+        "Config.dailySetDone": today,
+        "Config.punchCardBgDone": today,
+        "Config.searchProgressDate": 1,
+    }, {
+        setTimeout: (fn, ms) => { scheduled.push({ fn, ms }); return scheduled.length; },
+    });
+
+    init();
+
+    assert.equal(scheduled.length, 1, "只开移动搜索且 searchDate 未完成时不得短路");
 });

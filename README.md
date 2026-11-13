@@ -4,9 +4,9 @@
 
 **微软积分商城每日签到全家桶 · 后台静默执行 · 多通道消息推送**
 
-[![Version](https://img.shields.io/badge/version-4.5.4-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
+[![Version](https://img.shields.io/badge/version-4.6.0--beta.1-blue)](https://github.com/Arimayuki03/bing-rewards-auto/releases)
 [![ScriptCat](https://img.shields.io/badge/ScriptCat-%E6%89%A9%E5%B1%95%E8%84%9A%E6%9C%AC-orange)](https://scriptcat.org/)
-[![Tests](https://img.shields.io/badge/tests-100%2F100-brightgreen)](#开发与测试)
+[![Tests](https://img.shields.io/badge/tests-121%2F121-brightgreen)](#开发与测试)
 [![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](#License)
 [![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-%E5%9B%BD%E5%8C%BA%20Microsoft%20Rewards-9cf)](https://rewards.bing.com/)
 [![Stars](https://img.shields.io/github/stars/Arimayuki03/bing-rewards-auto?style=social)](https://github.com/Arimayuki03/bing-rewards-auto/stargazers)
@@ -17,27 +17,31 @@
 
 ## 📖 简介
 
-基于 [ScriptCat（脚本猫）](https://scriptcat.org/) 的 Microsoft Rewards 自动任务脚本，每天在浏览器后台**静默完成签到、阅读、搜索、每日活动**等任务赚取积分，活动卡片与欢迎积分**发现可领取时当日提醒一次**、手动打开页面领取，支持**企业微信 / 钉钉 / 飞书 / PushMe / Bark** 五种推送渠道通知积分变动。
+基于 [ScriptCat（脚本猫）](https://scriptcat.org/) 的 Microsoft Rewards 自动任务脚本，每天在浏览器后台**静默完成签到、阅读、PC + 移动双端搜索、搜索奖励、每日活动**等任务赚取积分；活动卡片优先通过 **Bing Flyout 通道自动领取**，失败时当日提醒一次；欢迎积分仍以提醒为主。支持**企业微信 / 钉钉 / 飞书 / PushMe / Bark** 五种推送渠道通知积分变动。
 
-项目经过 40 余轮真实抓包实证迭代：签到走 **App 静默通道**（Bing App UA 上报）、阅读走 **DAPI Token 通道**、每日活动走 **DAPI App 上报**自动完成；活动卡片与欢迎积分因 Server Action 被 SW 边缘 503 结构性拦截（v4.2.0 实证）改为**提醒模式**。内置轮内缓存、跨实例运行锁、随机延迟与当日一次提醒去重，长期无人值守运行稳定。
+项目经过 40 余轮真实抓包实证迭代：签到走 **App 静默通道**（Bing App UA 上报）、阅读走 **DAPI Token 通道**、每日活动走 **DAPI App 上报**自动完成；PC / 移动搜索改用 **SERP 真实 IG + cvid** 上报并解析 ModernRewards 回执；活动卡片改走与 Server Action 不同域的 **Bing Flyout reportactivity** 自动领取（v4.6.0 吸收 TheNetsky 方案），失败自动降级为当日提醒。内置轮内缓存、跨实例运行锁、随机延迟、当日一次提醒去重，长期无人值守运行稳定。
 
 > ⚠️ 本项目仅限个人学习交流使用，请自行承担账号风险。不适用于中国大陆以外地区（内置国区锁定检测，非大陆 IP 自动停止）。
+
+> 🧪 **当前 Release：v4.6.0-beta.1（预发布）** — 新增移动搜索、SERP 真实 IG 上报、URLReward 搜索奖励与 Bing Flyout 自动领卡。Beta 版用于真机验证上述新通道；若出现搜索配额不涨、Flyout 领取持续未确认等异常，可回滚到稳定版 v4.5.4 并在 [Issues](https://github.com/Arimayuki03/bing-rewards-auto/issues) 反馈日志。
 
 ## ✨ 功能特性
 
 | 功能 | 说明 | 默认 |
 |---|---|---|
 | ✅ 每日签入 | PC + App 双通道静默签入（+3 分/次） | 开 |
-| 📰 新闻阅读 | DAPI 接口领取阅读任务，App UA 上报 3 篇（+30 分） | 开 |
-| 🎯 活动卡片 | 自动发现可领 offer，**当日提醒一次**，手动领取（v4.5.1 起提醒模式） | 开 |
+| 📰 新闻阅读 | DAPI 接口领取阅读任务，App UA 上报（+30 分） | 开 |
+| 🎯 活动卡片 | 自动发现可领 offer，优先 **Bing Flyout 自动领取**，失败转当日提醒 | 开 |
 | 🔍 PC 搜索 | 随机词 + 4 家热搜 API 补足搜索积分，间隔 ±15 秒抖动 | 开 |
-| 🧩 Quiz / 拼图卡片 | 随活动卡片扫描，可领时一并提醒（无答题器） | 开 |
+| 📱 移动搜索 | 独立移动配额（Bing App UA + `_Rwho=u=m`），PC 满后继续补移动（3-5 次/轮） | 开 |
+| 🎁 搜索奖励 | 自动识别 URLReward 搜索卡并按缺口补搜，单轮最多 6 次 | 开 |
+| 🧩 Quiz / 拼图卡片 | 随活动卡片扫描；自动领取失败时一并提醒（无答题器） | 开 |
 | 📅 每日活动 | DAPI App 上报自动完成 + flight 流三级兜底 | 开 |
 | 🔗 连签检测 | 自动检测搜索连签任务并接续 | 自动 |
 | 🔁 二次扫描 | 复查每日活动入账确认，防误报完成 | 自动 |
 | 🔔 积分通知 | 企业微信 / 钉钉 / 飞书 / PushMe / Bark，余额变动推送 | 自选 |
 
-**可靠性设计**：轮内请求缓存（同轮零重复请求）· 跨实例运行锁 · 按日期隔离状态 · 随机延迟与 UA 轮换 · 边缘 503 拦截识别与当日放弃账本 · 当日一次提醒去重 · 跨日自愈。
+**可靠性设计**：轮内请求缓存（同轮零重复请求）· 跨实例运行锁 · 按日期隔离状态 · 随机延迟与 UA 轮换 · 边缘 503 拦截识别与当日放弃账本 · Flyout 领取失败自动转提醒 · 当日一次提醒去重 · 跨日自愈。
 
 ## 🧩 脚本组成
 
@@ -45,7 +49,7 @@
 
 | 文件 | 角色 | 版本 |
 |---|---|---|
-| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.5.4 |
+| [`微软积分商城签到（全能智能重构版）.user.js`](微软积分商城签到（全能智能重构版）.user.js) | 主脚本：`@crontab` 后台脚本，每 20 分钟一轮自动完成全部任务 | 4.6.0-beta.1 |
 
 ## 📦 安装
 
@@ -78,7 +82,8 @@
 | `span` | 搜索间隔（秒），±15 秒抖动 | 30 |
 | `api` | 搜索词接口：`offline` / hot.nntool.cc / hot.baiwumm.com / hot.cnxiaobai.com | offline |
 | `code` | 授权码链接（首次使用必填；换取成功后仍保留，可随时查看/重贴） | — |
-| `Tasks.*` | 五类任务开关：签入 / 阅读 / 活动卡片 / Quiz / PC 搜索 | 全开 |
+| `flyoutClaim` | 活动卡片自动领取（Bing Flyout 通道，失败转当日提醒） | 开 |
+| `Tasks.*` | 任务开关：签入 / 阅读 / 活动卡片 / Quiz / PC 搜索 / 移动搜索 / 搜索奖励 | 全开 |
 | `Notice.*` | 通知开关与 webhook 密钥（企业微信 / 钉钉 / 飞书 / PushMe / Bark） | 浏览器通知开 |
 
 **运行方式**：主脚本为 `@crontab` 后台脚本，**不注入任何页面**——扩展面板「当前页运行脚本」显示 0/0 属正常现象，任务在后台按 20 分钟周期自动执行。可随时通过菜单 **🚀 立即运行** 手动触发一轮。
@@ -111,13 +116,13 @@
 <details>
 <summary><b>搜索积分没涨？</b></summary>
 
-确认 PC 搜索任务开启且未达当日上限（积分满后服务端不再计分）。可在设置中把 `api` 换成任一热搜接口提升词库多样性；国区账号需使用大陆 IP。
+确认 PC / 移动搜索任务开启且未达当日上限（积分满后服务端不再计分）。v4.6.0 起移动配额会单独补搜；可在设置中把 `api` 换成任一热搜接口提升词库多样性；国区账号需使用大陆 IP。若日志显示「搜索上报失败」或配额长时间不涨，检查浏览器是否登录 bing.com，并查看是否触发风控。
 </details>
 
 <details>
 <summary><b>每日活动/活动卡片/欢迎积分是怎么完成的？</b></summary>
 
-v4.5.1 起分两条链路：**每日活动集**（dashboard 上 3 张 Gamification_DailySet 卡）由脚本经 DAPI App 通道**自动完成**；**活动卡片**（/earn 日常任务区）与**欢迎积分**因服务端对后台请求的结构性拦截（SW 直发 Server Action 一律 503）改为**提醒模式**——发现可领取时当日推送一次通知（含明细），打开 rewards.bing.com 手动点卡片领取即可。「仅限积分商城应用」的卡片只能由必应 App 完成。有疑问时用主脚本菜单 **🩺 日常卡片诊断** 逐层查看。
+v4.6.0 起分三条链路：**每日活动集**（dashboard 上 3 张 Gamification_DailySet 卡）由脚本经 DAPI App 通道**自动完成**；**活动卡片**（/earn 日常任务区）优先通过 **Bing Flyout reportactivity** 自动领取（与 rewards Server Action 不同域，绕开 SW 503 拦截），失败/未确认的卡片当日推送一次提醒；**欢迎积分**仍以当日提醒为主。「仅限积分商城应用」的卡片只能由必应 App 完成。有疑问时用主脚本菜单 **🩺 日常卡片诊断** 逐层查看。
 </details>
 
 <details>
@@ -132,10 +137,23 @@ v4.5.1 起分两条链路：**每日活动集**（dashboard 上 3 张 Gamificati
 任何自动化操作都有风险。脚本内置随机延迟、搜索间隔抖动、国区锁定检测等防风控措施，但请自行评估与承担。
 </details>
 
+## 🔎 GitHub 热门脚本吸收
+
+v4.6.0 调研了 GitHub 上星标较高的 Microsoft Rewards 自动化项目，按“能在 ScriptCat 后台脚本里稳定落地”筛选后吸收：
+
+| 项目 | 星标 | 借鉴点 | 本项目落地 |
+|---|---:|---|---|
+| [TheNetsky/Microsoft-Rewards-Script](https://github.com/TheNetsky/Microsoft-Rewards-Script) | 1.2k | 移动/桌面搜索双配额、SERP 真实 IG + cvid 上报、`ModernRewards.ReportActivity` 回执、URLReward 搜索奖励、Bing Flyout 领卡 | 移动搜索、真实 IG 上报、搜索奖励、Flyout 自动领取 |
+| [chiihero/Microsoft-Rewards-Script](https://github.com/chiihero/Microsoft-Rewards-Script) | 668 | 中文环境本地化、搜索进度与任务汇总口径 | 中文日志与国区配额兼容 |
+| [3kh0/bing-rewards](https://github.com/3kh0/bing-rewards) | 69 | web/mobile/offers 全类别覆盖、按剩余任务执行 | 移动配额独立补齐 |
+| [idbb98/microsoft-bing-rewards-daily-task-script](https://github.com/idbb98/microsoft-bing-rewards-daily-task-script) | 8 | App 签到/阅读接口、设备 UA 预设、任务面板状态 | 现有 App 通道对齐与移动 UA 复用 |
+
+未吸收：Edge 后台浏览（需桌面 token + 30 分钟常驻上报，与 20 分钟 crontab 冲突）、视觉搜索（需图片上传与 bcid 轮换，后台稳定性未验证）、Quiz 自动答题（无通用答案源，保留提醒）。调研明细见 [GitHub脚本功能吸收.md](GitHub脚本功能吸收.md)。
+
 ## 🛠 开发与测试
 
 ```bash
-# 运行全部测试（100 个）
+# 运行全部测试（121 个）
 # 注意：必须显式列出文件名——node --test tests/ 在 Windows 下报 MODULE_NOT_FOUND
 node --test "tests/userscript.logic.test.cjs"
 
@@ -147,10 +165,11 @@ node --check "微软积分商城签到（全能智能重构版）.user.js"
 
 ```
 bing-rewards-auto/
-├── 微软积分商城签到（全能智能重构版）.user.js   # 主脚本（后台定时任务，单文件，4100+ 行）
+├── 微软积分商城签到（全能智能重构版）.user.js   # 主脚本（后台定时任务，单文件，4700+ 行）
 ├── tests/
-│   └── userscript.logic.test.cjs               # 主脚本逻辑测试（100）
+│   └── userscript.logic.test.cjs               # 主脚本逻辑测试（121）
 ├── 改动与待办记录.md                            # 历轮迭代完整改动日志
+├── GitHub脚本功能吸收.md                        # GitHub 热门项目调研与吸收清单
 └── 优化分析.md                                  # 初期优化分析与裁定记录
 ```
 
@@ -160,6 +179,7 @@ bing-rewards-auto/
 
 | 版本 | 要点 |
 |---|---|
+| v4.6.0-beta.1 | **预发布**：吸收 GitHub 热门脚本的积分获取能力——**移动端搜索**独立配额与 UA/cookie 通道（PC 满后继续补移动）、搜索上报改用 **SERP 真实 IG + cvid** 并解析 `ModernRewards.ReportActivity` 回执、新增 **URLReward 搜索奖励**自动补搜、活动卡片改走 **Bing Flyout reportactivity** 自动领取（失败降级为当日提醒）；新增 `Config.flyoutClaim`、`Tasks.mobile`、`Tasks.bonus`；代码审查后修复 null 结账语义、锁定卡过滤、每日补搜上限、移动-only 配额、Flyout 过期模型/旧 hash 等 10 项问题；测试 100 → 121 |
 | v4.5.4 | 修复设置面板「授权码链接」输入框在授权码用掉后变空——`Config.code` 曾同时充当"输入框显示值"与"待消费一次性凭据"，后者按设计须清空，输入框因此必然被清空；现 `Config.code` 只作显示值永久保留，"是否已用过"另存指纹 `Config.codeUsed`，同步根治 v4.5.0 每 20 分钟重演的 Token 死循环；测试 97 → 100 |
 | v4.5.3 | 修复每日活动卡未完成被静默剔除不提醒：自动通道放弃后降级为「每日活动」手动提醒（不再连带结账，下轮重扫）；二次扫描改 `discoverCards({fresh:true})` 修复同轮缓存把刚入账卡重报（实测 00:07 三卡 +10p 后仍命中重报，误报 0/3）；`runAll` 成功清零区分 give-up 放弃语义（否则 5 轮失败→放弃→清零循环往复，降级提醒判据失效）；测试 94 → 97 |
 | v4.5.2 | 提醒模式实战修正：活动卡片提醒剔除每日活动卡（Gamification_DailySet，由脚本自动完成，2026-10-01 实测混入 6 项中 3 项）；欢迎积分提醒前移至搜索前——原排运行末尾，SW 回收丢写 claimNotify 账本致当日重复提醒；测试 91 → 94 |

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.5.4
-// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅搜索、✅每日活动自动完成（DAPI App 上报）、✅连签检测、✅积分通知；v4.5.1：/earn 活动卡片与 dashboard 欢迎积分改为提醒模式——发现可领取时当日提醒一次（浏览器通知+webhook），由用户打开 rewards.bing.com 手动领取（SW 直发 Server Action 被边缘 503 结构性拦截，自动领取退役）；v4.5.4：修复设置面板「授权码链接」输入框在授权码用掉后变空——Config.code 曾同时充当"输入框显示值"与"待消费一次性凭据"，后者按设计必须在换取后清空，输入框因此必然跟着被清空；现改为 Config.code 只作显示值永久保留，"是否已用过"另存指纹 Config.codeUsed，同一份授权码不会被反复重试（顺带根治 v4.5.0 每 20 分钟重演的 Token 死循环）；v4.5.3：修复每日活动卡未完成被静默剔除不提醒——自动通道放弃后降级为手动领取提醒、等待期不提前结账；二次扫描改 fresh 抓取修复同轮缓存重报误报；修复 give-up 计数被成功分支误清零；单脚本文件，无页面领取组件；历史缺陷修复记录见改动与待办记录.md
+// @version      4.6.0-beta.1
+// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅PC+移动双端搜索、✅搜索奖励自动补搜、✅每日活动自动完成（DAPI App 上报）、✅活动卡片自动领取（Bing Flyout 通道，失败转当日提醒）、✅连签检测、✅积分通知；v4.6.0-beta.1（预发布）：吸收 GitHub 热门脚本 TheNetsky/idbb98/3kh0 的积分获取能力——补全移动端搜索配额、搜索上报改用 SERP 真实 IG+cvid 并解析 ModernRewards 回执、新增 URLReward 搜索奖励自动补搜、新增 Bing Flyout 活动卡片自动领取（失败自动降级为当日提醒），并完成代码审查修复（null 结账语义、锁定卡过滤、每日补搜上限、移动-only 配额、Flyout 过期模型等）；v4.5.4：修复设置面板「授权码链接」输入框被清空并根治 Token 死循环；历史记录见改动与待办记录.md
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -73,6 +73,10 @@ Config:
         title: DAPI调试日志（输出getuserinfo/DAPI诊断细节，排查用）
         type: checkbox
         default: false
+    flyoutClaim:
+        title: 活动卡片自动领取（Bing Flyout 通道，失败转提醒）
+        type: checkbox
+        default: true
     code:
         title: 授权码链接
         type: textarea
@@ -97,6 +101,14 @@ Tasks:
         default: true
     search:
         title: PC搜索
+        type: checkbox
+        default: true
+    mobile:
+        title: 移动搜索
+        type: checkbox
+        default: true
+    bonus:
+        title: 搜索奖励（URLReward 搜索卡）
         type: checkbox
         default: true
 Notice:
@@ -264,6 +276,10 @@ Notice:
             dateNowStr: "",
             pcProgress: 0,
             pcMax: 60,
+            mobileProgress: 0,
+            mobileMax: 0,
+            lastMobileSearchProgress: -1,
+            mobileRestrictedTimes: 0,
             readProgress: 0,
             readMax: 30,
             sendMSG: "",
@@ -562,6 +578,74 @@ Notice:
                 Utils.log("🟢", `动态 next-action${label}: ${naMatch[1].slice(0, 12)}…`);
             }
             return naMatch ? naMatch[1] : null;
+        },
+
+        // 从 SERP HTML 中提取真实 IG（搜索上报必须与本次 SERP 的 IG 一致）。
+        // 兼容 IG:"..."、IG=...、&IG=... 三种形态；找不到返回空串。
+        extractSearchIg(html) {
+            if (typeof html !== "string" || !html) return "";
+            const m = html.match(/\bIG["']?\s*[:=]\s*["']([A-F0-9]{32})["']/i)
+                || html.match(/(?:[?&]|&amp;|%26)IG=([A-F0-9]{32})\b/i)
+                || html.match(/"IG"\s*:\s*"([A-F0-9]{32})"/i);
+            return m ? m[1] : "";
+        },
+
+        // 从文本中 marker 之后提取一个平衡的 JSON 对象（flyoutViewModel 等）。
+        // 字符串感知，支持嵌套/转义；解析失败返回 null。
+        extractJsonObjectAfter(text, marker) {
+            if (typeof text !== "string" || !text) return null;
+            const idx = text.indexOf(marker);
+            if (idx === -1) return null;
+            const start = text.indexOf("{", idx + marker.length);
+            if (start === -1) return null;
+            let depth = 0, inStr = false, esc = false;
+            for (let i = start; i < text.length; i++) {
+                const c = text[i];
+                if (esc) { esc = false; continue; }
+                if (inStr && c === "\\") { esc = true; continue; }
+                if (c === '"') { inStr = !inStr; continue; }
+                if (inStr) continue;
+                if (c === "{") depth++;
+                else if (c === "}" && --depth === 0) {
+                    try { return JSON.parse(text.slice(start, i + 1)); } catch (_) { return null; }
+                }
+            }
+            return null;
+        },
+
+        // 解析搜索上报回执 ModernRewards.ReportActivity({...}) 中的会话数据。
+        // 来源：TheNetsky v5 BingSearchReport；用于确认本次搜索是否真的计入配额。
+        parseSearchReport(text) {
+            const out = { parsed: false, balance: null, previousBalance: null, pointsEarned: null, pointsLimit: null };
+            if (typeof text !== "string") return out;
+            const m = text.match(/ModernRewards\.ReportActivity\((\{[\s\S]*?\})\)\s*;/);
+            if (!m) return out;
+            try {
+                const session = (JSON.parse(m[1]).RewardsSessionData) || {};
+                const num = v => (typeof v === "number" && Number.isFinite(v) && v >= 0) ? v : null;
+                out.balance = num(session.Balance);
+                out.previousBalance = num(session.PreviousBalance);
+                out.pointsEarned = num(session.DailySearchPointsEarned);
+                out.pointsLimit = num(session.DailySearchPointsLimit);
+                out.parsed = true;
+            } catch (_) {}
+            return out;
+        },
+
+        // 搜索奖励卡判据：URLReward 且目标为 Bing 根路径（仅跟踪参数）。
+        // 来源：TheNetsky v5 findActiveSearchBonus。
+        isBareBingSearchUrl(raw) {
+            if (typeof raw !== "string" || !raw) return false;
+            let url;
+            try { url = new URL(raw); } catch (_) { return false; }
+            if (url.protocol !== "https:" && url.protocol !== "http:") return false;
+            if (!/(^|\.)bing\.com$/i.test(url.hostname)) return false;
+            if (url.pathname !== "" && url.pathname !== "/") return false;
+            const allowed = new Set(["form", "ocid", "publ", "crea", "pc", "channel", "mkt", "cc", "setlang"]);
+            for (const key of url.searchParams.keys()) {
+                if (!allowed.has(key.toLowerCase())) return false;
+            }
+            return true;
         },
 
         // 判定 Server Action 直连是否被边缘拦截（v4.2.0 抓包实证 2026-09-17）：
@@ -1080,6 +1164,12 @@ Notice:
                     dashboard: {
                         dailySetPromotions: flyout.dailySetPromotions || {},
                         morePromotions: flyout.morePromotions || [],
+                        morePromotionsWithoutPromotionalItems: flyout.morePromotionsWithoutPromotionalItems || [],
+                        promotionalItem: flyout.promotionalItem || null,
+                        promotionalItems: flyout.promotionalItems || [],
+                        exploreOnBingPromotions: flyout.exploreOnBingPromotions || [],
+                        highValueActionPromotions: flyout.highValueActionPromotions || [],
+                        browseStreakPromotions: flyout.browseStreakPromotions || [],
                         activityAndQuiz: flyout.activityAndQuiz || [],
                         userStatus: {
                             ...status,
@@ -1344,12 +1434,16 @@ Notice:
                         }
                         try {
                             const pts = JSON.parse(clean.substring(start, end));
-                            pcMax = pts.pc?.max ?? 60;
+                            // v4.6.0：pointsCounters 只有 mobile 段时（移动-only 账号/分桶），
+                            // 不能沿用 PC 默认 60——否则 doSearch 会持续发无效 PC 搜索，
+                            // 3 轮后 PC 判受限并连带停掉移动搜索。仅当移动配额真实存在时
+                            // 把缺失的 PC 段视为 0；两段都缺失时保留 60 走旧兜底。
+                            pcMax = pts.pc?.max ?? (Number(pts.mobile?.max) > 0 ? 0 : 60);
                             pcCur = pts.pc?.progress ?? 0;
                             mobMax = pts.mobile?.max ?? 0;
                             mobCur = pts.mobile?.progress ?? 0;
                             dailyOffer = pts.dailyOffer ?? 0;
-                            searchQuotaFound = Number(pts.pc?.max) > 0;
+                            searchQuotaFound = Number(pts.pc?.max) > 0 || Number(pts.mobile?.max) > 0;
                             if (pts.totalPoints != null) balance = Number(pts.totalPoints);
                         } catch {}
                     }
@@ -1864,7 +1958,9 @@ Notice:
                 };
 
                 const pc = sumCounter(counters.pcSearch);
-                if (pc.max === 0) return false;
+                const mobile = sumCounter(counters.mobileSearch);
+                // 国区/部分账号可能只有移动配额（或只有 PC 配额），任一存在即可用。
+                if (pc.max === 0 && mobile.max === 0) return false;
 
                 const balance = Number(userStatus.availablePoints || dashboard.availablePoints || 0);
 
@@ -1878,15 +1974,19 @@ Notice:
                     }
                 } catch (e) {}
 
-                Utils.log("📊", `getuserinfo查询: PC ${pc.progress}/${pc.max}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+                Utils.log("📊", `getuserinfo查询: PC ${pc.progress}/${pc.max}, 移动 ${mobile.progress}/${mobile.max}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
 
                 return {
                     balance,
                     pc,
+                    mobile,
                     readProgress,
                     readMax,
                     dailyOffer: 0,
-                    todayDetails: pc.max > 0 ? [{ title: "必应搜索", points: pc.progress, max: pc.max }] : [],
+                    todayDetails: [
+                        ...(pc.max > 0 ? [{ title: "必应搜索", points: pc.progress, max: pc.max }] : []),
+                        ...(mobile.max > 0 ? [{ title: "必应移动搜索", points: mobile.progress, max: mobile.max }] : [])
+                    ],
                     history: null
                 };
             } catch (e) {
@@ -1923,14 +2023,20 @@ Notice:
                         return false;
                     }
 
-                    const pcSearch = Array.isArray(counters.pcSearch) ? counters.pcSearch : [];
-                    const { progress: pcCur, max: pcMax } = pcSearch.reduce((acc, item) => {
-                        acc.progress += Number(item?.pointProgress || 0);
-                        acc.max += Number(item?.pointProgressMax || item?.pointMax || 0);
-                        return acc;
-                    }, { progress: 0, max: 0 });
+                    const sumCounter = items => {
+                        if (!Array.isArray(items)) return { progress: 0, max: 0 };
+                        return items.reduce((acc, item) => {
+                            acc.progress += Number(item?.pointProgress || 0);
+                            acc.max += Number(item?.pointProgressMax || item?.pointMax || 0);
+                            return acc;
+                        }, { progress: 0, max: 0 });
+                    };
+                    const pc = sumCounter(counters.pcSearch);
+                    const mobile = sumCounter(counters.mobileSearch);
+                    const pcCur = pc.progress, pcMax = pc.max;
 
-                    if (pcMax === 0) {
+                    // 移动配额可能单独存在；PC 与移动都为空才回退页面解析。
+                    if (pcMax === 0 && mobile.max === 0) {
                         if (GM_getValue("Config.debugDAPI", false)) {
                             Utils.log("🟡", "DAPI 返回配额 0，回退到页面解析");
                         }
@@ -1949,11 +2055,12 @@ Notice:
                         }
                     } catch (e) {}
 
-                    Utils.log("📊", `DAPI查询: PC ${pcCur}/${pcMax}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
+                    Utils.log("📊", `DAPI查询: PC ${pcCur}/${pcMax}, 移动 ${mobile.progress}/${mobile.max}, 阅读 ${readProgress}/${readMax}, 积分 ${balance}`);
 
                     return {
                         balance,
                         pc: { progress: pcCur, max: pcMax },
+                        mobile,
                         readProgress,
                         readMax,
                         dailyOffer: 0,
@@ -1965,6 +2072,217 @@ Notice:
                 Utils.log("🟡", `DAPI查询失败: ${e.message}`);
             }
             return false;
+        },
+
+        // 搜索奖励（URLReward 搜索卡）发现：来源 TheNetsky v5 findActiveSearchBonus。
+        // 只认 promotionType=urlreward 且目标为 Bing 根路径的未完成卡；这类卡不需要
+        // Server Action，直接搜索即可推进，因此适合在后台自动补搜。
+        async getSearchBonusOffers(fetchOpts) {
+            try {
+                const data = await this._getUserInfo(fetchOpts);
+                // null = 数据源不可用（与“确实没有搜索奖励”的空数组区分）
+                if (!data) return null;
+                const dashboard = data.dashboard || data;
+                // v4.6.0：getuserinfo 只要带 userStatus 就可能返回非空对象，但 dashboard
+                // 可能没有任何 promotion 容器。此时 pools 为空，不能返回 []（会被
+                // _runSearchBonus 当成"确实没有奖励"直接结账）；保持 null=不可用契约。
+                const containers = [
+                    dashboard.morePromotions,
+                    dashboard.morePromotionsWithoutPromotionalItems,
+                    dashboard.promotionalItems,
+                    dashboard.exploreOnBingPromotions,
+                    dashboard.highValueActionPromotions,
+                    dashboard.browseStreakPromotions,
+                    dashboard.promotionalItem
+                ];
+                if (!containers.some(v => Array.isArray(v) || (v && typeof v === "object"))) {
+                    return null;
+                }
+                const pools = [
+                    ...(Array.isArray(dashboard.morePromotions) ? dashboard.morePromotions : []),
+                    ...(Array.isArray(dashboard.morePromotionsWithoutPromotionalItems) ? dashboard.morePromotionsWithoutPromotionalItems : []),
+                    ...(Array.isArray(dashboard.promotionalItems) ? dashboard.promotionalItems : []),
+                    ...(Array.isArray(dashboard.exploreOnBingPromotions) ? dashboard.exploreOnBingPromotions : []),
+                    ...(Array.isArray(dashboard.highValueActionPromotions) ? dashboard.highValueActionPromotions : []),
+                    ...(Array.isArray(dashboard.browseStreakPromotions) ? dashboard.browseStreakPromotions : []),
+                    ...(dashboard.promotionalItem ? [dashboard.promotionalItem] : [])
+                ];
+                const seen = new Set();
+                const offers = [];
+                for (const item of pools) {
+                    if (!item || typeof item !== "object") continue;
+                    const offerId = String(item.offerId || item.offerid || item.name || "").trim();
+                    if (!offerId || seen.has(offerId)) continue;
+                    // v4.6.0：锁定卡（unlockCriteria:"rewardsApp" 等）只能在对应端完成，
+                    // 网页搜索无法推进；不过滤会每轮空烧搜索预算直到当日结束。
+                    if (item.isLocked === true) continue;
+                    const max = Number(item.pointProgressMax ?? item.points ?? 0) || 0;
+                    const cur = Number(item.pointProgress ?? 0) || 0;
+                    const completeFlag = item.complete ?? item.isCompleted ?? item.completed;
+                    const complete = completeFlag === true || completeFlag === "true" || completeFlag === "True"
+                        || (max > 0 && cur >= max);
+                    if (complete || max <= cur || max <= 0) continue;
+                    const type = String(item.promotionType || item.type || "").toLowerCase();
+                    if (type !== "urlreward") continue;
+                    let url = item.destinationUrl || item.destination || item.url
+                        || item.clickUrl || item.attributes?.url || "";
+                    if (typeof url === "string") url = url.replace(/&amp;/g, "&");
+                    if (!Utils.isBareBingSearchUrl(url)) continue;
+                    const skip = RewardsAuto.skipPatterns.some(p =>
+                        offerId.toLowerCase().includes(p.toLowerCase()) ||
+                        String(item.title || "").toLowerCase().includes(p.toLowerCase())
+                    );
+                    if (skip) continue;
+                    // v4.6.0：dedupe 标记后移到所有过滤之后——同一 offer 在多个池里
+                    // 形态不同，首个条目缺字段时不应把后续完整条目一起吞掉。
+                    seen.add(offerId);
+                    offers.push({
+                        offerId,
+                        title: String(item.title || item.name || ""),
+                        points: max - cur,
+                        progress: cur,
+                        max,
+                        url
+                    });
+                }
+                return offers;
+            } catch (e) {
+                if (GM_getValue("Config.debugDAPI", false)) {
+                    Utils.log("🟡", `搜索奖励发现失败: ${e.message}`);
+                }
+                return null;
+            }
+        },
+
+        // 获取 Bing Flyout 渲染页中的 window.flyoutViewModel（含 userId 与卡片 AuthKey）。
+        // 来源：TheNetsky v5 FlyoutPageParser / FlyoutActivityReport；这条通道与
+        // rewards.bing.com 的 Server Action 不同域，绕开 SW 503 边缘拦截。
+        async getFlyoutViewModel(fetchOpts) {
+            try {
+                const ru = encodeURIComponent("https://www.bing.com/");
+                const headers = {
+                    "user-agent": RewardsAuto.ua.pc,
+                    "referer": "https://www.bing.com/",
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+                };
+                // v4.6.0：与 claimCardViaFlyout 一致显式补 Cookie 头。SW 跨源子请求
+                // 不会自动携带 SameSite 登录 cookie，未登录态渲染会缺 userId/AuthKey。
+                try {
+                    const cookie = await Utils.cookieHeaderFor("https://www.bing.com/");
+                    if (cookie) headers.cookie = cookie;
+                } catch (_) {}
+                const html = await Utils.fetchPage({
+                    url: `https://www.bing.com/rewards/panelflyout?channel=bingflyout&partnerId=BingRewards&isDarkMode=0&ru=${ru}`,
+                    _cacheKey: "flyout-view-model",
+                    headers
+                }, fetchOpts);
+                if (!html) return null;
+                if (Utils.isJSON(html)) {
+                    try {
+                        const direct = JSON.parse(html);
+                        if (direct && (direct.flyoutResult || direct.userInfo)) return direct;
+                    } catch (_) {}
+                }
+                const model = Utils.extractJsonObjectAfter(html, "window.flyoutViewModel");
+                return model && (model.flyoutResult || model.userInfo) ? model : null;
+            } catch (_) {
+                return null;
+            }
+        },
+
+        // 在 flyout 视图模型中递归查找 offerId 对应卡片（卡片 hash 与 earn 页可能不同，
+        // 上报必须用 flyout 本次渲染的 AuthKey）。
+        _findFlyoutCard(model, offerId) {
+            if (!model || !offerId) return null;
+            const stack = [model];
+            const seen = new Set();
+            while (stack.length) {
+                const cur = stack.pop();
+                if (!cur || typeof cur !== "object" || seen.has(cur)) continue;
+                seen.add(cur);
+                const id = cur.offerId || cur.offerid || cur.OfferId;
+                // v4.6.0：flyout 里 offerId 可能是数字，卡片的 offerId 是字符串，
+                // 严格相等会漏匹配并退回过期 hash。
+                if (id != null && String(id) === String(offerId) && (cur.hash || cur.authKey || cur.AuthKey)) return cur;
+                for (const value of Object.values(cur)) {
+                    if (value && typeof value === "object") stack.push(value);
+                }
+            }
+            return null;
+        },
+
+        // 通过 Bing Flyout 的 reportactivity API 领取一张活动卡片。
+        // payload 复刻 TheNetsky v5 FlyoutActivityReport；返回 {ok, complete, points}。
+        async claimCardViaFlyout(card, model) {
+            const offerId = card && card.offerId;
+            if (!offerId || !model) return null;
+            const flyoutCard = this._findFlyoutCard(model, offerId);
+            // v4.6.0：必须使用 flyout 本次渲染的 AuthKey。此前未命中时回落到
+            // card.hash（earn 页旧 hash），会发出一次注定失败的领取并消耗次数；
+            // 现在直接返回未命中，交由调用方保留提醒。
+            if (!flyoutCard) {
+                return { ok: false, complete: false, points: 0, reason: "missing-flyout-card" };
+            }
+            const hash = flyoutCard.hash || flyoutCard.authKey || flyoutCard.AuthKey;
+            const userId = model.userId || model.userInfo?.userId || model.userInfo?.id
+                || model.userInfo?.profile?.userId || model.UserId;
+            if (!hash || !userId) return { ok: false, complete: false, points: 0, reason: "missing-user-or-hash" };
+
+            const body = {
+                ActivityType: flyoutCard?.activityType || card.activityType || "bingredirect",
+                ActivitySubType: flyoutCard?.promotionSubtype || card.promotionSubtype || "",
+                OfferId: offerId,
+                Channel: model.channel || flyoutCard?.channel || "BingFlyout",
+                PartnerId: model.partnerId || "BingRewards",
+                UserId: userId,
+                AuthKey: hash,
+                ActivityCount: 1
+            };
+            const headers = {
+                "content-type": "application/json; charset=UTF-8",
+                "accept": "*/*",
+                "origin": "https://www.bing.com",
+                "referer": `https://www.bing.com/rewards/panelflyout?channel=bingflyout&partnerId=BingRewards`,
+                "user-agent": RewardsAuto.ua.pc
+            };
+            try {
+                const cookie = await Utils.cookieHeaderFor("https://www.bing.com/");
+                if (cookie) headers.cookie = cookie;
+            } catch (_) {}
+
+            let res;
+            try {
+                res = await Utils.xhr({
+                    method: "POST",
+                    url: "https://www.bing.com/msrewards/api/v1/reportactivity",
+                    headers,
+                    data: JSON.stringify(body),
+                    acceptErrorBody: true
+                });
+            } catch (e) {
+                if (GM_getValue("Config.debugDAPI", false)) {
+                    Utils.log("🟡", `Flyout领取请求失败(${offerId}): ${e.message}`);
+                }
+                return { ok: false, complete: false, points: 0, reason: e.message };
+            }
+
+            const text = typeof res === "string" ? res : (res && res.body) || "";
+            const status = typeof res === "object" && res ? res.status : 200;
+            if (!Utils.isJSON(text)) {
+                return { ok: false, complete: false, points: 0, status, reason: "non-json" };
+            }
+            let data;
+            try { data = JSON.parse(text); } catch (_) { return { ok: false, complete: false, points: 0, status, reason: "json-parse" }; }
+            const errorCode = data?.ErrorDetail?.ErrorCode;
+            // v4.6.0：服务端可能返回字符串 "0"，Number() 归一化避免把成功当失败。
+            const okError = errorCode === undefined || Number(errorCode) === 0;
+            return {
+                ok: status >= 200 && status < 300 && okError,
+                complete: data?.OfferComplete === true,
+                points: Number(data?.EarnedCredits || 0) || 0,
+                status,
+                errorCode
+            };
         },
 
         // 查询当前积分余额
@@ -2086,7 +2404,14 @@ Notice:
                     );
                     if (skip) return null;
 
-                    return { title, points, offerId, hash, form: obj.match(/"form":"([^"]+)"/)?.[1] || "", kind: inferKind(offerId, title) };
+                    return {
+                        title, points, offerId, hash,
+                        form: obj.match(/"form":"([^"]+)"/)?.[1] || "",
+                        activityType: obj.match(/"activityType":"?([^",}]+)"?/)?.[1] || "",
+                        promotionSubtype: obj.match(/"promotionSubtype":"([^"]+)"/)?.[1] || "",
+                        url: obj.match(/"destinationUrl":"([^"]+)"/)?.[1] || "",
+                        kind: inferKind(offerId, title)
+                    };
                 };
 
                 // ---------- 方法0: getuserinfo 结构化数据 ----------
@@ -2279,45 +2604,77 @@ Notice:
 
 
 
-        async getSearchPage(query, isMobile = false) {
+        async getSearchPage(query, isMobile = false, options = {}) {
             const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
             const deviceType = isMobile ? "m" : "d";
+            const form = options.form || "QBLH";
+            const cvid = options.cvid || Utils.getRandomUUID();
             return Utils.xhr({
-                url: `https://${RewardsAuto.state.host}/search?q=${encodeURIComponent(query)}&form=QBLH${mkt}`,
+                url: `https://${RewardsAuto.state.host}/search?q=${encodeURIComponent(query)}&form=${form}&cvid=${cvid}${mkt}`,
                 headers: {
                     "user-agent": isMobile ? RewardsAuto.ua.mobile : RewardsAuto.ua.pc,
                     "cookie": `_Rwho=u=${deviceType}&ts=${RewardsAuto.state.dateNowStr}`,
-                    "referer": `https://${RewardsAuto.state.host}/?form=QBLH`
+                    "referer": `https://${RewardsAuto.state.host}/?form=${form}`
                 }
             });
         },
 
-        async reportSearch(query, isMobile = false) {
+        async reportSearch(query, isMobile = false, options = {}) {
             try {
-                const ig = Utils.getRandomUUID();
+                const form = options.form || "QBLH";
+                const cvid = options.cvid || Utils.getRandomUUID();
+                // v4.6.0：必须使用本次 SERP 返回的真实 IG。旧实现用随机 UUID，
+                // 与页面会话不一致时服务端可能只回 200 而不计分（TheNetsky 抓包口径）。
+                // v4.6.0：保留随机兜底（部分区域仍可能计分），但不再静默——提取失败
+                // 会掩盖 extractSearchIg 的解析退化，必须留日志。
+                const rawIg = String(options.ig || "");
+                const hasRealIg = /^[A-F0-9]{32}$/i.test(rawIg);
+                if (!hasRealIg) {
+                    Utils.log("🟡", "SERP 未提取到有效 IG，本次回退随机 UUID（可能不计分）");
+                }
+                const ig = hasRealIg ? rawIg.toUpperCase() : Utils.getRandomUUID();
                 const mkt = GM_getValue("Config.lock", true) ? "&mkt=zh-CN" : "";
-                const params = `q=${encodeURIComponent(query)}&form=QBLH${mkt}`;
+                const params = `q=${encodeURIComponent(query)}&form=${form}${mkt}`;
+                const searchUrl = `https://${RewardsAuto.state.host}/search?${params}&cvid=${cvid}`;
                 const deviceType = isMobile ? "m" : "d";
                 const headers = {
                     "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
                     "user-agent": isMobile ? RewardsAuto.ua.mobile : RewardsAuto.ua.pc,
-                    "referer": `https://${RewardsAuto.state.host}/?form=QBLH`,
+                    "referer": `https://${RewardsAuto.state.host}/?form=${form}`,
+                    "origin": `https://${RewardsAuto.state.host}`,
+                    "x-requested-with": "XMLHttpRequest",
                     "cookie": `_Rwho=u=${deviceType}&ts=${RewardsAuto.state.dateNowStr}`
                 };
 
-                await Utils.xhr({
+                // ncheader 仍保留（部分区域用它初始化搜索会话），但 IG 改为 SERP 真值。
+                try {
+                    await Utils.xhr({
+                        method: "POST",
+                        url: `https://${RewardsAuto.state.host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
+                        headers,
+                        data: "wb=1%3bi%3d1%3bv%3d1"
+                    });
+                } catch (_) { /* ncheader 非必需；reportActivity 成功即可 */ }
+
+                const res = await Utils.xhr({
                     method: "POST",
-                    url: `https://${RewardsAuto.state.host}/rewardsapp/ncheader?ver=88888888&IID=SERP.5047&IG=${ig}&ajaxreq=1`,
+                    url: `https://${RewardsAuto.state.host}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&cvid=${cvid}&ajaxreq=1`,
                     headers,
-                    data: "wb=1%3bi%3d1%3bv%3d1"
+                    data: `url=${encodeURIComponent(searchUrl)}&V=web`
                 });
-                await Utils.xhr({
-                    method: "POST",
-                    url: `https://${RewardsAuto.state.host}/rewardsapp/reportActivity?IG=${ig}&IID=SERP.5047&${params}&ajaxreq=1`,
-                    headers,
-                    data: `url=${encodeURIComponent(`https://${RewardsAuto.state.host}/search?${params}`)}&V=web`
-                });
-                return true;
+                const receipt = Utils.parseSearchReport(res);
+                // v4.6.0：只有解析到 ModernRewards 回执才算上报成功。空响应/验证码页/
+                // 错误页虽然 HTTP 200，但通常未计分；继续本地累加配额会造成"搜索已执行"
+                // 的假象。未确认时交由 doSearch 末尾的 fresh 复核兜底。
+                if (!receipt.parsed) {
+                    Utils.log("🟡", "搜索回执缺失，本次搜索可能未计分");
+                }
+                return {
+                    ok: receipt.parsed,
+                    ig,
+                    cvid,
+                    ...receipt
+                };
             } catch (e) {
                 Utils.log("🟡", `搜索上报失败: ${e.message}`);
                 return false;
@@ -2441,34 +2798,53 @@ Notice:
             return sentence;
         },
 
-        async checkSearchRestricted(info) {
+        async checkSearchRestricted(info, isMobile = false) {
             // 用服务器实际进度判断，避免本地虚增导致误判。
             // 调用方可传入已获取的 info 复用，减少同一轮内的重复抓取。
-            let currentTotal = RewardsAuto.state.pcProgress;
+            // v4.6.0：PC 与移动各自独立计数，任一平台停滞不再被另一平台的增长掩盖。
+            const label = isMobile ? "移动" : "PC";
+            const quota = isMobile
+                ? ((info && info.mobile) || { progress: 0, max: RewardsAuto.state.mobileMax })
+                : ((info && info.pc) || { progress: 0, max: RewardsAuto.state.pcMax });
+            let currentTotal = isMobile ? RewardsAuto.state.mobileProgress : RewardsAuto.state.pcProgress;
             if (info) {
-                currentTotal = info.pc.progress;
+                currentTotal = Number(quota.progress || 0);
             } else {
                 const fetched = await this.getRewardsInfo();
-                if (fetched) currentTotal = fetched.pc.progress;
+                if (fetched) {
+                    const q = isMobile ? fetched.mobile : fetched.pc;
+                    currentTotal = Number(q?.progress || 0);
+                }
             }
-            const lastTotal = RewardsAuto.state.lastSearchProgress;
+            const maxTotal = isMobile ? RewardsAuto.state.mobileMax : RewardsAuto.state.pcMax;
+            const lastTotal = isMobile
+                ? RewardsAuto.state.lastMobileSearchProgress
+                : RewardsAuto.state.lastSearchProgress;
 
             if (lastTotal !== -1) {
-                if (currentTotal === lastTotal &&
-                    currentTotal < RewardsAuto.state.pcMax) {
-                    RewardsAuto.state.restrictedTimes++;
+                if (currentTotal === lastTotal && currentTotal < maxTotal) {
+                    if (isMobile) RewardsAuto.state.mobileRestrictedTimes++;
+                    else RewardsAuto.state.restrictedTimes++;
                 } else {
-                    RewardsAuto.state.restrictedTimes = 0;
+                    if (isMobile) RewardsAuto.state.mobileRestrictedTimes = 0;
+                    else RewardsAuto.state.restrictedTimes = 0;
                 }
             }
 
-            RewardsAuto.state.lastSearchProgress = currentTotal;
-            GM_setValue("Config.lastSearchProgress", currentTotal);
-            GM_setValue("Config.restrictedTimes", RewardsAuto.state.restrictedTimes);
+            if (isMobile) {
+                RewardsAuto.state.lastMobileSearchProgress = currentTotal;
+                GM_setValue("Config.lastMobileSearchProgress", currentTotal);
+                GM_setValue("Config.mobileRestrictedTimes", RewardsAuto.state.mobileRestrictedTimes);
+            } else {
+                RewardsAuto.state.lastSearchProgress = currentTotal;
+                GM_setValue("Config.lastSearchProgress", currentTotal);
+                GM_setValue("Config.restrictedTimes", RewardsAuto.state.restrictedTimes);
+            }
             GM_setValue("Config.searchProgressDate", RewardsAuto.state.dateNowNum);
 
-            if (RewardsAuto.state.restrictedTimes >= 3) {
-                Utils.log("🔴", "搜索受限或账号异常，已中断今日搜索！", true);
+            const times = isMobile ? RewardsAuto.state.mobileRestrictedTimes : RewardsAuto.state.restrictedTimes;
+            if (times >= 3) {
+                Utils.log("🔴", `${label}搜索受限或账号异常，已中断今日${label}搜索！`, true);
                 return true;
             }
             return false;
@@ -2478,6 +2854,15 @@ Notice:
     // 每日活动"当日连续失败"放弃上限：接口异常/边缘拦截日每 20 分钟轮次全量重试
     // 会放大请求量，当日失败达上限即当日放弃，次日按日期自动重置。
     const DAILY_SET_GIVE_UP_AFTER = 5;
+
+    // v4.6.0：搜索奖励单轮预算。主搜索（PC + 移动）单轮最多 14 次、每次
+    // 间隔 15-45 秒，最慢已接近 10 分钟；奖励补搜限制在 6 次以内，避免单轮
+    // 逼近 20 分钟 crontab 周期。奖励未完成时 searchDate 不落账，下轮继续。
+    // v4.6.0：增加当日总预算——某张奖励卡始终不计分时，单轮预算会让脚本每
+    // 20 分钟重复补搜（一天可放大到数百次），按当日账本封顶。
+    const SEARCH_BONUS_MAX_PER_RUN = 6;
+    const SEARCH_BONUS_MAX_PER_OFFER = 4;
+    const SEARCH_BONUS_MAX_PER_DAY = 18;
 
     // 运行锁参数：运行中心跳每 5 分钟续期一次；过期窗口 20 分钟（> 2 个心跳周期），
     // 既保证活跃长任务不被误判过期，又把实例意外终止（关标签页/SW 被杀）后
@@ -2522,11 +2907,17 @@ Notice:
             if (progressDate === RewardsAuto.state.dateNowNum) {
                 RewardsAuto.state.lastSearchProgress = GM_getValue("Config.lastSearchProgress", -1);
                 RewardsAuto.state.restrictedTimes = GM_getValue("Config.restrictedTimes", 0);
+                RewardsAuto.state.lastMobileSearchProgress = GM_getValue("Config.lastMobileSearchProgress", -1);
+                RewardsAuto.state.mobileRestrictedTimes = GM_getValue("Config.mobileRestrictedTimes", 0);
             } else {
                 RewardsAuto.state.lastSearchProgress = -1;
                 RewardsAuto.state.restrictedTimes = 0;
+                RewardsAuto.state.lastMobileSearchProgress = -1;
+                RewardsAuto.state.mobileRestrictedTimes = 0;
                 GM_setValue("Config.lastSearchProgress", -1);
                 GM_setValue("Config.restrictedTimes", 0);
+                GM_setValue("Config.lastMobileSearchProgress", -1);
+                GM_setValue("Config.mobileRestrictedTimes", 0);
                 GM_setValue("Config.searchProgressDate", RewardsAuto.state.dateNowNum);
             }
         },
@@ -2733,7 +3124,16 @@ Notice:
                 }
             }
             if (manual.length > 0) {
-                await this.notifyClaimables("活动卡片", manual);
+                // v4.6.0：先尝试 Bing Flyout 通道自动领取（绕开 rewards Server Action
+                // 的 SW 503 边缘拦截），失败/未确认的卡片再走当日一次提醒。
+                const claimed = await this._claimManualCardsViaFlyout(manual);
+                const remaining = manual.filter(c => !claimed.has(c.offerId));
+                if (claimed.size > 0) {
+                    Utils.log("🔵", `活动卡片自动领取 ${claimed.size}/${manual.length} 张`, true);
+                }
+                if (remaining.length > 0) {
+                    await this.notifyClaimables("活动卡片", remaining);
+                }
             }
             if (dailyWait) return true; // 每日活动待自动完成：不结账，下轮重扫
             this.promosDate = today;
@@ -2744,22 +3144,177 @@ Notice:
 
 
 
+        // 轮内搜索词去重：50 词池随机取 4-7 次约 1/4 概率撞词，重复词更可疑且通常不计分
+        async _nextSearchQuery(usedQueries) {
+            let query;
+            if (RewardsAuto.apiConfig.mode !== "offline") {
+                query = await API.getHotSearchWord();
+            } else {
+                query = RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
+                for (let tries = 0; tries < 3 && usedQueries.has(query); tries++) {
+                    query = RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
+                }
+            }
+            if (!query) query = RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
+            usedQueries.add(query);
+            return query;
+        },
+
+        async _waitSearchInterval() {
+            const span = Number(GM_getValue("Config.span", 30)) || 30;
+            // 限制 span 范围，避免配置过小时 (span-15) 为负导致延迟为负/过短
+            const safeSpan = Math.min(Math.max(span, 15), 120);
+            const wait = Utils.randomRange((safeSpan - 15) * 1000, (safeSpan + 15) * 1000);
+            Utils.log("⏳", `等待 ${wait / 1000}秒`);
+            await Utils.delay(wait);
+        },
+
+        // 在单一平台上执行 N 次搜索；PC 与移动共用同一套 SERP/上报链，
+        // 仅 UA 与 _Rwho cookie 不同。checkQuota=false 用于搜索奖励补搜。
+        async _runSearchQueries(isMobile, limit, { checkQuota = true, label = "" } = {}) {
+            const platform = label || this._platformLabel(isMobile);
+            const usedQueries = new Set();
+            let performed = 0;
+            let attempted = 0;
+            const getProgress = () => isMobile ? RewardsAuto.state.mobileProgress : RewardsAuto.state.pcProgress;
+            const getMax = () => isMobile ? RewardsAuto.state.mobileMax : RewardsAuto.state.pcMax;
+            let remaining = checkQuota ? Math.max(0, getMax() - getProgress()) : limit;
+            const total = Math.min(limit, checkQuota ? remaining : limit);
+
+            for (let i = 0; i < total; i++) {
+                if (checkQuota && getProgress() >= getMax()) break;
+                const query = await this._nextSearchQuery(usedQueries);
+                const cvid = Utils.getRandomUUID();
+                attempted++;
+                Utils.log("🔍", `[${platform}] 搜索 ${i + 1}/${total}: ${query}`);
+                try {
+                    const html = await API.getSearchPage(query, isMobile, { cvid });
+                    if (html) {
+                        const ig = Utils.extractSearchIg(html);
+                        const reported = await API.reportSearch(query, isMobile, { ig, cvid });
+                        if (reported && reported.ok !== false) {
+                            performed++;
+                            if (checkQuota) {
+                                if (isMobile) RewardsAuto.state.mobileProgress += 1;
+                                else RewardsAuto.state.pcProgress += 1;
+                            }
+                            if (reported.pointsEarned != null) {
+                                Utils.log("📈", `[${platform}] 搜索回执: 今日搜索分 ${reported.pointsEarned}/${reported.pointsLimit ?? "?"}`);
+                            }
+                        }
+                    }
+                } catch (e) {
+                    Utils.log("🟡", `${platform}搜索失败: ${e.message}`);
+                }
+                if (i < total - 1) await this._waitSearchInterval();
+            }
+            return { performed, attempted };
+        },
+
+        _platformLabel(isMobile) {
+            return isMobile ? "移动" : "PC";
+        },
+
+        // 搜索奖励（URLReward 搜索卡）：不需要 Server Action，直接补搜即可推进。
+        // 来源：TheNetsky v5 searchBonus；每次最多补 4 次/卡、单轮总预算 6 次。
+        async _runSearchBonus() {
+            if (!GM_getValue("Tasks.bonus", true)) return true;
+
+            // v4.6.0：当日补搜账本。某张奖励卡始终不计分时，仅靠单轮预算会让
+            // 脚本每 20 分钟重复补搜；按实际发出的搜索次数封顶，达上限后当日
+            // 放弃（返回 true 允许结账），次日自动重置。
+            const today = RewardsAuto.state.dateNowNum;
+            let dayRec = GM_getValue("Config.searchBonusTried", null);
+            if (!dayRec || typeof dayRec !== "object" || dayRec.date !== today) {
+                dayRec = { date: today, count: 0 };
+            }
+            const dayUsed = Math.max(0, Number(dayRec.count) || 0);
+            const dayLeft = SEARCH_BONUS_MAX_PER_DAY - dayUsed;
+            if (dayLeft <= 0) {
+                Utils.log("🟡", `搜索奖励今日补搜已达 ${SEARCH_BONUS_MAX_PER_DAY} 次上限，今日不再补搜`);
+                return true;
+            }
+
+            const offers = await API.getSearchBonusOffers({ fresh: true });
+            if (offers === null) {
+                // 数据源不可用 = 未确认，不是"确实没有奖励"。返回 false 让调用方
+                // 保持 searchDate=0，下一轮继续复查（v4.6.0 修复：此前返回 true
+                // 会被 doSearch 当作当日完成结账，奖励整天不再补搜）。
+                Utils.log("🟡", "搜索奖励数据源不可用，保留搜索任务待下轮");
+                return false;
+            }
+            if (offers.length === 0) {
+                Utils.log("✅", "无搜索奖励任务");
+                return true;
+            }
+            // PC 搜索关闭且只开移动时，奖励补搜走移动 UA，避免用户关闭 PC 后仍发 PC 请求。
+            const bonusIsMobile = !GM_getValue("Tasks.search", true) && GM_getValue("Tasks.mobile", true);
+            let budget = Math.min(SEARCH_BONUS_MAX_PER_RUN, dayLeft);
+            let attemptedTotal = 0;
+            for (const offer of offers) {
+                if (budget <= 0) break;
+                const need = Math.max(1, Math.min(offer.max - offer.progress, SEARCH_BONUS_MAX_PER_OFFER, budget));
+                Utils.log("🎁", `搜索奖励「${offer.title || offer.offerId}」${offer.progress}/${offer.max}，补搜 ${need} 次`);
+                const { attempted } = await this._runSearchQueries(bonusIsMobile, need, { checkQuota: false, label: "奖励" });
+                attemptedTotal += Number(attempted) || 0;
+                budget -= need;
+                await Utils.randomDelay(3000, 8000);
+            }
+            if (attemptedTotal > 0) {
+                dayRec.count = dayUsed + attemptedTotal;
+                GM_setValue("Config.searchBonusTried", dayRec);
+            }
+            const after = await API.getSearchBonusOffers({ fresh: true });
+            if (after === null) {
+                Utils.log("🟡", "搜索奖励复查数据源不可用，保留进度待下轮");
+                return false;
+            }
+            if (after.length === 0) {
+                Utils.log("🔵", "搜索奖励任务完成", true);
+                return true;
+            }
+            if (dayRec.count >= SEARCH_BONUS_MAX_PER_DAY) {
+                Utils.log("🟡", `搜索奖励未完成且今日补搜已达 ${SEARCH_BONUS_MAX_PER_DAY} 次上限，今日放弃`, true);
+                return true;
+            }
+            Utils.log("🟡", `搜索奖励未完成: ${after.map(o => `${o.title || o.offerId} ${o.progress}/${o.max}`).join("、")}`);
+            return false;
+        },
+
         async doSearch() {
-            if (!GM_getValue("Tasks.search", true)) { Utils.log("🟡", "搜索任务已关闭，跳过"); return true; }
+            const pcEnabled = GM_getValue("Tasks.search", true);
+            const mobileEnabled = GM_getValue("Tasks.mobile", true);
+            if (!pcEnabled && !mobileEnabled) { Utils.log("🟡", "PC/移动搜索均已关闭，跳过"); return true; }
 
             const info = await API.getRewardsInfo();
             if (!info) { Utils.log("🔴", "无法获取积分信息"); return false; }
 
-            RewardsAuto.state.pcProgress = info.pc.progress;
-            RewardsAuto.state.pcMax = info.pc.max;
+            const pc = info.pc || { progress: 0, max: 0 };
+            const mobile = info.mobile || { progress: 0, max: 0 };
+            RewardsAuto.state.pcProgress = Number(pc.progress) || 0;
+            RewardsAuto.state.pcMax = Number(pc.max) || 0;
+            RewardsAuto.state.mobileProgress = Number(mobile.progress) || 0;
+            RewardsAuto.state.mobileMax = Number(mobile.max) || 0;
+            const mobileAvailable = mobileEnabled && RewardsAuto.state.mobileMax > 0;
 
-            Utils.log("🔍", `搜索配额: PC ${info.pc.progress}/${info.pc.max}`);
+            Utils.log("🔍", `搜索配额: PC ${RewardsAuto.state.pcProgress}/${RewardsAuto.state.pcMax}` +
+                (mobileAvailable ? `, 移动 ${RewardsAuto.state.mobileProgress}/${RewardsAuto.state.mobileMax}` : ""));
 
-            const pcDone = info.pc.progress >= info.pc.max;
-            if (pcDone) {
+            const pcDone = !pcEnabled || RewardsAuto.state.pcProgress >= RewardsAuto.state.pcMax;
+            const mobileDone = !mobileAvailable || RewardsAuto.state.mobileProgress >= RewardsAuto.state.mobileMax;
+            if (pcDone && mobileDone) {
+                Utils.log("✅", `搜索配额已满 PC: ${RewardsAuto.state.pcProgress}/${RewardsAuto.state.pcMax}` +
+                    (mobileAvailable ? `，移动: ${RewardsAuto.state.mobileProgress}/${RewardsAuto.state.mobileMax}` : ""));
+                const bonusOk = await this._runSearchBonus();
+                if (!bonusOk) {
+                    // 主配额已满但搜索奖励仍缺口：不落 searchDate，下一轮继续补搜。
+                    this.searchDate = 0;
+                    this.save();
+                    Utils.log("🟡", "搜索奖励未完成，保留搜索任务待下轮补搜");
+                    return false;
+                }
                 this.searchDate = RewardsAuto.state.dateNowNum;
                 this.save();
-                Utils.log("✅", `搜索配额已满 PC: ${info.pc.progress}/${info.pc.max}`);
                 return true;
             }
 
@@ -2768,68 +3323,80 @@ Notice:
                 this.searchDate = 0;
             }
 
-            const isRestricted = await API.checkSearchRestricted(info);
-            if (isRestricted) {
-                this.searchDate = RewardsAuto.state.dateNowNum;
-                this.save();
-                return true;
+            let restricted = false;
+            if (!pcDone) {
+                if (await API.checkSearchRestricted(info, false)) {
+                    restricted = true;
+                } else {
+                    await this._runSearchQueries(false, Utils.randomRange(4, 7));
+                }
+            } else {
+                Utils.log("✅", `PC 搜索配额已满 ${RewardsAuto.state.pcProgress}/${RewardsAuto.state.pcMax}`);
             }
 
-            const limit = Utils.randomRange(4, 7);
-            // 轮内搜索词去重：50 词池随机取 4-7 次约 1/4 概率撞词，重复词更可疑且通常不计分
-            const usedQueries = new Set();
-            for (let i = 0; i < limit; i++) {
-                if (RewardsAuto.state.pcProgress >= RewardsAuto.state.pcMax) break;
-
-                let query;
-                if (RewardsAuto.apiConfig.mode !== "offline") {
-                    query = await API.getHotSearchWord();
+            if (mobileAvailable && !mobileDone && !restricted) {
+                if (await API.checkSearchRestricted(info, true)) {
+                    restricted = true;
                 } else {
-                    query = RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
-                    // 撞词时最多重试 3 次换词
-                    for (let tries = 0; tries < 3 && usedQueries.has(query); tries++) {
-                        query = RewardsAuto.searchPool[Utils.randomRange(0, RewardsAuto.searchPool.length - 1)];
-                    }
-                    usedQueries.add(query);
+                    // 移动端单轮 3-5 次：PC 4-7 + 移动 3-5 合计最多 12 次，
+                    // 避免顺序执行时逼近 20 分钟 crontab 周期。
+                    await this._runSearchQueries(true, Utils.randomRange(3, 5));
                 }
+            } else if (mobileAvailable && mobileDone) {
+                Utils.log("✅", `移动搜索配额已满 ${RewardsAuto.state.mobileProgress}/${RewardsAuto.state.mobileMax}`);
+            }
 
-                Utils.log("🔍", `[PC] 搜索 ${i+1}/${limit}: ${query}`);
-
-                try {
-                    const html = await API.getSearchPage(query, false);
-                    if (html) {
-                        const reported = await API.reportSearch(query, false);
-                        if (reported) {
-                            // 每次搜索通常计 1 分，仅用于循环内提前退出判断；
-                            // 真实配额以最终 getRewardsInfo 复查为准，避免虚增导致提前结束
-                            RewardsAuto.state.pcProgress += 1;
-                        }
-                    }
-                } catch (e) {
-                    Utils.log("🟡", `搜索失败: ${e.message}`);
-                }
-
-                const span = Number(GM_getValue("Config.span", 30)) || 30;
-                // 限制 span 范围，避免配置过小时 (span-15) 为负导致延迟为负/过短
-                const safeSpan = Math.min(Math.max(span, 15), 120);
-                const wait = Utils.randomRange((safeSpan - 15) * 1000, (safeSpan + 15) * 1000);
-                Utils.log("⏳", `等待 ${wait/1000}秒`);
-                await Utils.delay(wait);
+            if (restricted) {
+                // 与旧语义一致：受限日停止当日全部搜索，避免继续触发风控。
+                this.searchDate = RewardsAuto.state.dateNowNum;
+                this.save();
+                Utils.log("🟡", "搜索受限，今日搜索任务提前结束");
+                return true;
             }
 
             const finalInfo = await API.getRewardsInfo(3, { fresh: true });
             if (finalInfo) {
-                const pcDone2 = finalInfo.pc.progress >= finalInfo.pc.max;
-                if (pcDone2) {
+                const finalPc = finalInfo.pc || { progress: 0, max: 0 };
+                const finalMobile = finalInfo.mobile || { progress: 0, max: 0 };
+                const finalPcDone = !pcEnabled || (Number(finalPc.progress) || 0) >= (Number(finalPc.max) || 0);
+                // v4.6.0：finalInfo.mobile 缺失时默认 0/0，0>=0 会误判"移动已完成"。
+                // mobileAvailable 为真时必须看到真实 max 且 progress 达标，否则视为未确认。
+                const finalMobileDone = !mobileAvailable ||
+                    (Number(finalMobile.max) > 0 &&
+                        (Number(finalMobile.progress) || 0) >= Number(finalMobile.max));
+                if (finalPcDone && finalMobileDone) {
+                    // 本轮主搜索已接近 10 分钟上限，搜索奖励留到下一轮（主配额已满
+                    // 的早退分支）再补；这里只做一次轻量发现，缺口存在就不落 searchDate。
+                    if (GM_getValue("Tasks.bonus", true)) {
+                        const pendingBonuses = await API.getSearchBonusOffers({ fresh: true });
+                        // v4.6.0：null = 数据源不可用（未确认），不能当成"确无缺口"结账。
+                        if (pendingBonuses === null) {
+                            Utils.log("🟡", "搜索奖励复查数据源不可用，保留搜索任务待下轮");
+                            this.searchDate = 0;
+                            this.save();
+                            return true;
+                        }
+                        if (pendingBonuses.length > 0) {
+                            Utils.log("🟡", `搜索奖励待下轮补搜: ${pendingBonuses.map(o => `${o.title || o.offerId} ${o.progress}/${o.max}`).join("、")}`);
+                            this.searchDate = 0;
+                            this.save();
+                            return true;
+                        }
+                    }
                     this.searchDate = RewardsAuto.state.dateNowNum;
                     this.save();
                     RewardsAuto.state.restrictedTimes = 0;
+                    RewardsAuto.state.mobileRestrictedTimes = 0;
                     GM_setValue("Config.restrictedTimes", 0);
+                    GM_setValue("Config.mobileRestrictedTimes", 0);
                     GM_setValue("Config.lastSearchProgress", -1);
-                    Utils.log("🔵", `🔍 搜索任务完成！PC: ${finalInfo.pc.progress}/${finalInfo.pc.max}`, true);
+                    GM_setValue("Config.lastMobileSearchProgress", -1);
+                    Utils.log("🔵", `🔍 搜索任务完成！PC: ${finalPc.progress}/${finalPc.max}` +
+                        (mobileAvailable ? `，移动: ${finalMobile.progress}/${finalMobile.max}` : ""), true);
                     return true;
                 } else {
-                    Utils.log("🟡", `搜索已执行，配额未满 PC: ${finalInfo.pc.progress}/${finalInfo.pc.max}`);
+                    Utils.log("🟡", `搜索已执行，配额未满 PC: ${finalPc.progress}/${finalPc.max}` +
+                        (mobileAvailable ? `，移动: ${finalMobile.progress}/${finalMobile.max}` : ""));
                     return false;
                 }
             } else {
@@ -3157,6 +3724,55 @@ Notice:
 
 
 
+
+        // v4.6.0：通过 Bing Flyout API 自动领取活动卡片。
+        // 与 Server Action 不同域（www.bing.com/msrewards/api/v1/reportactivity），
+        // 不受 rewards.bing.com SW 503 边缘拦截影响；每张卡每天最多尝试 3 次，
+        // 单轮最多 8 张，失败/未确认的卡片交由 notifyClaimables 提醒兜底。
+        async _claimManualCardsViaFlyout(cards) {
+            const claimed = new Set();
+            if (!Array.isArray(cards) || cards.length === 0) return claimed;
+            if (!GM_getValue("Config.flyoutClaim", true)) return claimed;
+            const today = RewardsAuto.state.dateNowNum;
+            let rec = GM_getValue("Config.flyoutClaimTried", null);
+            if (!rec || typeof rec !== "object" || rec.date !== today) {
+                rec = { date: today, attempts: {} };
+            }
+            if (!rec.attempts || typeof rec.attempts !== "object") rec.attempts = {};
+
+            // v4.6.0：必须 fresh——panelflyout 的卡片 AuthKey 可能随会话轮换，
+            // 轮内缓存（按日期）会让后续轮次拿过期模型领取并白白消耗次数。
+            const model = await API.getFlyoutViewModel({ fresh: true });
+            if (!model) {
+                Utils.log("🟡", "Flyout 页面不可用，活动卡片转当日提醒");
+                return claimed;
+            }
+
+            let attempted = 0;
+            for (const card of cards) {
+                if (attempted >= 8) break;
+                const tries = Number(rec.attempts[card.offerId] || 0);
+                if (tries >= 3) continue;
+                rec.attempts[card.offerId] = tries + 1;
+                attempted++;
+                const result = await API.claimCardViaFlyout(card, model);
+                if (result && result.ok && result.complete) {
+                    claimed.add(card.offerId);
+                    // 单卡不推送，避免一次领 8 张刷屏；doPromos 汇总后统一推一条
+                    Utils.log("✅", `Flyout 自动领取: ${card.title || card.offerId} +${result.points || card.points || 0}分`);
+                } else if (result && result.ok && result.points > 0) {
+                    // 有积分入账但服务端未标 OfferComplete：保留提醒，避免用户漏掉
+                    // 仍需操作/仍可继续领取的卡片。
+                    Utils.log("🟡", `Flyout 部分入账 +${result.points}分，仍保留提醒: ${card.title || card.offerId}`);
+                } else {
+                    const why = result ? (result.reason || `errorCode=${result.errorCode ?? "?"}`) : "no-model-card";
+                    Utils.log("🟡", `Flyout 领取未确认: ${card.title || card.offerId}（${why}）`);
+                }
+                await Utils.randomDelay(2000, 4000);
+            }
+            GM_setValue("Config.flyoutClaimTried", rec);
+            return claimed;
+        },
 
         // v4.5.0：可领取项当日一次提醒（替代原自动领取）。独立于 pushDedupe 的
         // 通知账本——用户手动领取后第二天才会再提醒；同日新增可领项合并进当日
@@ -3521,10 +4137,11 @@ Notice:
         _isIdle() {
             const today = RewardsAuto.state.dateNowNum;
             const enabled = key => GM_getValue(key, true);
+            const searchEnabled = enabled("Tasks.search") || enabled("Tasks.mobile");
             return (!enabled("Tasks.sign")     || this.signDate === today) &&
                    (!enabled("Tasks.read")     || this.readDate === today) &&
                    (!enabled("Tasks.promos")   || this.promosDate === today) &&
-                   (!enabled("Tasks.search")   || this.searchDate === today) &&
+                   (!searchEnabled              || this.searchDate === today) &&
                    GM_getValue("Config.dailySetDone", 0) === today &&
                    GM_getValue("Config.punchCardBgDone", 0) === today;
         },
@@ -3830,12 +4447,17 @@ Notice:
                 // 构建简洁日志
                 const signOk = this.signDate === RewardsAuto.state.dateNowNum;
                 const readOk = this.readDate === RewardsAuto.state.dateNowNum;
-                const searchOk = info.pc.progress >= info.pc.max;
+                const pcEnabled = GM_getValue("Tasks.search", true);
+                const searchOk = !pcEnabled || info.pc.progress >= info.pc.max;
                 const promosOk = this.promosDate === RewardsAuto.state.dateNowNum;
 
                 let logMsg = `签到\t\t${signOk ? '✅' : '❌'}\n`;
                 logMsg += `阅读\t\t${readOk ? '✅' : '❌'} ${info.readProgress || 0}/${info.readMax || 30}\n`;
-                logMsg += `PC 搜索\t${searchOk ? '✅' : '⏳'} ${info.pc.progress}/${info.pc.max}\n`;
+                logMsg += `PC 搜索\t${!pcEnabled ? '—' : (searchOk ? '✅' : '⏳')} ${info.pc.progress}/${info.pc.max}\n`;
+                if (GM_getValue("Tasks.mobile", true) && info.mobile && info.mobile.max > 0) {
+                    const mobileOk = info.mobile.progress >= info.mobile.max;
+                    logMsg += `移动搜索\t${mobileOk ? '✅' : '⏳'} ${info.mobile.progress}/${info.mobile.max}\n`;
+                }
                 logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
                 logMsg += `每日活动\t${GM_getValue("Config.dailySetDone", 0) === RewardsAuto.state.dateNowNum ? '✅' : '❌'}\n`;
                 logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
@@ -4039,6 +4661,17 @@ Notice:
             const names = cookie ? cookie.split(";").map(s => s.trim().split("=")[0]) : [];
             lines.push(`【Cookie 链】${cookie ? `${names.length} 个（${names.join(", ")}）` : "❌ 空——SW 拿不到登录 cookie，Server Action 必败（检查浏览器是否登录 rewards.bing.com）"}`);
 
+            // 1.5) PC / 移动搜索配额（v4.6.0）
+            const quotaInfo = await API.getRewardsInfo(1, { fresh: true });
+            if (quotaInfo) {
+                const mobileLine = (quotaInfo.mobile && quotaInfo.mobile.max > 0)
+                    ? `，移动 ${quotaInfo.mobile.progress}/${quotaInfo.mobile.max}`
+                    : "，移动配额不可见";
+                lines.push(`【搜索配额】PC ${quotaInfo.pc.progress}/${quotaInfo.pc.max}${mobileLine}`);
+            } else {
+                lines.push("【搜索配额】❌ 获取失败");
+            }
+
             // 2) 每日活动清单 + 数据源判定
             const items = await API.getDailySetItems({ fresh: true });
             if (items === null) {
@@ -4063,13 +4696,21 @@ Notice:
                 lines.push(`  - ${id}: ${o.isCompleted ? "✅已完成" : o.isLocked ? `🔒锁定(${o.unlockCriteria || "?"})` : "⬜可领取"}${o.hash ? ` hash=${o.hash.slice(0, 10)}…` : " 无hash"}`);
             }
 
-            // 4) 领取方式说明（v4.5.1 提醒模式）
-            lines.push("【领取方式】v4.5.1 起活动卡/欢迎积分为提醒模式（当日一次），请打开 rewards.bing.com 手动领取；每日活动仍自动完成；本诊断不再解析 action ID");
+            // 4) 领取方式说明（v4.6.0：Flyout 自动领卡 + 失败转提醒）
+            lines.push("【领取方式】v4.6.0 起活动卡优先走 Bing Flyout 自动领取，失败/未确认转当日提醒；欢迎积分仍为提醒；每日活动仍自动完成");
 
-            // 5) 提醒账本状态（v4.5.1）
+            // 5) 提醒账本 + Flyout 领取账本
             const today = RewardsAuto.state.dateNowNum;
             const notify = GM_getValue("Config.claimNotify", null);
             lines.push(`【提醒账本】${notify && notify.date === today ? `今日已提醒：${Object.keys(notify.kinds || {}).join("、") || "（无类目）"}` : "今日尚未提醒"}；每日活动完成判据: ${GM_getValue("Config.dailySetDone", 0) === today ? "✅" : "❌ 未完成"}`);
+            const flyoutRec = GM_getValue("Config.flyoutClaimTried", null);
+            if (flyoutRec && flyoutRec.date === today && flyoutRec.attempts) {
+                const attempted = Object.entries(flyoutRec.attempts);
+                lines.push(`【Flyout 领取账本】今日尝试 ${attempted.length} 张（每张上限 3 次）：` +
+                    attempted.slice(0, 8).map(([id, n]) => `${id}×${n}`).join("、"));
+            } else {
+                lines.push("【Flyout 领取账本】今日尚未尝试");
+            }
 
             lines.push("", "— 以上为只读探测，未发送任何领取请求 —");
         } catch (e) {
@@ -4115,10 +4756,13 @@ Notice:
         // keep=false 会在本函数提前 return，调度语句永不执行，当日剩余 tick 零调度。
         const isKeep = GM_getValue("Config.keep", true);
         const checkDone = (enabled, date) => !enabled || date === RewardsAuto.state.dateNowNum;
+        // v4.6.0：与 _isIdle 同一口径——只开移动搜索时也必须等 searchDate 完成，
+        // 否则 keep=false 会在移动配额未完成时提前停止调度。
+        const searchEnabled = GM_getValue("Tasks.search", true) || GM_getValue("Tasks.mobile", true);
         const isAllDone = checkDone(GM_getValue("Tasks.sign", true), TaskManager.signDate) &&
                           checkDone(GM_getValue("Tasks.read", true), TaskManager.readDate) &&
                           checkDone(GM_getValue("Tasks.promos", true), TaskManager.promosDate) &&
-                          checkDone(GM_getValue("Tasks.search", true), TaskManager.searchDate) &&
+                          checkDone(searchEnabled, TaskManager.searchDate) &&
                           GM_getValue("Config.dailySetDone", 0) === RewardsAuto.state.dateNowNum &&
                           GM_getValue("Config.punchCardBgDone", 0) === RewardsAuto.state.dateNowNum;
 
