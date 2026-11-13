@@ -2540,3 +2540,70 @@ test("init keeps scheduling when only mobile search is incomplete (keep=false, v
 
     assert.equal(scheduled.length, 1, "只开移动搜索且 searchDate 未完成时不得短路");
 });
+
+// ====== v4.6.0-beta.2：Server酱³ 推送通道 ======
+
+test("Server酱 posts form-encoded title/desp to sc3.ft07.com", async () => {
+    const { Utils, RewardsAuto } = createHarness({
+        "Notice.serverchan": "sctp123t456",
+        "Notice.serverchan_on": true,
+    });
+    const requests = [];
+    Utils.xhr = async options => {
+        requests.push(options);
+        return JSON.stringify({ code: 0, message: "" });
+    };
+    RewardsAuto.state.sendMSG = "今日获取 +15 分";
+
+    await Utils.sendWebhook();
+
+    assert.equal(requests.length, 1);
+    assert.equal(requests[0].url, "https://123.push.ft07.com/send/sctp123t456.send");
+    assert.match(requests[0].headers["content-type"], /x-www-form-urlencoded/);
+    const params = new URLSearchParams(requests[0].data);
+    assert.equal(params.get("title"), "Rewards Auto Test");
+    assert.equal(params.get("desp"), "今日获取 +15 分");
+});
+
+test("isPublicHttpUrl blocks localhost/private/reserved targets", () => {
+    const { Utils } = createHarness();
+    assert.equal(Utils.isPublicHttpUrl("https://sc3.ft07.com/send/x.send"), true);
+    assert.equal(Utils.isPublicHttpUrl("http://example.com/hook"), true);
+    assert.equal(Utils.isPublicHttpUrl("http://localhost:8080/hook"), false);
+    assert.equal(Utils.isPublicHttpUrl("http://127.0.0.1/hook"), false);
+    assert.equal(Utils.isPublicHttpUrl("http://10.0.0.5/hook"), false);
+    assert.equal(Utils.isPublicHttpUrl("http://172.20.1.1/hook"), false);
+    assert.equal(Utils.isPublicHttpUrl("http://192.168.1.10/hook"), false);
+    assert.equal(Utils.isPublicHttpUrl("http://169.254.169.254/latest/meta-data"), false);
+    assert.equal(Utils.isPublicHttpUrl("http://[::1]/hook"), false);
+    assert.equal(Utils.isPublicHttpUrl("http://0.0.0.0/hook"), false);
+    assert.equal(Utils.isPublicHttpUrl("ftp://example.com/hook"), false);
+});
+
+test("sendWebhook refuses a private URL pasted as the key", async () => {
+    const { Utils, RewardsAuto } = createHarness({
+        "Notice.wework": "http://192.168.1.20:8080/hook",
+        "Notice.wework_on": true,
+    });
+    let called = false;
+    Utils.xhr = async () => { called = true; return ""; };
+    RewardsAuto.state.sendMSG = "测试";
+
+    await Utils.sendWebhook();
+
+    assert.equal(called, false, "私有地址不得发起请求");
+});
+
+test("sendWebhook refuses a malformed Server酱 SendKey", async () => {
+    const { Utils, RewardsAuto } = createHarness({
+        "Notice.serverchan": "not-a-sendkey",
+        "Notice.serverchan_on": true,
+    });
+    let called = false;
+    Utils.xhr = async () => { called = true; return ""; };
+    RewardsAuto.state.sendMSG = "测试";
+
+    await Utils.sendWebhook();
+
+    assert.equal(called, false, "无法提取 uid 的 SendKey 不得发起请求");
+});

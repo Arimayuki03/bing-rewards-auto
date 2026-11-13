@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.6.0-beta.1
-// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅PC+移动双端搜索、✅搜索奖励自动补搜、✅每日活动自动完成（DAPI App 上报）、✅活动卡片自动领取（Bing Flyout 通道，失败转当日提醒）、✅连签检测、✅积分通知；v4.6.0-beta.1（预发布）：吸收 GitHub 热门脚本 TheNetsky/idbb98/3kh0 的积分获取能力——补全移动端搜索配额、搜索上报改用 SERP 真实 IG+cvid 并解析 ModernRewards 回执、新增 URLReward 搜索奖励自动补搜、新增 Bing Flyout 活动卡片自动领取（失败自动降级为当日提醒），并完成代码审查修复（null 结账语义、锁定卡过滤、每日补搜上限、移动-only 配额、Flyout 过期模型等）；v4.5.4：修复设置面板「授权码链接」输入框被清空并根治 Token 死循环；历史记录见改动与待办记录.md
+// @version      4.6.0-beta.2
+// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅PC+移动双端搜索、✅搜索奖励自动补搜、✅每日活动自动完成（DAPI App 上报）、✅活动卡片自动领取（Bing Flyout 通道，失败转当日提醒）、✅连签检测、✅积分通知（企业微信/钉钉/飞书/PushMe/Bark/Server酱³）；v4.6.0-beta.2（预发布）：新增 Server酱³ 推送通道（sc3.ft07.com），通知请求统一校验 http/https 公网地址；v4.6.0-beta.1：吸收 GitHub 热门脚本 TheNetsky/idbb98/3kh0 的积分获取能力——补全移动端搜索配额、搜索上报改用 SERP 真实 IG+cvid 并解析 ModernRewards 回执、新增 URLReward 搜索奖励自动补搜、新增 Bing Flyout 活动卡片自动领取（失败自动降级为当日提醒），并完成代码审查修复（null 结账语义、锁定卡过滤、每日补搜上限、移动-only 配额、Flyout 过期模型等）；v4.5.4：修复设置面板「授权码链接」输入框被清空并根治 Token 死循环；历史记录见改动与待办记录.md
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -19,6 +19,8 @@
 // @connect      open.feishu.cn
 // @connect      push.i-i.me
 // @connect      api.day.app
+// @connect      sc3.ft07.com
+// @connect      push.ft07.com
 // @match        https://login.live.com/oauth20_desktop.srf*
 // @match        https://rewards.bing.com/*
 // @match        https://www.bing.com/*
@@ -159,6 +161,15 @@ Notice:
         description: xxxxxxxxxxxxxxxxxxxx
     bark_on:
         title: Bark推送开关
+        type: checkbox
+        default: false
+    serverchan:
+        title: Server酱³（sc3.ft07.com）
+        type: text
+        password: true
+        description: SendKey（形如 sctp...t...；脚本自动提取 uid 并发送到 <uid>.push.ft07.com）
+    serverchan_on:
+        title: Server酱推送开关
         type: checkbox
         default: false
 ==/UserConfig== */
@@ -381,6 +392,31 @@ Notice:
                 }
             },
         },
+        {
+            // Server酱³：实际发送端点为 https://<uid>.push.ft07.com/send/<SendKey>.send，
+            // uid 从 SendKey 的 sctp{uid}t... 前缀提取；sc3.ft07.com 只是管理站。
+            name: "Server酱",
+            contentType: "application/x-www-form-urlencoded; charset=UTF-8",
+            get key() { return GM_getValue("Notice.serverchan", false); },
+            get enabled() { return GM_getValue("Notice.serverchan_on", false); },
+            buildUrl(safeKey) {
+                if (/^https?:\/\//i.test(safeKey)) return safeKey;
+                const m = safeKey.match(/^sctp(\d+)t/i);
+                return m ? `https://${m[1]}.push.ft07.com/send/${safeKey}.send` : "";
+            },
+            buildData() {
+                return `title=${encodeURIComponent(GM_info.script.name)}&desp=${encodeURIComponent(RewardsAuto.state.sendMSG)}`;
+            },
+            checkResult(text) {
+                try {
+                    const data = JSON.parse(text);
+                    if (data && Number(data.code) === 0) return { ok: true };
+                    return { ok: false, message: (data && (data.message || data.info)) || "未知错误" };
+                } catch (_) {
+                    return { ok: false, message: "响应非 JSON" };
+                }
+            },
+        },
     ];
 
     const Utils = {
@@ -426,22 +462,72 @@ Notice:
             }
         },
 
+        // 仅允许 http/https 公网地址：拒绝 localhost、环回、私有与保留地址。
+        // 通知 key 支持直接粘贴完整 URL，必须防止 SW 被引向本机/内网服务。
+        isPublicHttpUrl(raw) {
+            let url;
+            try { url = new URL(String(raw)); } catch (_) { return false; }
+            if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+            const host = String(url.hostname || "").toLowerCase().replace(/^\[|\]$/g, "");
+            if (!host) return false;
+            if (host === "localhost" || host.endsWith(".localhost")) return false;
+            if (host.includes(":")) {
+                // IPv6：环回、未指定、链路本地 fe80::/10、唯一本地 fc00::/7、
+                // IPv4-mapped（URL 可能归一化为十六进制，整段保守拒绝）
+                if (host === "::1" || host === "::" || /^fe[89ab]/.test(host) || /^f[cd]/.test(host)) return false;
+                if (host.startsWith("::ffff:")) return false;
+                return true;
+            }
+            const m = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+            if (m) {
+                const [a, b, c, d] = m.slice(1).map(Number);
+                if ([a, b, c, d].some(n => n > 255)) return false;
+                if (a === 0 || a === 10 || a === 127) return false;            // 本网/私网/环回
+                if (a === 100 && b >= 64 && b <= 127) return false;             // CGNAT
+                if (a === 169 && b === 254) return false;                       // 链路本地
+                if (a === 172 && b >= 16 && b <= 31) return false;              // 私网
+                if (a === 192 && b === 168) return false;                       // 私网
+                if (a === 192 && b === 0 && (c === 0 || c === 2)) return false;  // 保留/文档
+                if (a === 198 && (b === 18 || b === 19)) return false;          // 基准测试
+                if (a === 198 && b === 51 && c === 100) return false;           // 文档
+                if (a === 203 && b === 0 && c === 113) return false;            // 文档
+                if (a >= 224) return false;                                     // 组播/保留
+            }
+            return true;
+        },
+
         // 发送webhook通知
         async sendWebhook() {
             await Promise.all(Webhooks.map(async (i) => {
                 if (!i.enabled || !i.key) return;
                 const safeKey = String(i.key).trim();
-                const targetUrl = safeKey.startsWith("http") ? safeKey : i.url + safeKey;
+                const targetUrl = i.buildUrl
+                    ? i.buildUrl(safeKey)
+                    : (safeKey.startsWith("http") ? safeKey : i.url + safeKey + (i.suffix || ""));
+                if (!targetUrl) {
+                    GM_log(`🔴 「${i.name}」配置无效：SendKey 格式不正确`);
+                    return;
+                }
+                if (!this.isPublicHttpUrl(targetUrl)) {
+                    GM_log(`🔴 「${i.name}」推送地址不安全（仅允许 http/https 公网地址）: ${targetUrl}`);
+                    return;
+                }
                 try {
                     const result = await this.xhr({
                         method: "POST",
                         url: targetUrl,
                         headers: {
-                            "content-type": "application/json; charset=UTF-8",
+                            "content-type": i.contentType || "application/json; charset=UTF-8",
                         },
-                        data: JSON.stringify(i.msg),
+                        data: i.buildData ? i.buildData() : JSON.stringify(i.msg),
                     });
-                    if (result) GM_log(`🔵 「${i.name}」消息推送完成`);
+                    if (i.checkResult) {
+                        const check = i.checkResult(result);
+                        if (check.ok) GM_log(`🔵 「${i.name}」消息推送完成`);
+                        else GM_log(`🔴 「${i.name}」消息推送失败: ${check.message}`);
+                    } else if (result) {
+                        GM_log(`🔵 「${i.name}」消息推送完成`);
+                    }
                 } catch (e) {
                     GM_log(`🔴 「${i.name}」消息推送出错: ${e.message}`);
                 }
@@ -4572,7 +4658,8 @@ Notice:
             { key: "Notice.dingding", name: "钉钉机器人 Access Token", hint: "不加签，关键词需包含 #" },
             { key: "Notice.feishu", name: "飞书机器人 Webhook", hint: "不加签，关键词需包含 #" },
             { key: "Notice.pushme", name: "PushMe Key", hint: "push.i-i.me 推送key" },
-            { key: "Notice.bark", name: "Bark Key", hint: "bark.day.app 推送key" }
+            { key: "Notice.bark", name: "Bark Key", hint: "bark.day.app 推送key" },
+            { key: "Notice.serverchan", name: "Server酱³ SendKey", hint: "sc3.ft07.com 的 SendKey（形如 sctp...t...）" }
         ];
         
         let configStr = "🔔 通知接口配置\n";
@@ -4583,7 +4670,7 @@ Notice:
             configStr += `   状态: ${saved ? "✅ 已配置" : "❌ 未配置"}\n`;
             configStr += `   说明: ${item.hint}\n\n`;
         });
-        configStr += "请输入要配置的编号 (1-5)，或输入 0 清除所有配置：";
+        configStr += `请输入要配置的编号 (1-${configNames.length})，或输入 0 清除所有配置：`;
         
         const choice = prompt(configStr);
         if (!choice) return;
@@ -4597,7 +4684,7 @@ Notice:
             return;
         }
         
-        if (num >= 1 && num <= 5) {
+        if (num >= 1 && num <= configNames.length) {
             const selected = configNames[num - 1];
             const current = GM_getValue(selected.key, "");
             const newValue = prompt(`配置 ${selected.name}\n\n当前值: ${current || "(空)"}\n\n请输入新的值：`, current);
@@ -4617,6 +4704,7 @@ Notice:
         { key: "Notice.feishu_on", name: "飞书" },
         { key: "Notice.pushme_on", name: "PushMe" },
         { key: "Notice.bark_on", name: "Bark" },
+        { key: "Notice.serverchan_on", name: "Server酱" },
     ].forEach(ch => {
         GM_registerMenuCommand(GM_getValue(ch.key, false) ? `📢 ${ch.name}推送: 开` : `📢 ${ch.name}推送: 关`, () => {
             const cur = GM_getValue(ch.key, false);
@@ -4736,6 +4824,7 @@ Notice:
             { name: "飞书", key: "Notice.feishu" },
             { name: "PushMe", key: "Notice.pushme" },
             { name: "Bark", key: "Notice.bark" },
+            { name: "Server酱", key: "Notice.serverchan" },
         ];
         let status = "📊 通知接口配置状态：\n\n";
         channels.forEach(c => {
