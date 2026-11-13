@@ -2607,3 +2607,64 @@ test("sendWebhook refuses a malformed Server酱 SendKey", async () => {
 
     assert.equal(called, false, "无法提取 uid 的 SendKey 不得发起请求");
 });
+
+// ====== v4.6.0-beta.3：余额口径与汇总推送策略 ======
+
+test("formatSignedDelta keeps the sign and marks unknown balances", () => {
+    const { Utils } = createHarness();
+    assert.equal(Utils.formatSignedDelta(15), "+15");
+    assert.equal(Utils.formatSignedDelta(0), "0");
+    assert.equal(Utils.formatSignedDelta(-500), "-500");
+    assert.equal(Utils.formatSignedDelta(null), "?");
+    assert.equal(Utils.formatSignedDelta(undefined), "?");
+    assert.equal(Utils.formatSignedDelta("abc"), "?");
+});
+
+test("summary push mode done pushes once per day only after all tasks complete", () => {
+    const today = 20261113;
+    const { RewardsAuto, TaskManager } = createHarness({ "Notice.summary": "done" });
+    RewardsAuto.state.dateNowNum = today;
+
+    assert.equal(TaskManager._shouldPushSummary(false), false, "未全部完成不推送");
+    assert.equal(TaskManager._shouldPushSummary(true), true, "全部完成推送一次");
+    assert.equal(TaskManager._shouldPushSummary(true), false, "同日不重复推送");
+});
+
+test("summary push mode every/off is honored", () => {
+    const today = 20261113;
+    const every = createHarness({ "Notice.summary": "every" });
+    every.RewardsAuto.state.dateNowNum = today;
+    assert.equal(every.TaskManager._shouldPushSummary(false), true);
+    assert.equal(every.TaskManager._shouldPushSummary(false), true);
+
+    const off = createHarness({ "Notice.summary": "off" });
+    off.RewardsAuto.state.dateNowNum = today;
+    assert.equal(off.TaskManager._shouldPushSummary(true), false);
+});
+
+test("daily balance baseline is recorded once per day and reset across days", () => {
+    const today = 20261113;
+    const { RewardsAuto, TaskManager, storage } = createHarness();
+    RewardsAuto.state.dateNowNum = today;
+
+    assert.equal(TaskManager._dailyStartBalance(1000), 1000);
+    assert.equal(storage.get("Config.dayStartBalance").balance, 1000);
+    assert.equal(TaskManager._dailyStartBalance(1015), 1000, "后续轮次沿用首轮基线");
+
+    RewardsAuto.state.dateNowNum = 20261114;
+    assert.equal(TaskManager._dailyStartBalance(2000), 2000, "跨日重置基线");
+
+    // 首轮取数失败留下 0 基线时，用后续成功值修复
+    RewardsAuto.state.dateNowNum = 20261115;
+    storage.set("Config.dayStartBalance", { date: 20261115, balance: 0 });
+    assert.equal(TaskManager._dailyStartBalance(3000), 3000);
+});
+
+test("getBalance falls back to DAPI userStatus.availablePoints", async () => {
+    const { API } = createHarness();
+    API._getMeInfo = async () => ({ balance: 1234, userStatus: { availablePoints: 4321 } });
+    assert.equal(await API.getBalance(), 1234, "顶层 balance 优先");
+
+    API._getMeInfo = async () => ({ userStatus: { availablePoints: 4321 } });
+    assert.equal(await API.getBalance(), 4321, "balance 缺失时回退 availablePoints");
+});

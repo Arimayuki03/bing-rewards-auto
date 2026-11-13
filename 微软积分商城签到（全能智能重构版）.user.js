@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         微软积分商城签到（全能智能重构版）
 // @namespace    local.bing-rewards-auto
-// @version      4.6.0-beta.2
-// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅PC+移动双端搜索、✅搜索奖励自动补搜、✅每日活动自动完成（DAPI App 上报）、✅活动卡片自动领取（Bing Flyout 通道，失败转当日提醒）、✅连签检测、✅积分通知（企业微信/钉钉/飞书/PushMe/Bark/Server酱³）；v4.6.0-beta.2（预发布）：新增 Server酱³ 推送通道（sc3.ft07.com），通知请求统一校验 http/https 公网地址；v4.6.0-beta.1：吸收 GitHub 热门脚本 TheNetsky/idbb98/3kh0 的积分获取能力——补全移动端搜索配额、搜索上报改用 SERP 真实 IG+cvid 并解析 ModernRewards 回执、新增 URLReward 搜索奖励自动补搜、新增 Bing Flyout 活动卡片自动领取（失败自动降级为当日提醒），并完成代码审查修复（null 结账语义、锁定卡过滤、每日补搜上限、移动-only 配额、Flyout 过期模型等）；v4.5.4：修复设置面板「授权码链接」输入框被清空并根治 Token 死循环；历史记录见改动与待办记录.md
+// @version      4.6.0-beta.3
+// @description  每天在后台自动完成 Microsoft Rewards 日常任务：✅签入(PC+App静默)、✅阅读、✅PC+移动双端搜索、✅搜索奖励自动补搜、✅每日活动自动完成（DAPI App 上报）、✅活动卡片自动领取（Bing Flyout 通道，失败转当日提醒）、✅连签检测、✅积分通知（企业微信/钉钉/飞书/PushMe/Bark/Server酱³）；v4.6.0-beta.3（预发布）：修复通知"今日获取/总积分"口径——起始余额移至 Token 续期后、首尾统一数据源、持久化当日余额基线、总积分改用 fresh 结束余额并处理负数/取数失败；汇总推送默认改为"全部完成时当日一次"（Notice.summary 可选 every/off），移除签入/阅读/每日活动等任务级成功推送，合并地区检测告警并避免外发 IP 信息；v4.6.0-beta.2：新增 Server酱³ 推送通道（sc3.ft07.com）与通知目标公网地址校验；v4.6.0-beta.1：吸收 GitHub 热门脚本能力（移动搜索、SERP 真实 IG、搜索奖励、Bing Flyout 自动领卡）并完成代码审查修复；v4.5.4：修复设置面板「授权码链接」输入框被清空并根治 Token 死循环；历史记录见改动与待办记录.md
 // @icon         https://bing.com/th?id=OMR.icon-96.png&pid=Rewards
 // @license      MIT
 // @crontab      */20 * * * *
@@ -118,6 +118,11 @@ Notice:
         title: 浏览器通知（当前脚本）
         type: checkbox
         default: true
+    summary:
+        title: 任务汇总推送（done=全部完成时一次 / every=每轮 / off=关闭）
+        type: select
+        default: done
+        values: [done, every, off]
     wework:
         title: 企业微信消息推送（群机器人）
         type: text
@@ -494,6 +499,15 @@ Notice:
                 if (a >= 224) return false;                                     // 组播/保留
             }
             return true;
+        },
+
+        // 余额差格式化：正数带 +，负数保留 -，无法获取显示 ?。
+        // 兑换/捐赠会让余额下降，不能再硬拼 "+" 变成 "+-500"。
+        formatSignedDelta(delta) {
+            if (delta === null || delta === undefined || delta === "") return "?";
+            const n = Number(delta);
+            if (!Number.isFinite(n)) return "?";
+            return n > 0 ? `+${n}` : String(n);
         },
 
         // 发送webhook通知
@@ -1535,8 +1549,10 @@ Notice:
                     }
 
                     // 补充获取 balance
+                    // v4.6.0-beta.3：优先 availablePoints（账户可用积分），避免
+                    // 首个 "balance" 命中卡片/历史对象导致总积分取到别的口径。
                     if (balance === 0) {
-                        const balMatch = clean.match(/"balance":(\d+)/) || clean.match(/"availablePoints":(\d+)/);
+                        const balMatch = clean.match(/"availablePoints":(\d+)/) || clean.match(/"balance":(\d+)/);
                         if (balMatch) balance = parseInt(balMatch[1]);
                     }
 
@@ -1658,7 +1674,9 @@ Notice:
                     }
 
                     if (!searchQuotaFound) {
-                        const userInfoResult = await this.getSearchQuotaFromUserInfo();
+                        // v4.6.0-beta.3：轮末汇总传 fresh:true 时必须透传，否则
+                        // 兜底路径命中本轮早先缓存，info.balance 会比 endBalance 旧。
+                        const userInfoResult = await this.getSearchQuotaFromUserInfo({ fresh });
                         if (userInfoResult) {
                             Utils.log("🟢", "页面未命中搜索配额，使用 getuserinfo 兜底");
                             return userInfoResult;
@@ -1666,7 +1684,7 @@ Notice:
                     }
 
                     if (!searchQuotaFound && RewardsAuto.state.token) {
-                        const apiResult = await this.getSearchQuotaFromAPI();
+                        const apiResult = await this.getSearchQuotaFromAPI({ fresh });
                         if (apiResult) {
                             Utils.log("🟢", "页面未命中搜索配额，使用 DAPI 兜底");
                             return apiResult;
@@ -2375,13 +2393,23 @@ Notice:
         async getBalance(fetchOpts) {
             // 方法1: DAPI（需要 Token）；options=613 与阅读进度/搜索配额共用同一份缓存
             const meInfo = await this._getMeInfo("613", fetchOpts);
-            if (meInfo) return meInfo.balance || 0;
+            if (meInfo) {
+                // v4.6.0-beta.3：DAPI 顶层 balance 缺失时回退 userStatus.availablePoints，
+                // 避免"明明有余额却取 0"导致汇总的今日获取/总积分一起失真。
+                const b = Number(meInfo.balance);
+                if (Number.isFinite(b) && b > 0) return b;
+                const alt = Number(meInfo.userStatus?.availablePoints);
+                if (Number.isFinite(alt) && alt > 0) return alt;
+                return 0;
+            }
 
             // 方法2: getuserinfo API（不需要 Token）
             try {
                 const data2 = await this._getUserInfo(fetchOpts);
                 if (data2) {
-                    return data2.dashboard?.availablePoints || data2.balance || 0;
+                    const available = Number(data2.dashboard?.availablePoints);
+                    if (Number.isFinite(available) && available > 0) return available;
+                    return Number(data2.balance) || 0;
                 }
             } catch (e) {}
 
@@ -2786,7 +2814,7 @@ Notice:
                     if (RewardsAuto.state.region !== "CN") {
                         // 获取IP详细信息（来自比尔脚本）
                         await this.getIPInfo();
-                        Utils.log("🔴", `IP非大陆(${RewardsAuto.state.region})，已停止\n${RewardsAuto.state.ipInfo}`, true);
+                        Utils.log("🔴", `IP非大陆(${RewardsAuto.state.region})，已停止\n${RewardsAuto.state.ipInfo}`);
                         return false;
                     }
                     Utils.log("🟢", `地区检测通过: ${RewardsAuto.state.region}`);
@@ -3056,7 +3084,7 @@ Notice:
                 this.signDate = RewardsAuto.state.dateNowNum;
                 GM_setValue("Config.signPoint", totalPoint);
                 this.save();
-                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`, true);
+                Utils.log("🔵", `签入任务完成！总积分 +${totalPoint}`);
                 return true;
             } else {
                 this.signTimes++;
@@ -3131,7 +3159,7 @@ Notice:
             await Utils.delay(12000);
             const verify = await API.getReadProgress({ fresh: true });
             if (verify && verify.progress >= verify.max) {
-                Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`, true);
+                Utils.log("🔵", `阅读任务完成！共 ${successCount} 篇`);
                 return true;
             } else {
                 this.readTimes++;
@@ -3215,7 +3243,7 @@ Notice:
                 const claimed = await this._claimManualCardsViaFlyout(manual);
                 const remaining = manual.filter(c => !claimed.has(c.offerId));
                 if (claimed.size > 0) {
-                    Utils.log("🔵", `活动卡片自动领取 ${claimed.size}/${manual.length} 张`, true);
+                    Utils.log("🔵", `活动卡片自动领取 ${claimed.size}/${manual.length} 张`);
                 }
                 if (remaining.length > 0) {
                     await this.notifyClaimables("活动卡片", remaining);
@@ -3356,7 +3384,7 @@ Notice:
                 return false;
             }
             if (after.length === 0) {
-                Utils.log("🔵", "搜索奖励任务完成", true);
+                Utils.log("🔵", "搜索奖励任务完成");
                 return true;
             }
             if (dayRec.count >= SEARCH_BONUS_MAX_PER_DAY) {
@@ -3634,7 +3662,7 @@ Notice:
                     const okCount = after.filter(it => it.complete).length;
                     if (okCount >= after.length) {
                         GM_setValue("Config.dailySetDone", today);
-                        Utils.log("🔵", `每日活动完成 ${okCount}/${after.length} 个`, true);
+                        Utils.log("🔵", `每日活动完成 ${okCount}/${after.length} 个`);
                         return true;
                     } else {
                         Utils.log("🟡", `每日活动完成 ${okCount}/${after.length} 个，未完成项下轮重试`);
@@ -3690,7 +3718,7 @@ Notice:
                 return false;
             }
             GM_setValue("Config.dailySetDone", today);
-            Utils.log("🔵", `每日活动完成 ${completed.length}/${afterOpen.length} 个`, true);
+            Utils.log("🔵", `每日活动完成 ${completed.length}/${afterOpen.length} 个`);
             return true;
         },
         // 打卡任务（后台模式）：从 dashboard 发现打卡页 → 提取子任务链接 → 逐个 XHR 模拟点击
@@ -3796,7 +3824,7 @@ Notice:
 
             if (ok === taskLinks.length) {
                 GM_setValue(doneKey, today);
-                Utils.log("🔵", `打卡任务: ${ok}/${taskLinks.length} 个子任务完成`, true);
+                Utils.log("🔵", `打卡任务: ${ok}/${taskLinks.length} 个子任务完成`);
                 return true;
             } else if (ok > 0) {
                 Utils.log("🟡", `打卡任务部分失败: ${ok}/${taskLinks.length} 个子任务完成`);
@@ -4232,6 +4260,36 @@ Notice:
                    GM_getValue("Config.punchCardBgDone", 0) === today;
         },
 
+        // 当日余额基线：每日首轮记录一次，后续轮次沿用，用于计算"今日获取"。
+        // 仍会受账号外部操作（手动搜索/领取/兑换）影响，但不再只是单轮增量。
+        _dailyStartBalance(startBalance) {
+            const today = RewardsAuto.state.dateNowNum;
+            const start = Number(startBalance) || 0;
+            let rec = GM_getValue("Config.dayStartBalance", null);
+            if (!rec || typeof rec !== "object" || rec.date !== today) {
+                rec = { date: today, balance: start };
+                GM_setValue("Config.dayStartBalance", rec);
+            } else if (!(Number(rec.balance) > 0) && start > 0) {
+                // 首轮取数失败留下 0 基线时，用后续轮次的成功值修复
+                rec.balance = start;
+                GM_setValue("Config.dayStartBalance", rec);
+            }
+            return Number(rec.balance) || 0;
+        },
+
+        // 汇总推送策略：done=全部完成时当日一次；every=每轮；off=关闭。
+        // 只有 done 模式写当日账本，防止同日重复汇总。
+        _shouldPushSummary(allDone) {
+            const mode = GM_getValue("Notice.summary", "done");
+            if (mode === "off") return false;
+            if (mode === "every") return true;
+            if (!allDone) return false;
+            const today = RewardsAuto.state.dateNowNum;
+            if (GM_getValue("Config.summaryPushDate", 0) === today) return false;
+            GM_setValue("Config.summaryPushDate", today);
+            return true;
+        },
+
         // 跨实例运行锁（尽力而为）：crontab 每 20 分钟触发一次新脚本实例，
         // 而一轮 runAll 可能耗时数分钟到二十分钟。用共享 storage 加锁，
         // 防止两个实例重叠执行造成重复搜索/上报。写入后回读校验降低竞态窗口；
@@ -4337,10 +4395,6 @@ Notice:
                 return;
             }
 
-            // 记录初始积分
-            const startBalance = await API.getBalance();
-            Utils.log("📊", `初始积分: ${startBalance}`);
-
             const regionOK = await API.checkRegion();
 
             // Token 续期。renewToken 返回 false 有两种情形：① 四个 DAPI 消费任务
@@ -4361,9 +4415,20 @@ Notice:
                     }
                 }
             } else {
-                Utils.log("🔴", "IP非国内，已暂停全部任务", true);
+                // v4.6.0-beta.3：checkRegion 内已记录具体地区/IP（不推送，避免
+                // 把 IP 信息发到外部渠道）；这里统一推送一条不含 IP 的告警，
+                // 同时覆盖"非大陆 IP"和"地区检测临时失败"两种中止原因。
+                Utils.log("🔴", "地区检测未通过（非大陆 IP 或检测失败），已暂停全部任务", true);
                 return;
             }
+
+            // v4.6.0-beta.3：初始余额放在 Token 续期之后，首尾统一走同一数据源
+            // （有 Token 时 DAPI，否则 getuserinfo），避免 start=getuserinfo、
+            // end=DAPI 的跨接口差值污染"今日获取"。同时记录当日余额基线，
+            // 后续轮次用 endBalance - 当日基线 计算真正的"今日获取"。
+            const startBalance = await API.getBalance({ fresh: true });
+            const dayStartBalance = this._dailyStartBalance(startBalance);
+            Utils.log("📊", `初始积分: ${startBalance}（今日基线: ${dayStartBalance || "?"}）`);
 
             // setTimeout 重试机制
             const retryDelay = 60000; // 重试间隔 60 秒
@@ -4525,10 +4590,15 @@ Notice:
             // 轮末必须 fresh 绕开轮内页面缓存：缓存键绑定 dateNowNum（单轮恒定），
             // 不刷新的话首尾拿到同一份缓存值，"今日获取"恒显示 +0
             const endBalance = await API.getBalance({ fresh: true });
-            const earned = (startBalance > 0 && endBalance > 0) ? (endBalance - startBalance) : 0;
+            // v4.6.0-beta.3：今日获取 = 当前余额 - 当日首轮基线，不再只是本轮增量。
+            // 任一余额取数失败时显示 ?，不再静默显示 +0。
+            const earned = (dayStartBalance > 0 && endBalance > 0) ? (endBalance - dayStartBalance) : null;
+            const earnedText = Utils.formatSignedDelta(earned);
 
             // 汇总必须反映本轮执行后的最新进度，绕过轮内缓存
             const info = await API.getRewardsInfo(3, { fresh: true });
+            const allDone = this._isIdle();
+            const pushSummary = this._shouldPushSummary(allDone);
             if (info) {
                 // 构建简洁日志
                 const signOk = this.signDate === RewardsAuto.state.dateNowNum;
@@ -4547,14 +4617,24 @@ Notice:
                 logMsg += `活动卡片\t${promosOk ? '✅' : '❌'}\n`;
                 logMsg += `每日活动\t${GM_getValue("Config.dailySetDone", 0) === RewardsAuto.state.dateNowNum ? '✅' : '❌'}\n`;
                 logMsg += `连签\t\t${this.streakDays || 0} 天\n`;
-                logMsg += `今日获取\t+${earned}\n`;
-                logMsg += `总积分\t\t${info.balance || endBalance}`;
+                logMsg += `今日获取\t${earnedText}\n`;
+                // 总积分固定用 fresh 结束余额（与今日获取同源）；仅在取数失败时
+                // 回退页面解析值，避免 info.balance 的页面口径覆盖真实余额。
+                const totalBalance = endBalance > 0 ? endBalance : (Number(info.balance) || 0);
+                logMsg += `总积分\t\t${totalBalance > 0 ? totalBalance : "?"}`;
+                if (GM_getValue("Config.debugDAPI", false) && endBalance > 0 &&
+                    Number(info.balance) > 0 && Number(info.balance) !== endBalance) {
+                    Utils.log("🟡", `余额口径差异: 页面 ${info.balance} / DAPI ${endBalance}`);
+                }
 
-                // 发送通知
+                // 发送通知（Notice.summary：done=全部完成时一次 / every=每轮 / off=关闭）
                 RewardsAuto.state.sendMSG = logMsg;
-                Utils.log("📊", logMsg, true);
+                if (pushSummary) Utils.log("📊", logMsg, true);
+                else Utils.log("📊", logMsg);
             } else {
-                Utils.log("🎉", `任务执行完成！用时 ${totalTime} 秒`, true);
+                const fallbackMsg = `任务执行完成！用时 ${totalTime} 秒`;
+                if (pushSummary) Utils.log("🎉", fallbackMsg, true);
+                else Utils.log("🎉", fallbackMsg);
             }
             } finally {
                 clearInterval(this._lockHeartbeat);
@@ -4833,6 +4913,8 @@ Notice:
             status += `${c.name}: ${configured ? "✅已配置" : "❌未配置"} | 推送${on ? "🔔开" : "🔕关"}\n`;
         });
         status += `\n浏览器通知: ${GM_getValue("Notice.bro", true) ? "🔔开" : "🔕关"}`;
+        const summaryMode = GM_getValue("Notice.summary", "done");
+        status += `\n任务汇总推送: ${summaryMode === "done" ? "全部完成时一次" : summaryMode === "every" ? "每轮" : "关闭"}`;
         alert(status);
     });
 
